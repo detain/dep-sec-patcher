@@ -55,11 +55,16 @@
     ],
     "scripts": {
         "test": "phpunit",
+        "test:coverage": [
+            "@putenv XDEBUG_MODE=coverage",
+            "phpunit --coverage-clover build/logs/clover.xml"
+        ],
         "analyse": "phpstan analyse --no-progress --memory-limit=1G"
     },
     "scripts-descriptions": {
         "test": "Run the PHPUnit test suite",
-        "analyse": "Run PHPStan static analysis"
+        "test:coverage": "Run the test suite and write a Clover coverage report to build/logs/clover.xml",
+        "analyse": "Run PHPStan static analysis (level 8, see phpstan.neon.dist)"
     },
     "config": {
         "sort-packages": true

@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Run any JS action still declaring `using: node20` (setup-php, codecov,
+# codacy, the artifact actions) on Node 24, silencing the runner's
+# "Node.js 20 actions are deprecated" warnings.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: PHPUnit + PHPStan (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: ctype, json, mbstring, pcntl, posix
+          # Coverage instrumentation only on the single coverage leg
+          coverage: ${{ matrix.php == '8.3' && 'pcov' || 'none' }}
+          tools: composer:v2
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-php-${{ matrix.php }}-composer-${{ hashFiles('**/composer.json') }}
+          restore-keys: |
+            ${{ runner.os }}-php-${{ matrix.php }}-composer-
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies
+        # No composer.lock in the repo (it is a library), so resolve per PHP version
+        run: composer update --prefer-dist --no-progress --no-interaction
+
+      - name: PHPStan
+        run: composer analyse
+
+      - name: PHPUnit
+        if: ${{ matrix.php != '8.3' }}
+        run: composer test -- --colors=never
+
+      - name: PHPUnit with coverage
+        if: ${{ matrix.php == '8.3' }}
+        run: composer test:coverage -- --colors=never
+
+      - name: Upload coverage artifact
+        if: ${{ matrix.php == '8.3' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-clover
+          path: build/logs/clover.xml
+          retention-days: 7
+
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.php == '8.3' }}
+        uses: codecov/codecov-action@v5
+        # Never allowed to fail the build: a missing/expired token or a Codecov
+        # outage must not turn CI red. continue-on-error makes a FAILED step
+        # report "success", so check the step log for the upload, not the conclusion.
+        continue-on-error: true
+        with:
+          files: build/logs/clover.xml
+          flags: phpunit
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  codacy-coverage-reporter:
+    name: codacy-coverage-reporter
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-clover
+          path: build/logs
+
+      - name: Upload coverage to Codacy
+        uses: codacy/codacy-coverage-reporter-action@v1
+        # Never allowed to fail the build: a missing/expired token, a repository
+        # not yet added on Codacy, or a Codacy outage must not turn CI red.
+        # NOTE: continue-on-error makes a FAILED step report "success"; to check
+        # whether an upload actually happened, read the step log for
+        # "Coverage data uploaded", not the step conclusion.
+        continue-on-error: true
+        with:
+          # Account API token: the action derives provider/owner/repo from GitHub
+          api-token: ${{ secrets.CODACY_TOKEN }}
+          coverage-reports: build/logs/clover.xml
