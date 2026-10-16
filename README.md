@@ -2,9 +2,8 @@
 
 [![CI](https://github.com/detain/dep-sec-patcher/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/detain/dep-sec-patcher/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/detain/dep-sec-patcher/branch/master/graph/badge.svg)](https://codecov.io/gh/detain/dep-sec-patcher)
-<!-- Codacy: replace CODACY_PROJECT_ID (both badges) with the ID from Codacy > dep-sec-patcher > Settings > General > Project badge -->
-[![Codacy Badge](https://app.codacy.com/project/badge/Grade/CODACY_PROJECT_ID)](https://app.codacy.com/gh/detain/dep-sec-patcher/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
-[![Codacy Coverage](https://app.codacy.com/project/badge/Coverage/CODACY_PROJECT_ID)](https://app.codacy.com/gh/detain/dep-sec-patcher/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/dd2e8abafb0f4799b66d4fc920396793)](https://app.codacy.com/gh/detain/dep-sec-patcher/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+[![Codacy Coverage](https://app.codacy.com/project/badge/Coverage/dd2e8abafb0f4799b66d4fc920396793)](https://app.codacy.com/gh/detain/dep-sec-patcher/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
 [![PHPStan level 8](https://img.shields.io/badge/PHPStan-level%208-brightgreen.svg)](phpstan.neon.dist)
 <br>
 [![Latest Version](https://img.shields.io/packagist/v/detain/dep-sec-patcher.svg)](https://packagist.org/packages/detain/dep-sec-patcher)
