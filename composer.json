@@ -1,0 +1,67 @@
+{
+    "name": "detain/dep-sec-patcher",
+    "description": "Multi-language dependency vulnerability scanner and patcher: audits every ecosystem in a project tree, collects GitHub's view of its vulnerabilities into a local database, applies fixes to the manifests and closes issues proven fixed.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "security",
+        "vulnerability",
+        "dependencies",
+        "audit",
+        "dependabot",
+        "owasp",
+        "dependency-check",
+        "npm-audit",
+        "composer-audit",
+        "cli"
+    ],
+    "homepage": "https://github.com/detain/dep-sec-patcher",
+    "authors": [
+        {
+            "name": "Joe Huss",
+            "homepage": "https://github.com/detain"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/detain/dep-sec-patcher/issues",
+        "source": "https://github.com/detain/dep-sec-patcher"
+    },
+    "require": {
+        "php": "^8.1",
+        "ext-ctype": "*",
+        "ext-json": "*",
+        "ext-mbstring": "*"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^10.5"
+    },
+    "suggest": {
+        "ext-pcntl": "Runs audits in parallel (-t N) and forwards Ctrl-C to running tools; without it everything runs one at a time",
+        "ext-posix": "Lets a timeout kill a command's whole process tree and reaps daemons tools leave behind"
+    },
+    "autoload": {
+        "psr-4": {
+            "Detain\\DepSecPatcher\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Detain\\DepSecPatcher\\Tests\\": "tests/"
+        }
+    },
+    "bin": [
+        "bin/dep-sec-patcher"
+    ],
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse --no-progress --memory-limit=1G"
+    },
+    "scripts-descriptions": {
+        "test": "Run the PHPUnit test suite",
+        "analyse": "Run PHPStan static analysis"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

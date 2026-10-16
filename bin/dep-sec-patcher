@@ -1,0 +1,44 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * dep-sec-patcher: audit (and optionally update) every dependency ecosystem in
+ * a project tree. See --help and README.md.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "dep-sec-patcher must be run from the command line\n");
+    exit(1);
+}
+
+(static function (): void {
+    // Composer 2.2+ tells a proxied bin script where its autoloader is
+    $candidates = [];
+    if (isset($GLOBALS['_composer_autoload_path']) && is_string($GLOBALS['_composer_autoload_path'])) {
+        $candidates[] = $GLOBALS['_composer_autoload_path'];
+    }
+    $candidates[] = __DIR__ . '/../vendor/autoload.php';       // cloned standalone, after composer install
+    $candidates[] = __DIR__ . '/../../../autoload.php';        // installed: vendor/detain/dep-sec-patcher/bin
+    foreach ($candidates as $file) {
+        if (is_file($file)) {
+            require $file;
+            return;
+        }
+    }
+    // No autoloader (cloned without `composer install`): the tool has no
+    // runtime dependencies, so a PSR-4 loader for src/ is all it needs
+    $src = dirname(__DIR__) . '/src/';
+    spl_autoload_register(static function (string $class) use ($src): void {
+        $prefix = 'Detain\\DepSecPatcher\\';
+        if (str_starts_with($class, $prefix)) {
+            $file = $src . str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
+            if (is_file($file)) {
+                require $file;
+            }
+        }
+    });
+})();
+
+exit((new Detain\DepSecPatcher\Application())->run($argv, getenv()));
