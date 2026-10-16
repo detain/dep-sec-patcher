@@ -72,8 +72,12 @@ ecosystem tools you already have installed and skips the ones you don't.
 | `--push` | nothing | commits the changes to a new branch and pushes it |
 
 Check mode is safe to run against a working tree you care about: every file a
-tool changes is restored and every file it creates is deleted (see
-[Safety guarantees](#safety-guarantees)). Update mode changes manifests and
+tool changes is restored and every file it creates is deleted, so `git status`
+(ignored files included) is the same afterwards (see
+[Safety guarantees](#safety-guarantees)). One exception: a build or cache
+directory that already existed before the run (`obj/`, `.build/`,
+`node_modules/`, ...) is left in place, and tools may refresh cache files
+inside it (NuGet restore metadata, SwiftPM lock files). Update mode changes manifests and
 lockfiles in place and expects you to review `git diff`, or to use `--push`.
 
 The default is update mode, as it was in the original tool. Set
@@ -662,7 +666,9 @@ in-process.
   "still running after ..." line. `-v` streams all output.
 - **Workspace guard.** Before each audit the project directory's top level (and
   sbt's `project/`) is snapshotted. In check mode, afterwards, every new entry is
-  deleted and every changed file restored. In update mode only new build and
+  deleted and every changed file restored. The contents of build and
+  dependency directories that already existed are not snapshotted, so a tool
+  may refresh caches inside them. In update mode only new build and
   dependency directories are removed (`node_modules`, `vendor`, `target`,
   `obj`, `bin`, `build`, ...). Entries that existed before are never deleted.
   Read-only directories left by Go and Cargo are made writable before removal.
