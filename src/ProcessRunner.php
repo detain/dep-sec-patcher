@@ -181,7 +181,7 @@ final class ProcessRunner
         $this->killGroup($pid, self::SIGKILL);
         unset(self::$active[$pid]);
 
-        return new CommandResult($display, $exit ?? 1, $timedOut, $stdout, $output, microtime(true) - $start);
+        return new CommandResult($display, $exit, $timedOut, $stdout, $output, microtime(true) - $start);
     }
 
     /**

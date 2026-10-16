@@ -22,8 +22,8 @@ use Detain\DepSecPatcher\Scanner\Scanners;
 use RuntimeException;
 
 /**
- * One run of update-samples-security: ecosystem audits, scanners, GitHub
- * collection, PR triage, auto-fix, close-fixed, summary.
+ * One run: ecosystem audits, scanners, GitHub collection, PR triage,
+ * auto-fix, close-fixed, optional branch push, summary and JSON report.
  */
 final class SecurityRun
 {
@@ -34,29 +34,35 @@ final class SecurityRun
     private string $now;
     private ?GitHub $gh = null;
     private Context $ctx;
+    private string $root;
 
-    /**
-     * @param array<string, string>|null $profile resolved parent-project profile
-     */
     public function __construct(
         private Options $opt,
         private Console $console,
-        private ?array $profile,
-        private string $root,
+        private Target $target,
         private string $vulnDb,
         private string $reportDir,
-        private string $defaultRepo,
+        private string $configFile = '',
     ) {
-        $this->now = gmdate('Y-m-d\TH:i:s\Z');
+        $this->now  = gmdate('Y-m-d\TH:i:s\Z');
+        $this->root = $target->root;
     }
 
     public function run(): int
     {
         $c = $this->console;
-        if ($this->profile !== null) {
-            $c->line('project: ' . $this->profile['profile'] . ' (' . $this->profile['label'] . ')');
+        if ($this->target->remote) {
+            $c->line('target: ' . GitUrl::redact($this->target->url));
         }
         $c->line("root: {$this->root}");
+        if ($this->target->subdir !== '') {
+            $c->line("subdir: {$this->target->subdir}");
+        }
+        $c->line('github repo: ' . ($this->target->githubRepo !== '' ? $this->target->githubRepo : 'none')
+            . ($this->target->repoNote !== '' ? " ({$this->target->repoNote})" : ''));
+        if ($this->configFile !== '') {
+            $c->line("config: {$this->configFile}");
+        }
         $c->line("mode: {$this->opt->mode}");
         $c->line("vuln db: {$this->vulnDb}");
         $c->line("reports: {$this->reportDir}");
@@ -65,8 +71,10 @@ final class SecurityRun
         $c->line();
 
         $runner = new ProcessRunner($c, $this->opt->timeout, $this->opt->verbose, $this->opt->debug);
-        $index  = $this->opt->applyStored ? ManifestIndex::fromList($this->root, []) : new ManifestIndex($this->root);
-        $this->ctx = new Context($this->opt, $c, $runner, $this->root, $this->reportDir, $index);
+        $index  = $this->opt->applyStored
+            ? ManifestIndex::fromList($this->root, [])
+            : new ManifestIndex($this->root, $this->target->subdir, $this->opt->excludeDirs);
+        $this->ctx = new Context($this->opt, $c, $runner, $this->root, $this->reportDir, $index, $this->target->subdir);
         $nvd = $this->opt->nvdApiKey !== '' ? $this->opt->nvdApiKey : TokenHarvester::find('NVD_API_KEY');
         $this->ctx->state['nvd_api_key'] = (string)$nvd;
 
@@ -76,10 +84,18 @@ final class SecurityRun
             $this->runEcosystems();
         }
 
+        // --push publishes only this run's changes, so note the tree's state first
+        $publisher = null;
+        $cleanAtStart = null;
+        if ($this->opt->push && $this->opt->mode === 'update') {
+            $publisher    = new BranchPublisher($runner, $c, $this->root, $this->opt->timeout > 0 ? $this->opt->timeout : 600);
+            $cleanAtStart = $publisher->isClean();
+        }
+
         // Authenticate gh once up front so every GitHub step shares the result
-        if ($this->opt->githubEnabled()) {
+        if ($this->opt->githubEnabled() && $this->target->githubRepo !== '') {
             $this->gh = new GitHub($runner, $c, $this->root);
-            $this->gh->ensureAuth();
+            $this->gh()->ensureAuth();
         }
 
         $this->runScanners();
@@ -88,10 +104,31 @@ final class SecurityRun
         $this->triagePullRequests();
         $this->applyFixes();
         $this->closeFixedIssues();
+        $this->publishBranch($publisher, $cleanAtStart);
 
         $this->printSummary();
         $this->writeReport();
+
+        if ($this->opt->strict && $this->failed()) {
+            return 3;
+        }
         return 0;
+    }
+
+    /**
+     * Whether anything failed: a [FAIL] line, or a FAIL row in the summary.
+     */
+    public function failed(): bool
+    {
+        if ($this->console->fail > 0) {
+            return true;
+        }
+        foreach ($this->summary as $row) {
+            if ($row['status'] === 'FAIL') {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ── ecosystems ───────────────────────────────────────────────────────────
@@ -302,7 +339,7 @@ final class SecurityRun
     {
         $c = $this->console;
         $c->info('Running network/API security checks...');
-        $found = NetworkScanner::scan($this->ctx->files->files(), NetworkScanner::fileReader($this->root));
+        $found = NetworkScanner::scan($this->ctx->files->files(), NetworkScanner::fileReader($this->root), $this->opt->allowHttp);
         $total = 0;
 
         $list = static fn (array $files): string => implode(', ', array_slice($files, 0, 5)) . (count($files) > 5 ? ', …' : '');
@@ -339,9 +376,29 @@ final class SecurityRun
         return $this->gh !== null && $this->gh->ready;
     }
 
+    /**
+     * The GitHub client, for steps that already checked githubReady().
+     */
+    private function gh(): GitHub
+    {
+        if ($this->gh === null) {
+            throw new \LogicException('GitHub client used before githubReady() was checked');
+        }
+        return $this->gh;
+    }
+
     private function repo(): string
     {
-        return $this->gh?->resolveRepo($this->opt->ghRepo, $this->root, $this->defaultRepo) ?? '';
+        return $this->gh?->resolveRepo($this->target->githubRepo) ?? '';
+    }
+
+    /**
+     * Why there is no GitHub repository to work with, for SKIP lines.
+     */
+    private function noRepoReason(): string
+    {
+        return 'no GitHub repository' . ($this->target->repoNote !== '' ? ": {$this->target->repoNote}" : '')
+            . '; pass --repo OWNER/NAME';
     }
 
     /**
@@ -360,6 +417,11 @@ final class SecurityRun
             $c->info('github: skipping API collection (--apply-stored)');
             return;
         }
+        if ($this->target->githubRepo === '') {
+            $c->skip('github (' . $this->noRepoReason() . ')');
+            $this->record('dependabot', 'SKIP');
+            return;
+        }
         if (!$this->githubReady()) {
             $c->skip('github (gh unavailable or unauthenticated)');
             $this->record('dependabot', 'SKIP');
@@ -368,7 +430,7 @@ final class SecurityRun
         $repo = $this->repo();
         $c->info("GitHub repository: {$repo}");
 
-        $alerts = $this->gh->paginate("repos/{$repo}/dependabot/alerts?state=open&per_page=100");
+        $alerts = $this->gh()->paginate("repos/{$repo}/dependabot/alerts?state=open&per_page=100");
         $alertRecords = RecordNormalizer::fromDependabotAlerts($alerts ?? []);
         if ($alerts === null) {
             $c->warn('Dependabot: could not list alerts (API error or no access)');
@@ -389,7 +451,7 @@ final class SecurityRun
         }
 
         $status     = null;
-        $advisories = $this->gh->paginate("repos/{$repo}/security-advisories?per_page=100", $status);
+        $advisories = $this->gh()->paginate("repos/{$repo}/security-advisories?per_page=100", $status);
         $advRecords = RecordNormalizer::fromSecurityAdvisories($advisories ?? []);
         if ($advisories === null && $status !== 404) {
             $c->warn('Security advisories: could not list (API error)');
@@ -402,7 +464,7 @@ final class SecurityRun
         }
 
         $limit  = $this->opt->maxIssues === 0 ? 100000 : $this->opt->maxIssues;
-        $issues = $this->gh->openIssues($repo, $limit, 'number,title,body,author,url');
+        $issues = $this->gh()->openIssues($repo, $limit, 'number,title,body,author,url');
         $issueRecords = [];
         if ($issues === null) {
             $c->warn("Could not list issues for {$repo}");
@@ -425,7 +487,7 @@ final class SecurityRun
             return;
         }
         $db = $this->loadDb();
-        $db = VulnDb::upsert($db, $merged, $this->now, $this->gh->slug);
+        $db = VulnDb::upsert($db, $merged, $this->now, $this->gh()->slug);
         if ($this->saveDb($db)) {
             $c->ok('vuln DB: ' . count($db['vulns']) . ' records (' . VulnDb::countState($db, 'pending') . " pending) -> {$this->vulnDb}");
         }
@@ -439,13 +501,18 @@ final class SecurityRun
             $this->record('secret-scanning', 'SKIP');
             return;
         }
+        if ($this->target->githubRepo === '') {
+            $c->skip('secret scanning (no GitHub repository)');
+            $this->record('secret-scanning', 'SKIP');
+            return;
+        }
         if (!$this->githubReady()) {
             $c->skip('gh (unavailable or unauthenticated - cannot check secret scanning)');
             $this->record('secret-scanning', 'SKIP');
             return;
         }
         $c->info('Checking repository security settings...');
-        $info = $this->gh->json(['api', 'repos/' . $this->repo()], 60);
+        $info = $this->gh()->json(['api', 'repos/' . $this->repo()], 60);
         $sa   = is_array($info) ? ($info['security_and_analysis'] ?? null) : null;
         if (!is_array($sa)) {
             $c->skip('Secret scanning: cannot determine status');
@@ -483,6 +550,10 @@ final class SecurityRun
             $c->info('PR triage: skipped (--apply-stored)');
             return;
         }
+        if ($this->target->githubRepo === '') {
+            $c->skip('PR triage (no GitHub repository)');
+            return;
+        }
         if (!$this->githubReady()) {
             $c->skip('PR triage (gh unavailable or unauthenticated)');
             return;
@@ -490,7 +561,7 @@ final class SecurityRun
         $repo = $this->repo();
         $c->info("Triaging dependency-bot PRs on {$repo}...");
 
-        $prs = $this->gh->json(['pr', 'list', '--repo', $repo, '--state', 'open', '--limit', '100',
+        $prs = $this->gh()->json(['pr', 'list', '--repo', $repo, '--state', 'open', '--limit', '100',
             '--json', 'number,title,author,isDraft,headRefName']);
         if (!is_array($prs)) {
             $c->warn('PR triage: could not list pull requests');
@@ -530,10 +601,10 @@ final class SecurityRun
                     } else {
                         $c->info("  PR #{$num} behind base, rebase already requested");
                     }
-                } elseif ($this->gh->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--delete-branch'])->ok()) {
+                } elseif ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--delete-branch'])->ok()) {
                     $c->ok("  Merged PR #{$num}");
                     $merged++;
-                } elseif ($this->gh->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--auto', '--delete-branch'])->ok()) {
+                } elseif ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--auto', '--delete-branch'])->ok()) {
                     $c->ok("  Enabled auto-merge on PR #{$num} (pending required checks)");
                     $merged++;
                 } else {
@@ -563,7 +634,7 @@ final class SecurityRun
                 } else {
                     // No bot command available: leave the human-runnable equivalent
                     if ($defaultBranch === null) {
-                        $info          = $this->gh->json(['repo', 'view', $repo, '--json', 'defaultBranchRef'], 60);
+                        $info          = $this->gh()->json(['repo', 'view', $repo, '--json', 'defaultBranchRef'], 60);
                         $defaultBranch = (string)($info['defaultBranchRef']['name'] ?? 'master');
                     }
                     $branch = (string)($pr['headRefName'] ?? '');
@@ -593,7 +664,7 @@ final class SecurityRun
     {
         $state = ['UNKNOWN', 'UNKNOWN'];
         for ($i = 0; $i < 6; $i++) {
-            $data = $this->gh->json(['pr', 'view', $num, '--repo', $repo, '--json', 'mergeable,mergeStateStatus'], 60);
+            $data = $this->gh()->json(['pr', 'view', $num, '--repo', $repo, '--json', 'mergeable,mergeStateStatus'], 60);
             $m    = (string)($data['mergeable'] ?? '');
             if ($m !== '' && $m !== 'UNKNOWN') {
                 return [$m, (string)($data['mergeStateStatus'] ?? 'UNKNOWN')];
@@ -604,14 +675,15 @@ final class SecurityRun
     }
 
     /**
-     * @return array{comments: list<array<string, mixed>>, commits: list<array<string, mixed>>}
+     * @return array{comments: list<array<mixed>>, commits: list<array<mixed>>}
      */
     private function prComments(string $repo, string $num): array
     {
-        $data = $this->gh->json(['pr', 'view', $num, '--repo', $repo, '--json', 'comments,commits'], 60);
+        $data = $this->gh()->json(['pr', 'view', $num, '--repo', $repo, '--json', 'comments,commits'], 60);
+        $rows = static fn (mixed $v): array => is_array($v) ? array_values(array_filter($v, 'is_array')) : [];
         return [
-            'comments' => is_array($data['comments'] ?? null) ? $data['comments'] : [],
-            'commits'  => is_array($data['commits'] ?? null) ? $data['commits'] : [],
+            'comments' => $rows(is_array($data) ? ($data['comments'] ?? null) : null),
+            'commits'  => $rows(is_array($data) ? ($data['commits'] ?? null) : null),
         ];
     }
 
@@ -620,7 +692,7 @@ final class SecurityRun
      * pushed to the branch since we asked. (Comparing against the newest
      * comment would not do: the bot's own reply displaces ours.)
      *
-     * @param array{comments: list<array<string, mixed>>, commits: list<array<string, mixed>>}|null $data
+     * @param array{comments: list<array<mixed>>, commits: list<array<mixed>>}|null $data
      */
     private function rebaseRequested(string $repo, string $num, ?array $data = null): bool
     {
@@ -642,7 +714,7 @@ final class SecurityRun
 
     private function comment(string $repo, string $num, string $body): bool
     {
-        return $this->gh->run(['pr', 'comment', $num, '--repo', $repo, '--body', $body . "\n\n<!-- security-update:rebase -->"])->ok();
+        return $this->gh()->run(['pr', 'comment', $num, '--repo', $repo, '--body', $body . "\n\n<!-- security-update:rebase -->"])->ok();
     }
 
     private static function rebaseCommand(string $author): string
@@ -673,16 +745,21 @@ final class SecurityRun
             $c->ok('auto-fix: nothing pending');
             return;
         }
+        $plan    = FixPlanner::plan($db);
+        $inScope = array_values(array_filter($plan, fn (array $row): bool => $this->target->inScope($row['manifest'])));
+        // With --subdir, fixes for manifests elsewhere in the repository stay pending
+        $scopeNote = $this->target->subdir === '' ? ''
+            : ' (' . count($inScope) . ' of ' . count($plan) . " manifest/package fixes inside {$this->target->subdir})";
         if ($this->opt->mode !== 'update') {
-            $c->info("auto-fix: {$pending} pending fixes (MODE=check, not applying). Use --update to apply.");
+            $c->info("auto-fix: {$pending} pending fixes (MODE=check, not applying). Use --update to apply.{$scopeNote}");
             return;
         }
-        $c->info("auto-fix: applying {$pending} pending fix(es) from {$this->vulnDb}");
+        $c->info("auto-fix: applying {$pending} pending fix(es) from {$this->vulnDb}{$scopeNote}");
 
         $lister  = $this->dirLister();
         $updates = [];
         $applied = $missing = $notDeclared = $satisfied = 0;
-        foreach (FixPlanner::plan($db) as $row) {
+        foreach ($inScope as $row) {
             $target = ManifestPaths::sourceManifestFor($row['manifest'], $lister);
             $via    = $target !== $row['manifest'] ? ' (via ' . basename($row['manifest']) . ')' : '';
             $abs    = $this->root . '/' . $target;
@@ -749,6 +826,10 @@ final class SecurityRun
         if (!$this->opt->closeFixed) {
             return;
         }
+        if ($this->target->githubRepo === '') {
+            $c->skip('close-fixed (no GitHub repository)');
+            return;
+        }
         if (!$this->githubReady()) {
             $c->skip('close-fixed (GitHub unavailable)');
             return;
@@ -765,10 +846,10 @@ final class SecurityRun
         $labelOk = false;
         $label   = $this->opt->closeLabel;
         if ($label !== '') {
-            $labels = $this->gh->json(['label', 'list', '--repo', $repo, '--limit', '200', '--json', 'name'], 60);
+            $labels = $this->gh()->json(['label', 'list', '--repo', $repo, '--limit', '200', '--json', 'name'], 60);
             if (is_array($labels) && in_array($label, array_column($labels, 'name'), true)) {
                 $labelOk = true;
-            } elseif ($update && $this->gh->run(['label', 'create', $label, '--repo', $repo, '--color', '0E8A16',
+            } elseif ($update && $this->gh()->run(['label', 'create', $label, '--repo', $repo, '--color', '0E8A16',
                 '--description', 'Vulnerability verified resolved in the manifests'], 60)->ok()) {
                 $c->ok("created label '{$label}'");
                 $labelOk = true;
@@ -781,7 +862,7 @@ final class SecurityRun
         // The database keeps refs forever and most are long closed; only
         // consider issues that are actually open, so a run does not burn the
         // content-creation quota on failures
-        $open = $this->gh->json(['issue', 'list', '--repo', $repo, '--state', 'open', '--limit', '100000', '--json', 'number'], 900);
+        $open = $this->gh()->json(['issue', 'list', '--repo', $repo, '--state', 'open', '--limit', '100000', '--json', 'number'], 900);
         if (is_array($open) && $open !== []) {
             $openSet = array_flip(array_map('intval', array_column($open, 'number')));
             $c->info('close-fixed: ' . count($openSet) . ' issues open, ' . count($byIssue) . ' in the database');
@@ -799,7 +880,7 @@ final class SecurityRun
 
         $lister   = $this->dirLister();
         $contents = [];
-        $closed = $unresolved = $unverifiable = $rateLimited = 0;
+        $closed = $unresolved = $unverifiable = $rateLimited = $outOfScope = 0;
         foreach ($byIssue as $ref => $needs) {
             $ok       = true;
             $reason   = '';
@@ -808,6 +889,12 @@ final class SecurityRun
             foreach ($needs as $need) {
                 if ($need['package'] === '') {
                     continue;
+                }
+                // With --subdir, an issue is only judged when every manifest
+                // it names is inside the scanned part
+                if (!$this->target->inScope($need['manifest'])) {
+                    [$ok, $reason, $detail] = [false, 'out-of-scope', "{$need['manifest']} is outside {$this->target->subdir}"];
+                    break;
                 }
                 $target = ManifestPaths::sourceManifestFor($need['manifest'], $lister);
                 $abs    = $this->root . '/' . $target;
@@ -830,9 +917,13 @@ final class SecurityRun
             }
 
             if (!$ok) {
-                $reason === 'unresolved' ? $unresolved++ : $unverifiable++;
+                match ($reason) {
+                    'unresolved'   => $unresolved++,
+                    'out-of-scope' => $outOfScope++,
+                    default        => $unverifiable++,
+                };
                 if ($this->opt->debug) {
-                    $c->info("  #{$ref} " . ($reason === 'unresolved' ? 'still open' : 'unverifiable') . ": {$detail}");
+                    $c->info("  #{$ref} " . ($reason === 'unresolved' ? 'still open' : $reason) . ": {$detail}");
                 }
                 continue;
             }
@@ -843,7 +934,7 @@ final class SecurityRun
             }
             // Label first, so the marker survives even if the close fails
             if ($labelOk) {
-                $this->gh->run(['issue', 'edit', (string)$ref, '--repo', $repo, '--add-label', $label], 60);
+                $this->gh()->run(['issue', 'edit', (string)$ref, '--repo', $repo, '--add-label', $label], 60);
             }
             // GitHub applies a secondary limit to content-creating calls
             // (~80/minute, ~500/hour) separate from the REST quota: pace the
@@ -854,11 +945,11 @@ final class SecurityRun
             $body = "### Resolved — verified against the current manifests\n\n"
                 . "Every package this issue reports now declares a version at or above the required fix on `{$branch}`:\n\n"
                 . "| Package | Required | Declared | Manifest |\n| --- | --- | --- | --- |\n{$evidence}\n"
-                . 'Checked by `scripts/api/update-samples-security.sh --close-fixed`, which reads the version each manifest'
+                . 'Checked by [dep-sec-patcher](https://github.com/detain/dep-sec-patcher) `--close-fixed`, which reads the version each manifest'
                 . " declares rather than assuming an earlier fix succeeded. Reopen if this is wrong.\n\n"
                 . '<!-- security-update:closed-verified -->';
             for ($attempt = 1; ; $attempt++) {
-                $res = $this->gh->run(['issue', 'close', (string)$ref, '--repo', $repo, '--reason', 'completed', '--comment', $body], 120);
+                $res = $this->gh()->run(['issue', 'close', (string)$ref, '--repo', $repo, '--reason', 'completed', '--comment', $body], 120);
                 if ($res->ok()) {
                     $c->ok("  closed #{$ref} (all fixes verified)");
                     $closed++;
@@ -884,8 +975,36 @@ final class SecurityRun
                 break;
             }
         }
-        $c->info("close-fixed: closed={$closed} still-vulnerable={$unresolved} unverifiable={$unverifiable} rate-limited={$rateLimited}");
+        $c->info("close-fixed: closed={$closed} still-vulnerable={$unresolved} unverifiable={$unverifiable} rate-limited={$rateLimited}"
+            . ($this->target->subdir !== '' ? " outside-subdir={$outOfScope}" : ''));
         $this->record('close-fixed', 'PASS', 0, $closed);
+    }
+
+    // ── --push ───────────────────────────────────────────────────────────────
+
+    private function publishBranch(?BranchPublisher $publisher, ?bool $cleanAtStart): void
+    {
+        $c = $this->console;
+        if (!$this->opt->push) {
+            return;
+        }
+        if ($this->opt->mode !== 'update' || $publisher === null) {
+            $c->info('push: --check mode, nothing to push');
+            return;
+        }
+        if ($cleanAtStart === null) {
+            $c->skip("push ({$this->root} is not the top of a git work tree)");
+            return;
+        }
+        if ($cleanAtStart === false) {
+            $c->warn('push: the working tree had uncommitted changes before the run; not committing, so they cannot be mixed in');
+            return;
+        }
+        $branch  = $this->opt->branch !== '' ? $this->opt->branch : BranchPublisher::defaultBranch($this->now);
+        $message = "dependency security updates\n\nUpdated by dep-sec-patcher " . Application::VERSION . ' in update mode on '
+            . $this->now . ($this->target->subdir !== '' ? " (scope: {$this->target->subdir})" : '') . '.';
+        $pushed = $publisher->publish($branch, $message, $this->target->githubRepo);
+        $this->record('push', $pushed ? 'PASS' : 'SKIP');
     }
 
     // ── summary & report ─────────────────────────────────────────────────────
@@ -934,8 +1053,12 @@ final class SecurityRun
             ];
         }
         $report = [
+            'tool'           => 'dep-sec-patcher ' . Application::VERSION,
             'scan_timestamp' => $this->now,
             'root_dir'       => $this->root,
+            'subdir'         => $this->target->subdir,
+            'target'         => $this->target->remote ? GitUrl::redact($this->target->url) : $this->root,
+            'github_repo'    => $this->target->githubRepo,
             'mode'           => $this->opt->mode,
             'cvss_threshold' => (float)$this->opt->cvssThreshold,
             'summary'        => [
@@ -950,6 +1073,8 @@ final class SecurityRun
                 'trivy'  => ['enabled' => $this->opt->trivy !== 'no'],
                 'gosec'  => ['enabled' => $this->opt->gosec !== 'no'],
                 'bandit' => ['enabled' => $this->opt->bandit !== 'no'],
+                'grype'  => ['enabled' => $this->opt->trivy !== 'no' && $this->opt->grype !== 'no'],
+                'netsec' => ['enabled' => $this->opt->netsec !== 'no'],
             ],
         ];
         $file = $this->reportDir . '/security-scan-report.json';

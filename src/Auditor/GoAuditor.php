@@ -10,7 +10,7 @@ use Detain\DepSecPatcher\TargetResult;
 
 /**
  * Go: module updates, govulncheck, and optionally gosec (whose report now
- * goes to the report directory instead of being committed into the sample).
+ * goes to the report directory instead of being committed into the project).
  */
 final class GoAuditor extends Auditor
 {
@@ -105,7 +105,7 @@ final class GoAuditor extends Auditor
         [$modules, $stdlib] = self::parseFindings($r->stdout);
         $n = count($modules);
         // Standard-library findings belong to this host's Go toolchain, not
-        // to the sample, so on their own they do not fail it
+        // to the project, so on their own they do not fail it
         $t = $n > 0
             ? new TargetResult(TargetResult::FAIL, "govulncheck: {$n} {$mode} vulnerabilit" . ($n === 1 ? 'y' : 'ies') . ' in dependencies', $n)
             : new TargetResult(TargetResult::PASS, "govulncheck: no {$mode} vulnerabilities in dependencies");
@@ -121,7 +121,7 @@ final class GoAuditor extends Auditor
 
     /**
      * Split govulncheck text output into dependency findings and standard
-     * library findings (which belong to the toolchain, not the sample).
+     * library findings (which belong to the toolchain, not the project).
      *
      * @return array{0: list<string>, 1: list<string>} "id module@found -> fixed" lines, "id stdlib@version" lines
      */

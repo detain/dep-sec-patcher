@@ -52,31 +52,20 @@ final class GitHub
     }
 
     /**
-     * Repository slug: --repo, then the scanned tree's git remote, then the
-     * default; run through the API so a renamed repo resolves canonically.
+     * Canonical OWNER/NAME for a repository (from --repo or the target's
+     * origin remote), run through the API so a renamed or differently-cased
+     * repo resolves to its current name. Falls back to the input when the
+     * lookup fails.
      */
-    public function resolveRepo(string $explicit, string $root, string $default): string
+    public function resolveRepo(string $repo): string
     {
         if ($this->slug !== '') {
             return $this->slug;
         }
-        $slug = $explicit;
-        if ($slug === '' && is_dir($root . '/.git')) {
-            $r = $this->runner->run(['git', '-C', $root, 'remote', 'get-url', 'origin'], $root, ['timeout' => 30, 'label' => 'git']);
-            if ($r->ok()) {
-                $slug = (string)preg_replace(
-                    ['#^git@[^:]+:#', '#^ssh://git@[^/]+/#', '#^https?://[^/]+/#', '#\.git$#'],
-                    '',
-                    trim($r->stdout)
-                );
-            }
-        }
-        if ($slug === '') {
-            $slug = $default;
-        }
-        $repo = $this->json(['api', "repos/{$slug}"], 60);
-        if (is_array($repo) && !empty($repo['full_name'])) {
-            $slug = (string)$repo['full_name'];
+        $slug = $repo;
+        $info = $this->json(['api', "repos/{$slug}"], 60);
+        if (is_array($info) && !empty($info['full_name'])) {
+            $slug = (string)$info['full_name'];
         }
         return $this->slug = $slug;
     }
@@ -147,6 +136,9 @@ final class GitHub
         return $this->runner->run(array_merge(['gh'], $args), $this->cwd, ['timeout' => $timeout, 'label' => 'gh']);
     }
 
+    /**
+     * @phpstan-impure the answer changes once a token is exported
+     */
     private function authOk(): bool
     {
         return $this->run(['auth', 'status'], 60)->ok();

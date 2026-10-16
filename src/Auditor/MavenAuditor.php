@@ -61,7 +61,7 @@ final class MavenAuditor extends Auditor
         }
         $ctx->console->info('dependency-check: refreshing the NVD database (timeout ' . CommandResult::duration($ctx->opt->nvdTimeout) . ')...');
 
-        $argv = array_merge($ctx->state['maven.base'], [self::ODC . ':update-only']);
+        $argv = array_merge($this->base($ctx), [self::ODC . ':update-only']);
         $env  = $this->env($ctx);
         if ($key !== '') {
             // By environment variable, not -DnvdApiKey: a command-line value
@@ -88,7 +88,7 @@ final class MavenAuditor extends Auditor
 
     public function audit(Context $ctx, string $dir): TargetResult
     {
-        $base  = $ctx->state['maven.base'] ?? $this->baseArgs($ctx);
+        $base  = $this->base($ctx);
         $env   = $this->env($ctx);
         $notes = [];
 
@@ -106,7 +106,7 @@ final class MavenAuditor extends Auditor
             }
         }
 
-        // Report goes to the report directory, never into the sample's target/
+        // Report goes to the report directory, never into the project's target/
         $report = $ctx->reportPath('maven', $dir, 'dependency-check-report.json');
         @unlink($report);
         $threshold = $ctx->opt->cvssThreshold;
@@ -180,6 +180,17 @@ final class MavenAuditor extends Auditor
     private function version(Context $ctx): string
     {
         return $ctx->toolVersion('maven', ['mvn', '-v', '-B'], '/Apache Maven (\d+\.\d+\.\d+)/');
+    }
+
+    /**
+     * The mvn prefix computed in prepare(), shared with forked workers.
+     *
+     * @return list<string>
+     */
+    private function base(Context $ctx): array
+    {
+        $base = $ctx->state['maven.base'] ?? null;
+        return is_array($base) ? array_values(array_map('strval', $base)) : $this->baseArgs($ctx);
     }
 
     /**

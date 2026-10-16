@@ -88,7 +88,7 @@ final class Options
         /** @var array<string, true> $disabledByCli */
         $disabledByCli = [];
 
-        $args = array_values($argv);
+        $args = $argv;
         for ($i = 0; $i < count($args); $i++) {
             $arg   = $args[$i];
             $value = null;

@@ -431,6 +431,8 @@ final class ManifestEditor
     /**
      * preg_replace_callback that throws instead of returning null on a PCRE
      * error (backtrack/JIT limits), so a failure can never blank a manifest.
+     *
+     * @param-out int $count
      */
     private static function sub(string $rx, callable $fn, string $subject, int $limit = -1, ?int &$count = null): string
     {

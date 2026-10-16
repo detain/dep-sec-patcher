@@ -17,7 +17,7 @@ namespace Detain\DepSecPatcher;
  *   - in check mode ("audit only, no writes") also removes every other new
  *     file and restores every file whose content changed.
  *
- * Only entries that did NOT exist beforehand are ever deleted, so a sample's
+ * Only entries that did NOT exist beforehand are ever deleted, so a project's
  * own bin/ or build/ directory is never touched.
  */
 final class WorkspaceGuard

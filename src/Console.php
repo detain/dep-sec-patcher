@@ -25,11 +25,18 @@ final class Console
     private string $blue;
     private string $dim;
     private string $reset;
+    /** @var resource */
+    private $out;
 
+    /**
+     * @param resource|null $out where lines go (default: STDOUT)
+     */
     public function __construct(
         private bool $color,
-        private string $prefix = '[dep-sec-patcher]'
+        private string $prefix = '[dep-sec-patcher]',
+        $out = null
     ) {
+        $this->out    = is_resource($out) ? $out : STDOUT;
         $this->red    = $color ? "\033[0;31m" : '';
         $this->green  = $color ? "\033[0;32m" : '';
         $this->yellow = $color ? "\033[0;33m" : '';
@@ -115,6 +122,6 @@ final class Console
      */
     private function emit(string $msg): void
     {
-        fwrite(STDOUT, $this->prefix . ($msg === '' ? '' : ' ' . $msg) . "\n");
+        fwrite($this->out, $this->prefix . ($msg === '' ? '' : ' ' . $msg) . "\n");
     }
 }

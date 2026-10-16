@@ -31,6 +31,7 @@ final class VulnDb
      * one is reported through $corrupt and also treated as empty, rather than
      * failing every later step.
      *
+     * @param-out bool $corrupt
      * @return array<string, mixed>
      */
     public static function load(string $path, ?bool &$corrupt = null): array

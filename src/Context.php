@@ -23,7 +23,17 @@ final class Context
         public readonly string $root,
         public readonly string $reportDir,
         public readonly ManifestIndex $files,
+        public readonly string $subdir = '',
     ) {
+    }
+
+    /**
+     * Directory the whole-tree scanners run in: the root, or --subdir inside it.
+     * Target directories ($files) stay relative to the root either way.
+     */
+    public function scanRoot(): string
+    {
+        return $this->subdir === '' ? $this->root : $this->root . '/' . $this->subdir;
     }
 
     public function checkMode(): bool

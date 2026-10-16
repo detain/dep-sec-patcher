@@ -14,7 +14,7 @@ use Detain\DepSecPatcher\TargetResult;
  * The original shell script's snippet was missing a closing `fi`, so bash rejected it
  * and Python was never audited. It also ran
  * `pip install --break-system-packages -U -r requirements.txt`, which upgraded
- * packages in the host's own Python and never touched the sample; that is
+ * packages in the host's own Python and never touched the project; that is
  * gone. `pip-audit --fix` is what updates requirements.txt.
  */
 final class PythonAuditor extends Auditor

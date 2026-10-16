@@ -40,22 +40,25 @@ final class ForkPool
             return;
         }
 
-        $queue   = $jobs;
-        $running = [];   // pid => [job, tmpfile, group]
-        $inGroup = [];   // group => running count
+        $launched = [];  // job index => true once started
+        $running  = [];  // pid => [job, tmpfile, group]
+        $inGroup  = [];  // group => running count
 
-        while ($queue !== [] || $running !== []) {
+        while (count($launched) < count($jobs) || $running !== []) {
             // Start whatever fits, in queue order, skipping jobs whose group is full
-            foreach ($queue as $i => $job) {
+            foreach ($jobs as $i => $job) {
                 if (count($running) >= $threads) {
                     break;
+                }
+                if (isset($launched[$i])) {
+                    continue;
                 }
                 $group = $groupOf($job);
                 $limit = $limits[$group] ?? PHP_INT_MAX;
                 if (($inGroup[$group] ?? 0) >= $limit) {
                     continue;
                 }
-                unset($queue[$i]);
+                $launched[$i] = true;
 
                 $tmp = tempnam(sys_get_temp_dir(), 'dep-sec-patcher.');
                 $pid = $tmp === false ? -1 : pcntl_fork();
@@ -116,6 +119,9 @@ final class ForkPool
      */
     public static function signalChildren(int $signal): void
     {
+        if (!function_exists('posix_kill')) {
+            return;
+        }
         foreach (array_keys(self::$children) as $pid) {
             @posix_kill($pid, $signal);
         }

@@ -20,7 +20,7 @@ use Detain\DepSecPatcher\TargetResult;
  */
 final class Scanners
 {
-    public static function bandit(Context $ctx): ?TargetResult
+    public static function bandit(Context $ctx): TargetResult
     {
         if (!ProcessRunner::has('bandit')) {
             return new TargetResult(TargetResult::SKIP, 'bandit not installed');
@@ -30,8 +30,9 @@ final class Scanners
         }
         $report = $ctx->reportPath('bandit', '', 'bandit-results.json');
         @unlink($report);
-        $exclude = implode(',', array_map(static fn ($d) => "*/{$d}/*", ['node_modules', 'vendor', '.git', 'target', '.venv', 'build']));
-        $r = $ctx->runner->run(['bandit', '-r', '.', '-q', '-f', 'json', '-o', $report, '-x', $exclude], $ctx->root, ['label' => 'bandit']);
+        $dirs    = array_merge(['node_modules', 'vendor', '.git', 'target', '.venv', 'build'], self::extraExcludes($ctx));
+        $exclude = implode(',', array_map(static fn ($d) => "*/{$d}/*", $dirs));
+        $r = $ctx->runner->run(['bandit', '-r', '.', '-q', '-f', 'json', '-o', $report, '-x', $exclude], $ctx->scanRoot(), ['label' => 'bandit']);
         $data = is_file($report) ? json_decode((string)file_get_contents($report), true) : null;
         if (!is_array($data) || !isset($data['results'])) {
             return TargetResult::fromFailure($r, 'bandit');
@@ -56,7 +57,7 @@ final class Scanners
         return $t;
     }
 
-    public static function trivy(Context $ctx): ?TargetResult
+    public static function trivy(Context $ctx): TargetResult
     {
         if (!ProcessRunner::has('trivy')) {
             return new TargetResult(TargetResult::SKIP, 'trivy not installed');
@@ -71,8 +72,9 @@ final class Scanners
             // Trivy's own default timeout is 5 minutes, too short for this tree
             '--timeout', $timeout . 's',
             '--skip-dirs', '**/node_modules', '--skip-dirs', '**/vendor', '--skip-dirs', '**/.git',
+            ...self::trivySkips($ctx),
             '.',
-        ], $ctx->root, ['label' => 'trivy', 'timeout' => $timeout + 60]);
+        ], $ctx->scanRoot(), ['label' => 'trivy', 'timeout' => $timeout + 60]);
         $data = is_file($report) ? json_decode((string)file_get_contents($report), true) : null;
         if (!is_array($data)) {
             return TargetResult::fromFailure($r, 'trivy fs');
@@ -143,5 +145,41 @@ final class Scanners
             $out[] = [$dir, TargetResult::fromSeverities($bySev, 'grype')];
         }
         return $out;
+    }
+
+    /**
+     * Extra excluded directories (--exclude-dir / config), as paths relative
+     * to the scan root; bare names stay bare. Paths outside --subdir are dropped.
+     *
+     * @return list<string>
+     */
+    public static function extraExcludes(Context $ctx): array
+    {
+        $out = [];
+        foreach ($ctx->opt->excludeDirs as $entry) {
+            $entry = trim($entry, '/');
+            if ($entry === '') {
+                continue;
+            }
+            if (!str_contains($entry, '/') || $ctx->subdir === '') {
+                $out[] = $entry;
+            } elseif (str_starts_with($entry, $ctx->subdir . '/')) {
+                $out[] = substr($entry, strlen($ctx->subdir) + 1);
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * @return list<string> extra `--skip-dirs` arguments for trivy
+     */
+    private static function trivySkips(Context $ctx): array
+    {
+        $args = [];
+        foreach (self::extraExcludes($ctx) as $dir) {
+            $args[] = '--skip-dirs';
+            $args[] = str_contains($dir, '/') ? $dir : '**/' . $dir;
+        }
+        return $args;
     }
 }

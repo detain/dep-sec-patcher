@@ -81,7 +81,7 @@ final class SimpleAuditor extends Auditor
     public static function r(): self
     {
         // The original shell script also ran update.packages() in update mode, which
-        // upgraded the host's own R library and never touched a sample's
+        // upgraded the host's own R library and never touched a project's
         // DESCRIPTION; only the read-only listing is kept.
         return new self(
             'r',
@@ -141,7 +141,7 @@ final class SimpleAuditor extends Auditor
                 return $t;
             }
         }
-        $t = new TargetResult(TargetResult::PASS, implode(' ', end($steps)) . ' ok');
+        $t = new TargetResult(TargetResult::PASS, implode(' ', $steps[count($steps) - 1]) . ' ok');
         if ($this->note !== '') {
             $t->note($this->note);
         }

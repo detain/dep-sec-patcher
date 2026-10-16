@@ -21,9 +21,15 @@ final class NetworkScanner
 
     /**
      * http:// URLs that are identifiers, not endpoints: XML/JSON-schema
-     * namespaces, licence links, loopback.
+     * namespaces, licence links, loopback, documentation hosts. Prefixes of the
+     * URL after "http://"; extend them with --allow-http or the config file's
+     * "allow-http" list.
      */
-    private const HTTP_ALLOWED = '#^http://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|www\.w3\.org/|json-schema\.org/|www\.apache\.org/licenses|opensource\.org/|maven\.apache\.org/|xmlns\.|schemas\.|purl\.org/|example\.(?:com|org|net)|petstore\.swagger\.io)#i';
+    public const DEFAULT_HTTP_ALLOWED = [
+        'localhost', '127.0.0.1', '0.0.0.0', '[::1]', 'www.w3.org/', 'json-schema.org/', 'www.apache.org/licenses',
+        'opensource.org/', 'maven.apache.org/', 'xmlns.', 'schemas.', 'purl.org/', 'example.com', 'example.org',
+        'example.net', 'petstore.swagger.io',
+    ];
 
     /**
      * Assignment patterns; group 1 is the value, checked against PLACEHOLDER.
@@ -44,13 +50,15 @@ final class NetworkScanner
     private const PLACEHOLDER = '/example|^your\b|your[\s_-]|xxx|changeme|change_me|placeholder|dummy|sample|redacted|\$GLOBALS|^[<{$%]|^\*+$|^\.+$|^\s*$/i';
 
     /**
-     * @param list<string> $files relative paths
-     * @param callable     $read  (relative path): ?string file content, null to skip
+     * @param list<string> $files     relative paths
+     * @param callable     $read      (relative path): ?string file content, null to skip
+     * @param list<string> $allowHttp extra allowed plain-HTTP prefixes, added to DEFAULT_HTTP_ALLOWED
      * @return array{http: list<string>, credentials: array<string, list<string>>, tls: list<string>}
      */
-    public static function scan(array $files, callable $read): array
+    public static function scan(array $files, callable $read, array $allowHttp = []): array
     {
-        $found = ['http' => [], 'credentials' => [], 'tls' => []];
+        $allowed = self::allowPattern($allowHttp);
+        $found   = ['http' => [], 'credentials' => [], 'tls' => []];
         foreach ($files as $file) {
             $ext  = strtolower(pathinfo($file, PATHINFO_EXTENSION));
             if (preg_match('/\.(lock|sum)$|(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/', $file) === 1) {
@@ -66,7 +74,7 @@ final class NetworkScanner
             if ($isConfig && preg_match('/example|test/', $file) !== 1) {
                 if (preg_match_all('#http://[^\s"\'<>)]+#', $content, $m) > 0) {
                     foreach ($m[0] as $url) {
-                        if (preg_match(self::HTTP_ALLOWED, $url) !== 1) {
+                        if (preg_match($allowed, $url) !== 1) {
                             $found['http'][] = $file;
                             break;
                         }
@@ -103,5 +111,24 @@ final class NetworkScanner
             $content = @file_get_contents($abs);
             return $content === false ? null : $content;
         };
+    }
+
+    /**
+     * Regex matching an allowed plain-HTTP URL: the defaults plus $extra,
+     * each a prefix of the URL after "http://" in which * matches anything.
+     *
+     * @param list<string> $extra
+     */
+    public static function allowPattern(array $extra = []): string
+    {
+        $alternatives = [];
+        foreach (array_merge(self::DEFAULT_HTTP_ALLOWED, $extra) as $prefix) {
+            $prefix = (string)preg_replace('#^http://#i', '', $prefix);
+            if ($prefix === '') {
+                continue;
+            }
+            $alternatives[] = implode('.*', array_map(static fn (string $part): string => preg_quote($part, '#'), explode('*', $prefix)));
+        }
+        return '#^http://(?:' . implode('|', $alternatives) . ')#i';
     }
 }
