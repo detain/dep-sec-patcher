@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Detain\DepSecPatcher\Scanner;
 
+use Detain\DepSecPatcher\CommandResult;
 use Detain\DepSecPatcher\Context;
 use Detain\DepSecPatcher\ProcessRunner;
 use Detain\DepSecPatcher\TargetResult;
@@ -20,6 +21,13 @@ use Detain\DepSecPatcher\TargetResult;
  */
 final class Scanners
 {
+    /**
+     * Longest Retry-After worth waiting out when Maven Central rate-limits
+     * Trivy's POM lookups. A longer block (Central has answered with 1600s)
+     * goes straight to --offline-scan instead.
+     */
+    public const RATE_LIMIT_MAX_WAIT = 300;
+
     public static function bandit(Context $ctx): TargetResult
     {
         if (!ProcessRunner::has('bandit')) {
@@ -64,8 +72,7 @@ final class Scanners
         }
         $report  = $ctx->reportPath('trivy', '', 'trivy-fs-results.json');
         $timeout = $ctx->opt->timeout > 0 ? $ctx->opt->timeout : 3600;
-        @unlink($report);
-        $r = $ctx->runner->run([
+        $argv    = [
             'trivy', 'fs', '--quiet',
             '--scanners', 'vuln,misconfig,secret',
             '--format', 'json', '--output', $report,
@@ -73,11 +80,34 @@ final class Scanners
             '--timeout', $timeout . 's',
             '--skip-dirs', '**/node_modules', '--skip-dirs', '**/vendor', '--skip-dirs', '**/.git',
             ...self::trivySkips($ctx),
-            '.',
-        ], $ctx->scanRoot(), ['label' => 'trivy', 'timeout' => $timeout + 60]);
+        ];
+
+        // Trivy fetches parent POMs from Maven Central, which rate-limits by
+        // IP (the Maven audits earlier in the run count too) and makes Trivy
+        // abort the whole scan. Wait out a short block once; otherwise scan
+        // offline, which skips only those remote lookups.
+        $r       = self::runTrivy($ctx, $argv, $report, $timeout);
+        $wait    = self::rateLimitWait($r->output);
+        $offline = false;
+        if ($wait !== null && $wait <= self::RATE_LIMIT_MAX_WAIT) {
+            $ctx->console->detail('[trivy] Maven Central rate limit, retrying in ' . CommandResult::duration($wait + 1));
+            sleep($wait + 1);
+            $r    = self::runTrivy($ctx, $argv, $report, $timeout);
+            $wait = self::rateLimitWait($r->output);
+        }
+        if ($wait !== null) {
+            $ctx->console->detail('[trivy] Maven Central rate limit (Retry-After ' . CommandResult::duration($wait) . '), rescanning with --offline-scan');
+            $r       = self::runTrivy($ctx, [...$argv, '--offline-scan'], $report, $timeout);
+            $offline = true;
+        }
+
         $data = is_file($report) ? json_decode((string)file_get_contents($report), true) : null;
         if (!is_array($data)) {
-            return TargetResult::fromFailure($r, 'trivy fs');
+            $t = TargetResult::fromFailure($r, 'trivy fs' . ($offline ? ' --offline-scan' : ''));
+            if ($offline) {
+                $t->note('fell back to --offline-scan after a Maven Central rate limit');
+            }
+            return $t;
         }
         $vulns  = [];
         $misc   = 0;
@@ -105,8 +135,34 @@ final class Scanners
                 $t->status = TargetResult::WARN;
             }
         }
+        if ($offline) {
+            $t->detail .= '; offline scan';
+            $t->note('Maven Central rate-limited the scan, so it ran with --offline-scan: Java dependencies that only resolve through remote parent POMs may be missing');
+        }
         $t->note("report: {$report}");
         return $t;
+    }
+
+    /**
+     * @param list<string> $argv trivy fs options; the scan root "." is appended
+     */
+    private static function runTrivy(Context $ctx, array $argv, string $report, int $timeout): CommandResult
+    {
+        @unlink($report);
+        return $ctx->runner->run([...$argv, '.'], $ctx->scanRoot(), ['label' => 'trivy', 'timeout' => $timeout + 60]);
+    }
+
+    /**
+     * Seconds a Maven repository asked Trivy to back off (its 429 Retry-After),
+     * or null when the output shows no rate limit. A 429 without a numeric
+     * Retry-After counts as one minute.
+     */
+    public static function rateLimitWait(string $output): ?int
+    {
+        if (preg_match('/returned 429 Too Many Requests/i', $output) !== 1) {
+            return null;
+        }
+        return preg_match('/Retry-After:\s*(\d+)/i', $output, $m) === 1 ? (int)$m[1] : 60;
     }
 
     /**

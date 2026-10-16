@@ -16,7 +16,7 @@ final class SimpleAuditor extends Auditor
 {
     /**
      * @param list<string>      $manifests
-     * @param list<string>      $checkArgv  command in check mode
+     * @param list<list<string>> $checkArgv  commands in check mode
      * @param list<list<string>> $updateArgv commands in update mode
      * @param ?string           $serialWhy  set when the tool must not run concurrently
      * @param list<string>      $versionArgv
@@ -42,7 +42,7 @@ final class SimpleAuditor extends Auditor
             'dart',
             'dart',
             ['pubspec.yaml'],
-            ['dart', 'pub', 'outdated'],
+            [['dart', 'pub', 'outdated']],
             [['dart', 'pub', 'upgrade', '--major-versions']],
             'pub has no documented locking for concurrent runs against the shared pub cache (no fixed version known)',
             ['dart', '--version']
@@ -55,7 +55,9 @@ final class SimpleAuditor extends Auditor
             'elixir',
             'mix',
             ['mix.exs'],
-            ['mix', 'hex.audit'],
+            // hex.audit reads the fetched dependencies, so check mode fetches
+            // them first (the workspace guard removes deps/ and _build/ again)
+            [['mix', 'deps.get'], ['mix', 'hex.audit']],
             [['mix', 'deps.update', '--all'], ['mix', 'hex.audit']],
             'Hex\'s shared package cache has no documented concurrency guarantee (no fixed version known)',
             ['elixir', '--version'],
@@ -71,7 +73,7 @@ final class SimpleAuditor extends Auditor
             'swift',
             'swift',
             ['Package.swift'],
-            ['swift', 'package', 'show-dependencies'],
+            [['swift', 'package', 'show-dependencies']],
             [['swift', 'package', 'update']],
             'SwiftPM\'s shared dependency cache is not safe for concurrent resolution (no fixed version known)',
             ['swift', '--version']
@@ -87,7 +89,7 @@ final class SimpleAuditor extends Auditor
             'r',
             'Rscript',
             ['DESCRIPTION', 'renv.lock'],
-            ['Rscript', '-e', 'old.packages()'],
+            [['Rscript', '-e', 'old.packages()']],
             [['Rscript', '-e', 'old.packages()']],
             null,
             [],
@@ -132,7 +134,7 @@ final class SimpleAuditor extends Auditor
 
     public function audit(Context $ctx, string $dir): TargetResult
     {
-        $steps = $ctx->checkMode() ? [$this->checkArgv] : $this->updateArgv;
+        $steps = $ctx->checkMode() ? $this->checkArgv : $this->updateArgv;
         foreach ($steps as $argv) {
             $r = $this->run($ctx, $dir, $argv);
             if (!$r->ok()) {

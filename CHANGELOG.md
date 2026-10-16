@@ -45,6 +45,12 @@ First release: a standalone, generic port of MyAdmin's
 - The netsec plain-HTTP allow-list is a documented default that can be extended.
 - The no-`pcntl` fallback no longer references `SIGTERM`/`SIGKILL`, which are
   only defined when `pcntl` is loaded.
+- Trivy no longer aborts when Maven Central rate-limits its POM lookups
+  (HTTP 429): a `Retry-After` of up to 5 minutes is waited out and the scan
+  retried once, otherwise it reruns with `--offline-scan` and says so.
+- Elixir check mode runs `mix deps.get` before `mix hex.audit`, which needs
+  the fetched dependencies (it always warned before). The workspace guard
+  removes `deps/` and `_build/` afterwards.
 
 ### Kept
 

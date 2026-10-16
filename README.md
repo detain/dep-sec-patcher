@@ -365,7 +365,7 @@ followed, and `--exclude-dir` adds more.
 | `rust` | `Cargo.toml` | `cargo`, `cargo-audit` | `cargo generate-lockfile` if needed, then `cargo audit` | `cargo update` rewrites `Cargo.lock` | yes |
 | `dotnet` | `*.sln`, `*.csproj`, `*.fsproj` (a solution owns the projects it references) | `dotnet`, `dotnet-outdated` | `dotnet restore`, `dotnet list package --vulnerable --include-transitive` | `dotnet-outdated -u:Auto` rewrites project files | always serial |
 | `dart` | `pubspec.yaml` | `dart` | `dart pub outdated` (informational, no advisory database) | `dart pub upgrade --major-versions` | always serial |
-| `elixir` | `mix.exs` | `mix` | `mix hex.audit` (retired packages) | `mix deps.update --all`, then `mix hex.audit` | always serial |
+| `elixir` | `mix.exs` | `mix` | `mix deps.get`, then `mix hex.audit` (retired packages) | `mix deps.update --all`, then `mix hex.audit` | always serial |
 | `swift` | `Package.swift` | `swift` | `swift package show-dependencies` (informational) | `swift package update` | always serial |
 | `r` | `DESCRIPTION`, `renv.lock` | `Rscript` | `old.packages()` on the host R library (informational) | same; nothing is written | yes |
 
@@ -380,7 +380,7 @@ failing the project.
 
 | Scanner | Runs | Result |
 | --- | --- | --- |
-| `trivy` | `trivy fs --scanners vuln,misconfig,secret` over the scanned tree, once | Secrets or high/critical vulnerabilities fail; misconfigurations warn. Report `trivy/_root/trivy-fs-results.json`. |
+| `trivy` | `trivy fs --scanners vuln,misconfig,secret` over the scanned tree, once. If Maven Central rate-limits its POM lookups (HTTP 429), a `Retry-After` of up to 5 minutes is waited out and the scan retried once; a longer block, or a second 429, reruns it with `--offline-scan` | Secrets or high/critical vulnerabilities fail; misconfigurations warn. An offline fallback adds "offline scan" to the result. Report `trivy/_root/trivy-fs-results.json`. |
 | `bandit` | `bandit -r .` once, when there are `.py` files | HIGH findings fail, others warn. Report `bandit/_root/bandit-results.json`. |
 | `grype` | Builds an image from each of up to 5 `Dockerfile`s and scans it; needs `grype` and `docker`; images are removed afterwards | By severity. Skipped silently when either tool is missing. |
 | `gosec` | Inside each Go audit | Finding count as a note; report under `gosec/`. |
@@ -711,6 +711,15 @@ security alerts. That needs admin access or the `security_events` scope.
 **`refusing to use DIR: it exists and is not a clone made by dep-sec-patcher`.**
 `--workdir` points at a directory the tool did not create. Choose an empty or
 non-existent directory.
+
+**Trivy says "offline scan".** Maven Central answered Trivy's parent-POM
+lookups with `429 Too Many Requests`. It rate-limits by IP, and the Maven
+audits earlier in the same run count against the limit. A block of up to five
+minutes is waited out once; anything longer (Central has asked for 1600
+seconds) makes Trivy rescan with `--offline-scan`. That run still reports
+vulnerabilities, misconfigurations and secrets, but Java dependencies that
+only resolve through a remote parent POM can be missing. The next run, once
+the block has cleared, scans online again.
 
 **A project is SKIPped.** The reason is on the line: tool not installed, no
 lockfile to audit, or a Gradle/sbt plugin that is not applied. Install the tool,
