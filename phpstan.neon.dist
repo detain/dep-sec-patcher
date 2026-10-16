@@ -1,0 +1,10 @@
+parameters:
+    level: 8
+    paths:
+        - src
+        - tests
+        - bin/dep-sec-patcher
+    phpVersion:
+        min: 80100
+        max: 80499
+    tmpDir: .phpstan-cache
