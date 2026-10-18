@@ -49,6 +49,13 @@ class VersionTest extends TestCase
             'prerelease ordering'           => ['1.0.0-rc.1', '1.0.0-beta', true],
             'maven suffix'                  => ['4.1.100.Final', '4.1.42.Final', true],
             'four-part'                     => ['2.13.4.1', '2.13.4', true],
+            'trailing zero'                 => ['1.2', '1.2.0', true],
+            'trailing zero, other way'      => ['1.2.0', '1.2', true],
+            'pep440 rc below release'       => ['4.2rc1', '4.2', false],
+            'pep440 dev below release'      => ['2.0.0.dev1', '2.0.0', false],
+            'ruby rc below release'         => ['7.0.0.rc1', '7.0.0', false],
+            'release above ruby rc'         => ['7.0.0', '7.0.0.rc1', true],
+            'maven Final is a release'      => ['4.1.42.Final', '4.1.42', true],
         ];
     }
 
@@ -76,6 +83,16 @@ class VersionTest extends TestCase
             'maven final'    => ['4.1.42.Final', '4.1.42.Final'],
             'unresolved property' => ['${jackson.version}', ''],
             'star'           => ['*', ''],
+            'upper bound only' => ['<2', ''],
+            'pip upper and lower' => ['<1.27,>=1.21.1', '1.21.1'],
+            'not-equal ignored' => ['!=1.5,>=1.2', '1.2'],
+            'union takes the lowest' => ['^5.4 || ^6.0', '5.4'],
+            'composer single bar' => ['^1.0|^2.0', '1.0'],
+            'maven open lower' => ['(,1.0]', ''],
+            'maven union'    => ['[1.0,2.0),[3.0,)', '1.0'],
+            'hyphen range'   => ['1.2.3 - 2.0.0', '1.2.3'],
+            'composer dev branch' => ['1.0.x-dev', '1.0'],
+            'dev-master'     => ['dev-master', ''],
         ];
     }
 
@@ -159,5 +176,16 @@ class VersionTest extends TestCase
     {
         $this->assertSame('4.1.100.Final', Version::max(['4.1.42.Final', '4.1.100.Final', '4.1.9.Final']));
         $this->assertSame('', Version::max([]));
+    }
+
+    public function testMajorLineAndClearsAll(): void
+    {
+        $this->assertSame('4', Version::majorLine('^4.17.1'));
+        $this->assertSame('0.8', Version::majorLine('0.8.15'), 'below 1.0 a minor release is a major one');
+        $this->assertSame('', Version::majorLine('*'));
+        $spec = ['A' => ['1.1.12', '2.0.2'], 'B' => ['1.1.21']];
+        $this->assertTrue(Version::clearsAll('1.1.21', $spec));
+        $this->assertFalse(Version::clearsAll('1.1.14', $spec));
+        $this->assertFalse(Version::clearsAll('2.0.1', $spec), 'below the 2.x fix of A');
     }
 }

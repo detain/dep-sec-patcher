@@ -92,6 +92,25 @@ final class GitHub
     public function paginate(string $path, ?int &$httpStatus = null): ?array
     {
         $r = $this->run(['api', '--paginate', '--slurp', $path], 600);
+        if (!$r->ok() && str_contains($r->output, 'unknown flag')) {
+            // gh before 2.48 has no --slurp: one compact JSON item per line instead
+            $r = $this->run(['api', '--paginate', $path, '--jq', '.[] | tojson'], 600);
+            $httpStatus = preg_match('/HTTP (\d{3})/', $r->output, $m) === 1 ? (int)$m[1] : null;
+            if (!$r->ok()) {
+                return null;
+            }
+            $items = [];
+            foreach (preg_split('/\r?\n/', trim($r->stdout)) ?: [] as $line) {
+                $item = json_decode($line, true);
+                if ($line !== '' && !is_array($item)) {
+                    return null;
+                }
+                if (is_array($item)) {
+                    $items[] = $item;
+                }
+            }
+            return $items;
+        }
         $httpStatus = preg_match('/HTTP (\d{3})/', $r->output, $m) === 1 ? (int)$m[1] : null;
         if (!$r->ok()) {
             return null;
@@ -141,6 +160,13 @@ final class GitHub
      */
     private function authOk(): bool
     {
-        return $this->run(['auth', 'status'], 60)->ok();
+        // Only the account gh will use matters: plain `auth status` fails
+        // when any stored account's token is stale, even an inactive one
+        $r = $this->run(['auth', 'status', '--active'], 60);
+        if (!$r->ok() && str_contains($r->output, 'unknown flag')) {
+            // gh before 2.40 has no --active
+            $r = $this->run(['auth', 'status'], 60);
+        }
+        return $r->ok();
     }
 }

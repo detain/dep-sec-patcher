@@ -42,7 +42,8 @@ final class Version
         [$abase, $apre] = self::splitPrerelease($a);
         [$bbase, $bpre] = self::splitPrerelease($b);
 
-        if ($abase !== $bbase) {
+        // "1.2" and "1.2.0" are the same release
+        if ($abase !== $bbase && self::trimZeros($abase) !== self::trimZeros($bbase)) {
             return self::compare($abase, $bbase) >= 0;
         }
         // Same release: no prerelease outranks any prerelease
@@ -56,20 +57,61 @@ final class Version
     }
 
     /**
-     * Reduce a declared requirement to the version it pins or starts from:
+     * Reduce a declared requirement to the lowest version it admits:
      * "^4.17.1" -> "4.17.1", ">= 8.4.2" -> "8.4.2", "~> 2.0" -> "2.0".
      *
-     * Takes the first version-looking token, so a range such as ">=1.2 <2"
-     * yields "1.2". (The original shell script deleted the operators and glued the
-     * bounds together into "1.22".) Returns '' when nothing numeric is present.
+     * Only lower bounds and exact pins count, so ">=1.2 <2" yields "1.2" and
+     * "<2" yields '' (it admits anything below 2, however old). A union
+     * ("^5.4 || ^6.0") yields its lowest alternative. (The original shell
+     * script deleted the operators and glued the bounds together into
+     * "1.22".) Returns '' when no lower bound is present.
      */
     public static function floor(string $declared): string
     {
-        if (preg_match('/[0-9][0-9A-Za-z.+_-]*/', $declared, $m) !== 1) {
-            return '';
+        $declared = trim($declared);
+        // Maven/NuGet union of ranges: "[1.0,2.0),[3.0,)"
+        $parts = preg_split('/(?<=[\])])\s*,\s*(?=[\[(])/', $declared) ?: [$declared];
+        if (count($parts) === 1) {
+            // npm "||", Composer "||" and "|"
+            $parts = preg_split('/\s*\|\|?\s*/', $declared) ?: [$declared];
         }
-        // "1.2.x" / "1.2.*" wildcards: the floor is the fixed part
-        return rtrim(preg_replace('/\.[xX*](?:\.[xX*])*$/', '', $m[0]) ?? $m[0], '.');
+        if (count($parts) > 1) {
+            $floors = array_map([self::class, 'floor'], $parts);
+            return in_array('', $floors, true) ? '' : self::sortAscending($floors)[0];
+        }
+
+        $range = self::bracketRange($declared);
+        if ($range !== null) {
+            return $range['lower'] === '' ? '' : self::floor($range['lower']);
+        }
+        // npm hyphen range "1.2.3 - 2.0.0"
+        if (preg_match('/^(\S+)\s+-\s+\S+$/', $declared, $m) === 1) {
+            $declared = $m[1];
+        }
+        preg_match_all('/(===|==|>=|<=|!=|~=|~>|\^|~|>|<|=)?\s*[vV]?([0-9][0-9A-Za-z.+_-]*)/', $declared, $mm, PREG_SET_ORDER);
+        $lower = [];
+        foreach ($mm as $m) {
+            if (in_array($m[1], ['<', '<=', '!='], true)) {
+                continue;
+            }
+            // "1.2.x" / "1.2.*" / "1.0.x-dev" wildcards: the floor is the fixed part
+            $lower[] = rtrim((string)preg_replace('/(?:\.[xX*])+(?:-dev)?$/', '', $m[2]), '.');
+        }
+        return match (count($lower)) {
+            0       => '',
+            1       => $lower[0],
+            default => self::max($lower),
+        };
+    }
+
+    /**
+     * Whether a declared requirement is a union of alternatives
+     * ("^5.4 || ^6.0", "[1.0,2.0),[3.0,)"), which a single bumped version
+     * cannot replace without dropping an alternative.
+     */
+    public static function isUnion(string $declared): bool
+    {
+        return preg_match('/\||[\])]\s*,\s*[\[(]/', $declared) === 1;
     }
 
     /**
@@ -83,6 +125,35 @@ final class Version
             return '';
         }
         return isset($m[2]) ? $m[1] . '.' . $m[2] : $m[1];
+    }
+
+    /**
+     * The semver compatibility line a version belongs to: its major version,
+     * or "0.minor" below 1.0, where a minor release may break (as npm's
+     * caret treats it). "4.17.1" -> "4", "0.8.15" -> "0.8".
+     */
+    public static function majorLine(string $version): string
+    {
+        if (preg_match('/^(\d+)(?:\.(\d+))?/', self::floor($version), $m) !== 1) {
+            return '';
+        }
+        return $m[1] === '0' && isset($m[2]) ? '0.' . $m[2] : $m[1];
+    }
+
+    /**
+     * Whether a version clears every advisory in $spec (advisory id =>
+     * candidate fix versions).
+     *
+     * @param array<string, list<string>> $spec
+     */
+    public static function clearsAll(string $version, array $spec): bool
+    {
+        foreach ($spec as $candidates) {
+            if (!self::satisfies(self::floor($version), $candidates)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -239,10 +310,23 @@ final class Version
     private static function splitPrerelease(string $v): array
     {
         $pos = strpos($v, '-');
-        if ($pos === false) {
-            return [$v, null];
+        if ($pos !== false) {
+            return [substr($v, 0, $pos), substr($v, $pos + 1)];
         }
-        return [substr($v, 0, $pos), substr($v, $pos + 1)];
+        // PEP 440 / RubyGems / Maven prereleases carry no dash: "4.2rc1",
+        // "2.0.0.dev1", "7.0.0.rc1", "1.0.M1"
+        if (preg_match('/^(\d+(?:\.\d+)*)\.?((?:a|b|c|rc|alpha|beta|pre|preview|dev|snapshot|m|cr)\.?\d*)$/i', $v, $m) === 1) {
+            return [$m[1], $m[2]];
+        }
+        return [$v, null];
+    }
+
+    /**
+     * "1.2.0" -> "1.2", "1.0.0" -> "1"; anything not purely numeric unchanged.
+     */
+    private static function trimZeros(string $v): string
+    {
+        return preg_match('/^\d+(?:\.\d+)+$/', $v) === 1 ? (string)preg_replace('/(?:\.0+)+$/', '', $v) : $v;
     }
 
     // ── gnulib filevercmp ────────────────────────────────────────────────────

@@ -96,7 +96,34 @@ class OptionsTest extends TestCase
             'negative issues'  => [['--max-issues', '-1'], '--max-issues must be a non-negative integer'],
             'bad cvss'         => [['--cvss-threshold', 'high'], '--cvss-threshold must be a number'],
             'unknown --only'   => [['--only', 'cobol'], "--only: unknown check 'cobol'"],
+            'pr and direct'    => [['--pr', '--push-direct'], '--pr and --push-direct cannot be combined'],
+            'direct + branch'  => [['--push-direct', '--branch', 'x'], 'cannot be combined with --branch'],
+            'pr-merge alone'   => [['--push', '--pr-merge', 'merge'], '--pr-merge applies only with --pr'],
+            'bad pr-merge'     => [['--pr', '--pr-merge', 'octopus'], '--pr-merge must be one of squash, merge, rebase, none'],
         ];
+    }
+
+    public function testPushModes(): void
+    {
+        $o = Options::parse(['--push'], []);
+        $this->assertTrue($o->push);
+        $this->assertSame('branch', $o->pushMode);
+        $this->assertSame('squash', $o->prMerge);
+
+        $o = Options::parse(['--pr', '--pr-merge=rebase', '--branch', 'sec/x'], []);
+        $this->assertTrue($o->push, '--pr implies --push');
+        $this->assertSame('pr', $o->pushMode);
+        $this->assertSame('rebase', $o->prMerge);
+        $this->assertSame('sec/x', $o->branch);
+        $this->assertSame('pr', Options::parse(['--pr', '--push'], [])->pushMode, '--push does not undo --pr');
+
+        $this->assertFalse(Options::parse([], [])->allowMajor);
+        $this->assertTrue(Options::parse(['--allow-major'], [])->allowMajor);
+
+        $o = Options::parse(['--push-direct'], []);
+        $this->assertTrue($o->push, '--push-direct implies --push');
+        $this->assertSame('direct', $o->pushMode);
+        $this->assertFalse(Options::parse([], [])->push);
     }
 
     public function testHelpMentionsEveryEcosystem(): void

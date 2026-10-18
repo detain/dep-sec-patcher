@@ -44,6 +44,8 @@ final class Options
     public string $github = 'auto';
     public string $mergePrs = 'auto';
     public string $autoFix = 'auto';
+    /** Let auto-fix move a declared dependency to a new major version. */
+    public bool $allowMajor = false;
     public bool $applyStored = false;
     public bool $closeFixed = false;
     public string $closeLabel = 'security: verified fixed';
@@ -55,6 +57,10 @@ final class Options
     public string $nvdApiKey = '';
     public string $reportDir = '';
     public bool $push = false;
+    /** How --push publishes: 'branch', 'pr' (--pr) or 'direct' (--push-direct). */
+    public string $pushMode = 'branch';
+    /** --pr merge method: squash, merge, rebase, or none to leave the PR open. */
+    public string $prMerge = 'squash';
     public string $branch = '';
     public bool $strict = false;
     public bool $help = false;
@@ -85,6 +91,8 @@ final class Options
         $o->vulnDb  = $env['VULN_DB'] ?? $o->vulnDb;
         $modeFromCli = null;
         $onlyFromCli = false;
+        /** @var array<string, true> $pushFlags --pr / --push-direct / --pr-merge as given */
+        $pushFlags = [];
         /** @var array<string, true> $disabledByCli */
         $disabledByCli = [];
 
@@ -169,6 +177,9 @@ final class Options
                 case '--no-auto-fix':
                     $o->autoFix = 'no';
                     break;
+                case '--allow-major':
+                    $o->allowMajor = true;
+                    break;
                 case '--apply-stored':
                     $o->applyStored = true;
                     break;
@@ -220,6 +231,20 @@ final class Options
                 case '--push':
                     $o->push = true;
                     break;
+                case '--pr':
+                    $o->push     = true;
+                    $o->pushMode = 'pr';
+                    $pushFlags[$arg] = true;
+                    break;
+                case '--push-direct':
+                    $o->push     = true;
+                    $o->pushMode = 'direct';
+                    $pushFlags[$arg] = true;
+                    break;
+                case '--pr-merge':
+                    $o->prMerge = self::choice($take(), $arg, ['squash', 'merge', 'rebase', 'none']);
+                    $pushFlags[$arg] = true;
+                    break;
                 case '--branch':
                     $o->branch = self::branchName($take());
                     break;
@@ -259,6 +284,16 @@ final class Options
                     $o->setScanner($name, 'auto');
                 }
             }
+        }
+
+        if (isset($pushFlags['--pr'], $pushFlags['--push-direct'])) {
+            throw new InvalidArgumentException('--pr and --push-direct cannot be combined');
+        }
+        if ($o->pushMode === 'direct' && $o->branch !== '') {
+            throw new InvalidArgumentException('--push-direct commits to the checked-out branch, so it cannot be combined with --branch');
+        }
+        if (isset($pushFlags['--pr-merge']) && $o->pushMode !== 'pr') {
+            throw new InvalidArgumentException('--pr-merge applies only with --pr');
         }
 
         // CLI option overrides the environment
@@ -392,6 +427,9 @@ GitHub integration (requires the gh CLI):
   --no-github           Skip all GitHub API work
   --no-merge-prs        Do not merge Dependabot PRs or request rebases
   --no-auto-fix         Record vulnerabilities but never edit manifests
+  --allow-major         Let auto-fix move a dependency to a new major version
+                        when that is the only fix (default: such fixes are
+                        reported and left pending)
   --apply-stored        Apply fixes from the local vuln DB only (no API calls,
                         no ecosystem audits)
   --close-fixed         Close security issues whose packages now meet the
@@ -412,7 +450,14 @@ Mode options:
                         edits; anything a tool writes into the tree is undone
   --push                Update mode: commit the changes to a new branch and push
                         it to origin (needs a git TARGET that was clean at start)
-  --branch NAME         Branch for --push (default: dep-sec-patcher/<timestamp>)
+  --pr                  Like --push, then open a pull request from the branch
+                        into the branch the tree started on, merge it and
+                        delete the branch (implies --push)
+  --pr-merge METHOD     How --pr merges: squash (default), merge, rebase, or
+                        none to leave the pull request open for review
+  --push-direct         Like --push, but commit straight onto the checked-out
+                        branch (master/main/...) and push it; no side branch
+  --branch NAME         Branch for --push/--pr (default: dep-sec-patcher/<timestamp>)
 
 Environment:
   SECURITY_UPDATE_MODE=update|check   default mode (CLI flag wins)
@@ -446,6 +491,17 @@ TXT;
             ));
         }
         return (int)$value;
+    }
+
+    /**
+     * @param list<string> $choices
+     */
+    public static function choice(string $value, string $option, array $choices): string
+    {
+        if (!in_array($value, $choices, true)) {
+            throw new InvalidArgumentException("{$option} must be one of " . implode(', ', $choices) . ", got: {$value}");
+        }
+        return $value;
     }
 
     public static function cvss(string $value, string $option): string

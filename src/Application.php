@@ -55,6 +55,9 @@ final class Application
         $runner  = new ProcessRunner($console, $opt->timeout, $opt->verbose, $opt->debug);
         $cwd     = (string)getcwd();
 
+        // Before prepare(): Ctrl-C during the first clone must stop git too
+        $this->installSignalHandlers($console);
+
         try {
             [$opt, $target, $state, $configFile] = $this->prepare($opt, $args, $env, $cwd, $console, $runner);
         } catch (InvalidArgumentException | RuntimeException $e) {
@@ -62,9 +65,7 @@ final class Application
             return 1;
         }
 
-        $this->installSignalHandlers($console);
-
-        $run  = new SecurityRun($opt, $console, $target, $state->vulnDb, $state->reportDir, $configFile);
+        $run  = new SecurityRun($opt, $console, $target, $state->vulnDb, $state->reportDir, $configFile, $argv);
         $code = $run->run();
         $this->releaseLock();
         return $code;
@@ -210,6 +211,10 @@ final class Application
             pcntl_signal($sig, static function () use ($code, $parent, $console): void {
                 ProcessRunner::killAll(ProcessRunner::SIGTERM);
                 ForkPool::signalChildren(ProcessRunner::SIGTERM);
+                // exit() skips the finally blocks that undo a running
+                // audit's changes; give the stopped tools a moment, then undo
+                usleep(300000);
+                WorkspaceGuard::restoreAll();
                 if ((function_exists('posix_getpid') ? posix_getpid() : getmypid()) === $parent) {
                     $console->line('interrupted, stopping running tools');
                 }

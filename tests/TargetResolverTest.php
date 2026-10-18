@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Detain\DepSecPatcher\Tests;
 
+use Detain\DepSecPatcher\ProcessRunner;
 use Detain\DepSecPatcher\TargetResolver;
 use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
@@ -186,5 +187,22 @@ class TargetResolverTest extends TestCase
     {
         $env = TargetResolver::gitEnv();
         $this->assertSame('0', $env['GIT_TERMINAL_PROMPT']);
+    }
+
+    public function testGitUsesTheGhTokenForGithubHttps(): void
+    {
+        $this->setEnv('GH_TOKEN', null);
+        $this->setEnv('GITHUB_TOKEN', null);
+        $this->assertSame([], TargetResolver::gitOptions(), 'no token: the configured credential helpers apply');
+
+        $this->setEnv('GH_TOKEN', 'ghp_test');
+        if (!ProcessRunner::has('gh')) {
+            $this->assertSame([], TargetResolver::gitOptions());
+            return;
+        }
+        $this->assertSame(
+            ['-c', 'credential.https://github.com.helper=', '-c', 'credential.https://github.com.helper=!gh auth git-credential'],
+            TargetResolver::gitOptions()
+        );
     }
 }

@@ -22,8 +22,9 @@ use Detain\DepSecPatcher\Scanner\Scanners;
 use RuntimeException;
 
 /**
- * One run: ecosystem audits, scanners, GitHub collection, PR triage,
- * auto-fix, close-fixed, optional branch push, summary and JSON report.
+ * One run: GitHub collection, auto-fix, ecosystem updates and audits,
+ * scanners, PR triage, optional push (branch, pull request or direct),
+ * close-fixed, summary and JSON report.
  */
 final class SecurityRun
 {
@@ -35,6 +36,18 @@ final class SecurityRun
     private ?GitHub $gh = null;
     private Context $ctx;
     private string $root;
+    /** @var list<string> manifest edits made by auto-fix, for the commit message */
+    private array $appliedFixes = [];
+    /** Whether this run's changes reached the base branch on origin; null when not pushing. */
+    private ?bool $landed = null;
+    /** Whether the git tree was clean before the run; null outside a work tree. */
+    private ?bool $cleanAtStart = null;
+    /** What the run found but left undone, for the closing "Next steps". */
+    private int $readyFixes = 0;
+    private int $needsMajor = 0;
+    private int $mergeablePrs = 0;
+    private int $wouldClose = 0;
+    private int $openIssueRecords = 0;
 
     public function __construct(
         private Options $opt,
@@ -43,6 +56,8 @@ final class SecurityRun
         private string $vulnDb,
         private string $reportDir,
         private string $configFile = '',
+        /** @var list<string> the command line, program first, for suggesting the next one */
+        private array $argv = [],
     ) {
         $this->now  = gmdate('Y-m-d\TH:i:s\Z');
         $this->root = $target->root;
@@ -78,18 +93,18 @@ final class SecurityRun
         $nvd = $this->opt->nvdApiKey !== '' ? $this->opt->nvdApiKey : TokenHarvester::find('NVD_API_KEY');
         $this->ctx->state['nvd_api_key'] = (string)$nvd;
 
-        if ($this->opt->applyStored) {
-            $c->info('Ecosystem updaters: skipped (--apply-stored)');
-        } else {
-            $this->runEcosystems();
-        }
-
-        // --push publishes only this run's changes, so note the tree's state first
-        $publisher = null;
+        // --push publishes only this run's changes, so note the tree's state
+        // before anything touches it
+        $publisher    = null;
         $cleanAtStart = null;
+        $startBranch  = '';
+        if ($this->opt->mode === 'update') {
+            $this->cleanAtStart = (new BranchPublisher($runner, $c, $this->root))->isClean();
+        }
         if ($this->opt->push && $this->opt->mode === 'update') {
             $publisher    = new BranchPublisher($runner, $c, $this->root, $this->opt->timeout > 0 ? $this->opt->timeout : 600);
-            $cleanAtStart = $publisher->isClean();
+            $cleanAtStart = $this->cleanAtStart;
+            $startBranch  = $cleanAtStart === null ? '' : $publisher->currentBranch();
         }
 
         // Authenticate gh once up front so every GitHub step shares the result
@@ -98,15 +113,41 @@ final class SecurityRun
             $this->gh()->ensureAuth();
         }
 
-        $this->runScanners();
+        // When the result is pushed, merge the bot PRs first and pull them in,
+        // so this run's updates are made on top of them instead of
+        // conflicting with them at push time
+        $triaged = false;
+        if ($publisher !== null && $cleanAtStart === true && !$this->opt->applyStored) {
+            $this->triagePullRequests();
+            $triaged = true;
+            if ($startBranch !== '') {
+                $publisher->syncWithOrigin($startBranch);
+            }
+        }
+
+        // GitHub's alerts are written into the manifests before the ecosystem
+        // updates run, so the lockfiles are regenerated from the fixed
+        // manifests and the audits report the result
         $this->collectGitHub();
-        $this->checkRepoSettings();
-        $this->triagePullRequests();
         $this->applyFixes();
+
+        if ($this->opt->applyStored) {
+            $c->info('Ecosystem updaters: skipped (--apply-stored)');
+        } else {
+            $this->runEcosystems();
+        }
+
+        $this->runScanners();
+        $this->checkRepoSettings();
+        if (!$triaged) {
+            $this->triagePullRequests();
+        }
+        // Publish before close-fixed, which only closes what reached the base branch
+        $this->publishChanges($publisher, $cleanAtStart, $startBranch);
         $this->closeFixedIssues();
-        $this->publishBranch($publisher, $cleanAtStart);
 
         $this->printSummary();
+        $this->nextSteps();
         $this->writeReport();
 
         if ($this->opt->strict && $this->failed()) {
@@ -235,7 +276,13 @@ final class SecurityRun
                 $this->report($auditor->name(), $dir, $result instanceof TargetResult
                     ? $result
                     : new TargetResult(TargetResult::ERROR, 'worker returned no result'));
-            }
+            },
+            // Two audits of one directory (package.json and composer.json side
+            // by side) would undo each other's work through their guards
+            static fn (array $job): array => array_map(
+                static fn (string $g): string => $g === '' ? '.' : $g,
+                $job[0]->guardDirs($ctx, $job[1])
+            )
         );
     }
 
@@ -470,7 +517,8 @@ final class SecurityRun
             $c->warn("Could not list issues for {$repo}");
             $this->record('sec-issues', 'SKIP');
         } else {
-            $issueRecords = IssueParser::parse($issues);
+            // Issue bodies become manifest edits, so only a security bot's count
+            $issueRecords = IssueParser::parse(array_values(array_filter($issues, static fn ($i) => self::isBot($i['author'] ?? null))));
             if ($issueRecords !== []) {
                 $refs = count(array_unique(array_map(static fn ($r) => $r['ref'], $issueRecords)));
                 $c->info("Security issues: {$refs} issues -> " . count($issueRecords) . ' remediation records');
@@ -482,12 +530,23 @@ final class SecurityRun
         }
 
         $merged = array_map([RecordNormalizer::class, 'withEcosystem'], array_merge($alertRecords, $advRecords, $issueRecords));
-        if ($merged === []) {
+        $db     = $this->loadDb();
+        if ($merged === [] && $db['vulns'] === []) {
             $c->info('No vulnerability records collected');
             return;
         }
-        $db = $this->loadDb();
         $db = VulnDb::upsert($db, $merged, $this->now, $this->gh()->slug);
+        // Alerts fixed or dismissed and issues closed since they were recorded
+        // are retired, but only from a complete listing
+        if ($alerts !== null) {
+            $db = VulnDb::retire($db, 'dependabot', array_fill_keys(array_column($alertRecords, 'key'), true), $this->now);
+        }
+        if ($issues !== null && count($issues) < $limit) {
+            $open = array_fill_keys(array_map('intval', array_column($issues, 'number')), true);
+            $db   = VulnDb::retire($db, 'issue', array_fill_keys(array_column($issueRecords, 'key'), true), $this->now, $open);
+        }
+        $this->openIssueRecords = count(array_filter($db['vulns'], static fn ($v) => ($v['source'] ?? null) === 'issue'
+            && in_array($v['state'] ?? null, ['pending', 'applied'], true)));
         if ($this->saveDb($db)) {
             $c->ok('vuln DB: ' . count($db['vulns']) . ' records (' . VulnDb::countState($db, 'pending') . " pending) -> {$this->vulnDb}");
         }
@@ -562,14 +621,13 @@ final class SecurityRun
         $c->info("Triaging dependency-bot PRs on {$repo}...");
 
         $prs = $this->gh()->json(['pr', 'list', '--repo', $repo, '--state', 'open', '--limit', '100',
-            '--json', 'number,title,author,isDraft,headRefName']);
+            '--json', 'number,title,author,isDraft,headRefName,body']);
         if (!is_array($prs)) {
             $c->warn('PR triage: could not list pull requests');
             return;
         }
         // Only touch PRs raised by dependency bots, never a human contributor's work
-        $bots = array_values(array_filter($prs, static fn ($pr) => empty($pr['isDraft'])
-            && preg_match('/dependabot|renovate|mend|snyk/i', (string)($pr['author']['login'] ?? '')) === 1));
+        $bots = array_values(array_filter($prs, static fn ($pr) => empty($pr['isDraft']) && self::isBot($pr['author'] ?? null)));
         if ($bots === []) {
             $c->ok($prs === [] ? 'No open PRs' : 'No dependency-bot PRs open');
             $this->record('dep-prs', 'PASS');
@@ -584,12 +642,28 @@ final class SecurityRun
             $author = (string)($pr['author']['login'] ?? '');
             [$mergeable, $status] = $this->mergeState($repo, $num);
             $c->info("PR #{$num} [{$mergeable}/{$status}] " . ($pr['title'] ?? ''));
+            // A bot PR moving a dependency to a new major version gets the
+            // same opt-in as an auto-fix doing it
+            $majors = $this->opt->allowMajor ? [] : self::majorBumps((string)($pr['title'] ?? ''), (string)($pr['body'] ?? ''));
             if ($this->opt->mode !== 'update') {
+                if ($majors !== []) {
+                    $this->needsMajor++;
+                } else {
+                    $this->mergeablePrs += $mergeable === 'MERGEABLE' && $status !== 'UNSTABLE' ? 1 : 0;
+                }
                 continue;
             }
             $rebaseCmd = self::rebaseCommand($author);
-            if ($mergeable === 'MERGEABLE') {
-                if ($status === 'BLOCKED') {
+            if ($majors !== []) {
+                $c->warn("  PR #{$num} is a major upgrade (" . implode(', ', $majors) . '); not merged without --allow-major');
+                $this->needsMajor++;
+                $blocked++;
+            } elseif ($mergeable === 'MERGEABLE') {
+                if ($status === 'UNSTABLE') {
+                    // Failing or still-running checks: merging now could ship a broken build
+                    $c->warn("  PR #{$num} has checks that are failing or still running; left for a later run");
+                    $blocked++;
+                } elseif ($status === 'BLOCKED') {
                     $c->warn("  PR #{$num} is mergeable but blocked by branch protection");
                     $blocked++;
                 } elseif ($status === 'BEHIND') {
@@ -717,6 +791,50 @@ final class SecurityRun
         return $this->gh()->run(['pr', 'comment', $num, '--repo', $repo, '--body', $body . "\n\n<!-- security-update:rebase -->"])->ok();
     }
 
+    /**
+     * A dependency or security bot: a GitHub App account (which no user can
+     * impersonate) with one of the known names. A substring match on the
+     * login alone would trust "amendoza" or a freshly registered "renovate-fan".
+     */
+    private static function isBot(mixed $author): bool
+    {
+        return is_array($author) && ($author['is_bot'] ?? false) === true
+            && preg_match('#^(?:app/)?(?:dependabot|renovate|mend|whitesource|snyk)#i', (string)($author['login'] ?? '')) === 1;
+    }
+
+    /**
+     * The version bumps in a bot PR that cross a major line, as
+     * "bootstrap 3.4.1 -> 5.0.0". Read from Dependabot's title ("Bump x from
+     * A to B") and body ("Updates `x` from A to B"), and Renovate's table
+     * rows ("| [x](..) | `A` -> `B` |"); the changelog quoted further down a
+     * body is not looked at.
+     *
+     * @return list<string>
+     */
+    private static function majorBumps(string $title, string $body): array
+    {
+        $bumps = [];
+        $v     = '[vV]?([0-9][0-9A-Za-z.+-]*)';
+        if (preg_match('/^Bump (\S+) from ' . $v . ' to ' . $v . '/', $title, $m) === 1) {
+            $bumps[] = [$m[1], $m[2], $m[3]];
+        }
+        preg_match_all('/^Updates `([^`]+)` from ' . $v . ' to ' . $v . '/m', $body, $mm, PREG_SET_ORDER);
+        foreach ($mm as $m) {
+            $bumps[] = [$m[1], $m[2], $m[3]];
+        }
+        preg_match_all('/^\|\s*\[([^\]]+)\][^|]*\|.*?`' . $v . '`\s*->\s*`' . $v . '`/m', $body, $mm, PREG_SET_ORDER);
+        foreach ($mm as $m) {
+            $bumps[] = [$m[1], $m[2], $m[3]];
+        }
+        $out = [];
+        foreach ($bumps as [$pkg, $from, $to]) {
+            if (Version::majorLine($from) !== '' && Version::majorLine($from) !== Version::majorLine($to)) {
+                $out["{$pkg} {$from} -> {$to}"] = true;
+            }
+        }
+        return array_keys($out);
+    }
+
     private static function rebaseCommand(string $author): string
     {
         return match (true) {
@@ -750,48 +868,91 @@ final class SecurityRun
         // With --subdir, fixes for manifests elsewhere in the repository stay pending
         $scopeNote = $this->target->subdir === '' ? ''
             : ' (' . count($inScope) . ' of ' . count($plan) . " manifest/package fixes inside {$this->target->subdir})";
-        if ($this->opt->mode !== 'update') {
-            $c->info("auto-fix: {$pending} pending fixes (MODE=check, not applying). Use --update to apply.{$scopeNote}");
-            return;
-        }
-        $c->info("auto-fix: applying {$pending} pending fix(es) from {$this->vulnDb}{$scopeNote}");
+        // Check mode works out the same edits without writing them, so it can
+        // say what update mode would do
+        $write = $this->opt->mode === 'update';
+        $c->info($write
+            ? "auto-fix: applying {$pending} pending fix(es) from {$this->vulnDb}{$scopeNote}"
+            : "auto-fix: {$pending} pending fix(es); check mode only works out what update mode would change{$scopeNote}");
 
         $lister  = $this->dirLister();
         $updates = [];
-        $applied = $missing = $notDeclared = $satisfied = 0;
+        $applied = $missing = $notDeclared = $satisfied = $unsupported = $major = 0;
         foreach ($inScope as $row) {
             $target = ManifestPaths::sourceManifestFor($row['manifest'], $lister);
             $via    = $target !== $row['manifest'] ? ' (via ' . basename($row['manifest']) . ')' : '';
-            $abs    = $this->root . '/' . $target;
+            $abs    = $this->insideRoot($target);
+            $eco    = ManifestPaths::ecosystemFor($target);
+            $eco    = $eco !== 'unknown' ? $eco : $row['ecosystem'];
+            $pkg    = $row['package'];
+            $state  = 'pending';
 
-            if (!is_file($abs)) {
+            if ($abs === null) {
                 $missing++;
                 [$state, $note] = ['skipped', "manifest not found: {$target}"];
             } else {
                 $content  = (string)file_get_contents($abs);
-                $declared = ManifestEditor::declared($row['ecosystem'], $target, $content, $row['package']);
-                $ver      = Version::chooseTarget($declared, $row['spec'], $row['pkg_max']);
-                if ($ver === '') {
+                $declared = ManifestEditor::declared($eco, $target, $content, $pkg);
+                $pin      = $row['pkg_max'];
+                $current  = $declared;
+                $locked   = $declared === '' && $eco === 'npm' ? Lockfile::versions(dirname($abs), 'npm', $pkg) : null;
+                if ($locked !== null && $locked !== []) {
+                    // Transitive: what matters is what the lockfile resolved
+                    $lines = array_values(array_unique(array_map([Version::class, 'majorLine'], $locked)));
+                    if (array_filter($locked, static fn (string $v): bool => !Version::clearsAll($v, $row['spec'])) === []) {
+                        $ver = '';
+                    } elseif (count($lines) > 1) {
+                        // A package-wide pin would force every copy onto one line
+                        $ver = null;
+                    } else {
+                        $current = $locked[0];
+                        $ver     = $pin = Version::chooseTarget($locked[0], $row['spec']);
+                    }
+                } else {
+                    $ver = Version::chooseTarget($declared, $row['spec'], $pin);
+                }
+
+                if ($ver === null) {
+                    $unsupported++;
+                    $note = "{$pkg} is locked at " . implode(', ', $locked) . " in several major versions; pin it by hand";
+                } elseif ($ver === '') {
                     // Every advisory for this package is already cleared
                     $satisfied++;
-                    [$state, $note] = ['applied', "already satisfied: {$target} declares {$declared}"];
+                    $state = 'applied';
+                    $note  = $locked !== null && $locked !== []
+                        ? "already satisfied: the lockfile resolves {$pkg} to " . implode(', ', $locked)
+                        : "already satisfied: {$target} declares {$declared}";
+                } elseif (!$this->opt->allowMajor && Version::floor($current) !== '' && Version::majorLine($current) !== Version::majorLine($ver)) {
+                    // Left pending: --allow-major on a later run applies it
+                    $major++;
+                    $note = "needs a major upgrade: {$pkg} {$current} -> {$ver} in {$target} (rerun with --allow-major)";
+                    $c->warn("  {$eco} {$pkg} needs a major upgrade ({$current} -> {$ver}) in {$target}; not applied without --allow-major");
                 } else {
                     $res = ManifestEditor::apply(
-                        $row['ecosystem'],
+                        $eco,
                         $target,
                         $content,
-                        $row['package'],
+                        $pkg,
                         $ver,
-                        $row['pkg_max'] !== '' ? $row['pkg_max'] : $ver,
-                        is_file(dirname($abs) . '/yarn.lock')
+                        $pin !== '' ? $pin : $ver,
+                        is_file(dirname($abs) . '/yarn.lock'),
+                        is_file(dirname($abs) . '/package-lock.json') || is_file(dirname($abs) . '/npm-shrinkwrap.json')
                     );
                     if ($res['status'] === ManifestEditor::REFUSED) {
                         $notDeclared++;
                         [$state, $note] = ['skipped', "refused: {$ver} would downgrade the version declared in {$target}"];
+                    } elseif ($res['status'] === ManifestEditor::UNSUPPORTED) {
+                        $unsupported++;
+                        $note = "cannot edit {$pkg}" . ($declared !== '' ? " (declared as {$declared})" : '') . " in {$target}";
+                    } elseif ($res['content'] !== $content && !$write) {
+                        $applied++;
+                        $note = "would set {$ver} in {$target}";
+                        $c->info("  would set {$eco} {$pkg} -> {$ver} in {$target}{$via}");
                     } elseif ($res['content'] !== $content && file_put_contents($abs, $res['content']) !== false) {
                         $applied++;
                         [$state, $note] = ['applied', "set to {$ver} in {$target}"];
-                        $c->ok("  {$row['ecosystem']} {$row['package']} -> {$ver} in {$target}{$via}");
+                        $c->ok("  {$eco} {$pkg} -> {$ver} in {$target}{$via}");
+                        $this->appliedFixes[] = "{$eco} {$pkg} -> {$ver} in {$target}";
                     } else {
                         $notDeclared++;
                         [$state, $note] = ['skipped', "package not declared in {$target}"];
@@ -802,12 +963,22 @@ final class SecurityRun
                 $updates[] = ['key' => $key, 'state' => $state, 'note' => $note];
             }
         }
+        $this->needsMajor = $major;
+        if (!$write) {
+            $this->readyFixes = $applied;
+            $c->info("auto-fix (check mode): would-apply={$applied} already-ok={$satisfied} not-declared={$notDeclared}"
+                . " missing-manifest={$missing} cannot-edit={$unsupported} needs-major={$major}. Use --update to apply.");
+            return;
+        }
         $this->saveDb(VulnDb::applyStates($db, $updates, $this->now));
 
-        $c->info("auto-fix: applied={$applied} already-ok={$satisfied} not-declared={$notDeclared} missing-manifest={$missing}");
+        $c->info("auto-fix: applied={$applied} already-ok={$satisfied} not-declared={$notDeclared} missing-manifest={$missing}"
+            . " cannot-edit={$unsupported} needs-major={$major}");
         if ($applied > 0) {
             $this->record('auto-fix', 'PASS', 0, $applied);
-            $c->warn("Manifests were modified in {$this->root} — review 'git diff' before committing");
+            if (!$this->opt->push) {
+                $c->warn("Manifests were modified in {$this->root} — review 'git diff' before committing");
+            }
         } else {
             $this->record('auto-fix', 'SKIP');
         }
@@ -840,6 +1011,18 @@ final class SecurityRun
         }
         $repo   = $this->repo();
         $update = $this->opt->mode === 'update';
+        if ($update && $this->landed === false) {
+            // The fixes are on a side branch or an unmerged pull request, not
+            // on the branch the issues are judged against
+            $c->info("close-fixed: this run's changes have not reached the base branch; only listing what would close");
+            $update = false;
+        } elseif ($update && $this->landed === null && (new BranchPublisher($this->ctx->runner, $c, $this->root))->isClean() === false) {
+            // Uncommitted edits are not a fix yet, and a cache clone's are
+            // discarded by the next run
+            $c->info('close-fixed: the tree has uncommitted changes; only listing what would close'
+                . ' (commit and push them, or use --push-direct or --pr)');
+            $update = false;
+        }
 
         // The repo's existing "security fix" label means a Mend-generated fix
         // PR, so a dedicated marker label is used
@@ -863,13 +1046,16 @@ final class SecurityRun
         // consider issues that are actually open, so a run does not burn the
         // content-creation quota on failures
         $open = $this->gh()->json(['issue', 'list', '--repo', $repo, '--state', 'open', '--limit', '100000', '--json', 'number'], 900);
-        if (is_array($open) && $open !== []) {
-            $openSet = array_flip(array_map('intval', array_column($open, 'number')));
-            $c->info('close-fixed: ' . count($openSet) . ' issues open, ' . count($byIssue) . ' in the database');
-            $byIssue = array_intersect_key($byIssue, $openSet);
-        } else {
-            $c->warn('could not list open issues; falling back to every known ref');
+        if (!is_array($open)) {
+            // Working through every ref ever recorded would re-close closed
+            // issues and spend the content-creation quota doing it
+            $c->warn('close-fixed: could not list open issues; skipped');
+            $this->record('close-fixed', 'SKIP');
+            return;
         }
+        $openSet = array_flip(array_map('intval', array_column($open, 'number')));
+        $c->info('close-fixed: ' . count($openSet) . ' issues open, ' . count($byIssue) . ' in the database');
+        $byIssue = array_intersect_key($byIssue, $openSet);
         $c->info('close-fixed: checking ' . count($byIssue) . ' issue(s) against the current manifests');
 
         $branch = 'master';
@@ -896,11 +1082,27 @@ final class SecurityRun
                     [$ok, $reason, $detail] = [false, 'out-of-scope', "{$need['manifest']} is outside {$this->target->subdir}"];
                     break;
                 }
+                if ($need['fixed_version'] === '') {
+                    [$ok, $reason, $detail] = [false, 'unverifiable', "no fixed version is known for one of the {$need['package']} vulnerabilities"];
+                    break;
+                }
                 $target = ManifestPaths::sourceManifestFor($need['manifest'], $lister);
-                $abs    = $this->root . '/' . $target;
-                if (!is_file($abs)) {
+                $abs    = $this->insideRoot($target);
+                if ($abs === null) {
                     [$ok, $reason, $detail] = [false, 'unverifiable', "manifest missing: {$target}"];
                     break;
+                }
+                // Where a lockfile exists, what it resolved is what gets installed
+                $eco    = ManifestPaths::ecosystemFor($target);
+                $locked = in_array($eco, ['npm', 'composer'], true) ? Lockfile::versions(dirname($abs), $eco, $need['package']) : null;
+                if ($locked !== null && $locked !== []) {
+                    $behind = array_values(array_filter($locked, static fn (string $v): bool => !FixPlanner::requirementMet($v, $need)));
+                    if ($behind !== []) {
+                        [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is locked at " . implode(', ', $behind) . ", needs >= {$need['fixed_version']}"];
+                        break;
+                    }
+                    $evidence .= "| `{$need['package']}` | {$need['fixed_version']} | **" . implode(', ', $locked) . " (locked)** | `{$target}` |\n";
+                    continue;
                 }
                 $contents[$abs] ??= (string)file_get_contents($abs);
                 $cur = ManifestEditor::declared($need['ecosystem'], $target, $contents[$abs], $need['package']);
@@ -909,7 +1111,7 @@ final class SecurityRun
                     break;
                 }
                 if (!FixPlanner::requirementMet($cur, $need)) {
-                    [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is " . Version::floor($cur) . ", needs >= {$need['fixed_version']}"];
+                    [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is {$cur}, needs >= {$need['fixed_version']}"];
                     break;
                 }
                 // Record the evidence so the closing comment shows its working
@@ -930,6 +1132,7 @@ final class SecurityRun
             if (!$update) {
                 $c->info("  would close #{$ref} (all fixes verified)");
                 $closed++;
+                $this->wouldClose++;
                 continue;
             }
             // Label first, so the marker survives even if the close fails
@@ -980,9 +1183,9 @@ final class SecurityRun
         $this->record('close-fixed', 'PASS', 0, $closed);
     }
 
-    // ── --push ───────────────────────────────────────────────────────────────
+    // ── --push / --pr / --push-direct ────────────────────────────────────────
 
-    private function publishBranch(?BranchPublisher $publisher, ?bool $cleanAtStart): void
+    private function publishChanges(?BranchPublisher $publisher, ?bool $cleanAtStart, string $startBranch): void
     {
         $c = $this->console;
         if (!$this->opt->push) {
@@ -992,6 +1195,9 @@ final class SecurityRun
             $c->info('push: --check mode, nothing to push');
             return;
         }
+        // Until this run's changes are known to be on the base branch,
+        // close-fixed must not close anything on the strength of them
+        $this->landed = false;
         if ($cleanAtStart === null) {
             $c->skip("push ({$this->root} is not the top of a git work tree)");
             return;
@@ -1000,14 +1206,213 @@ final class SecurityRun
             $c->warn('push: the working tree had uncommitted changes before the run; not committing, so they cannot be mixed in');
             return;
         }
+        if (!$publisher->hasChanges()) {
+            // The base branch already is what the manifests say
+            $this->landed = true;
+            $this->record('push', 'SKIP');
+            return;
+        }
+
+        $files   = $publisher->changedFiles();
+        $title   = 'Dependency security updates';
+        $message = $title . "\n\n" . $this->changeSummary($files, false);
         $branch  = $this->opt->branch !== '' ? $this->opt->branch : BranchPublisher::defaultBranch($this->now);
-        $message = "dependency security updates\n\nUpdated by dep-sec-patcher " . Application::VERSION . ' in update mode on '
-            . $this->now . ($this->target->subdir !== '' ? " (scope: {$this->target->subdir})" : '') . '.';
-        $pushed = $publisher->publish($branch, $message, $this->target->githubRepo);
-        $this->record('push', $pushed ? 'PASS' : 'SKIP');
+
+        if ($this->opt->pushMode === 'direct') {
+            $result = $publisher->publishDirect($message, $branch);
+            $this->landed = $result === 'pushed';
+            $this->record('push', $result === 'pushed' ? 'PASS' : 'FAIL');
+            return;
+        }
+
+        $base = $startBranch;
+        if ($base === '' && $this->opt->pushMode === 'pr' && $this->githubReady()) {
+            $info = $this->gh()->json(['repo', 'view', $this->repo(), '--json', 'defaultBranchRef'], 60);
+            $base = (string)($info['defaultBranchRef']['name'] ?? '');
+        }
+        if (!$publisher->publish($branch, $message, $base)) {
+            $this->record('push', 'FAIL');
+            return;
+        }
+        if ($this->opt->pushMode !== 'pr') {
+            if ($this->target->githubRepo !== '') {
+                $c->info("open a pull request: gh pr create --repo {$this->target->githubRepo} --head {$branch} --fill");
+            }
+            $this->record('push', 'PASS');
+            return;
+        }
+        $this->record('push', $this->openPullRequest($publisher, $branch, $base, $title, $files) ? 'PASS' : 'FAIL');
+    }
+
+    /**
+     * --pr: open a pull request from the pushed $branch into $base, then
+     * merge it and delete the branch, unless --pr-merge none.
+     *
+     * @param list<string> $files
+     * @return bool false when the pull request could not be opened, or merging it failed
+     */
+    private function openPullRequest(BranchPublisher $publisher, string $branch, string $base, string $title, array $files): bool
+    {
+        $c = $this->console;
+        if ($this->target->githubRepo === '' || !$this->githubReady()) {
+            $c->fail("push: --pr needs gh and a GitHub repository; open a pull request for {$branch} by hand");
+            return false;
+        }
+        if ($base === '') {
+            $c->fail("push: could not tell which branch to open the pull request against; open one for {$branch} by hand");
+            return false;
+        }
+        $repo = $this->repo();
+        $body = "## {$title}\n\n" . $this->changeSummary($files, true) . "\n<!-- dep-sec-patcher:pr -->";
+        $r    = $this->gh()->run(['pr', 'create', '--repo', $repo, '--base', $base, '--head', $branch,
+            '--title', $title, '--body', $body], 120);
+        if (!$r->ok() || preg_match('#/pull/(\d+)#', $r->stdout, $m) !== 1) {
+            $c->fail("push: could not open a pull request for {$branch} (" . $r->failureReason() . ')');
+            foreach ($r->tail(4) as $line) {
+                $c->detail('| ' . $line);
+            }
+            return false;
+        }
+        $num = $m[1];
+        $url = trim($r->stdout);
+        $c->ok("push: opened pull request #{$num} {$url}");
+        if ($this->opt->prMerge === 'none') {
+            $c->info("push: leaving #{$num} open for review (--pr-merge none)");
+            return true;
+        }
+
+        [$mergeable] = $this->mergeState($repo, $num);
+        if ($mergeable === 'CONFLICTING') {
+            $c->fail("push: pull request #{$num} conflicts with {$base}; left open");
+            return false;
+        }
+        $method = '--' . $this->opt->prMerge;
+        $merge  = $this->gh()->run(['pr', 'merge', $num, '--repo', $repo, $method, '--delete-branch'], 300);
+        if ($merge->ok()) {
+            $c->ok("push: merged pull request #{$num} into {$base} and deleted {$branch}");
+            $publisher->deleteLocalBranch($branch);
+            if ($publisher->currentBranch() === $base) {
+                $publisher->syncWithOrigin($base);
+            }
+            $this->landed = true;
+            return true;
+        }
+        $auto = $this->gh()->run(['pr', 'merge', $num, '--repo', $repo, $method, '--auto', '--delete-branch'], 120);
+        if ($auto->ok()) {
+            $c->ok("push: enabled auto-merge on pull request #{$num}; it merges once the required checks pass");
+            return true;
+        }
+        $c->fail("push: could not merge pull request #{$num}; left open (" . $merge->failureReason() . ')');
+        foreach ($merge->tail(4) as $line) {
+            $c->detail('| ' . $line);
+        }
+        return false;
+    }
+
+    /**
+     * What the run changed, for the commit message and the pull request.
+     *
+     * @param list<string> $files
+     */
+    private function changeSummary(array $files, bool $markdown): string
+    {
+        $text = ($markdown ? 'Automated run of [dep-sec-patcher](https://github.com/detain/dep-sec-patcher) ' : 'Updated by dep-sec-patcher ')
+            . Application::VERSION . " in update mode on {$this->now}"
+            . ($this->target->subdir !== '' ? " (scope: {$this->target->subdir})" : '') . ".\n";
+        if ($this->appliedFixes !== []) {
+            $text .= "\n" . ($markdown ? '### ' : '') . 'Fixes applied from the vulnerability database' . ($markdown ? '' : ':') . "\n\n";
+            foreach (array_slice($this->appliedFixes, 0, 200) as $fix) {
+                $text .= "- {$fix}\n";
+            }
+            if (count($this->appliedFixes) > 200) {
+                $text .= '- ... and ' . (count($this->appliedFixes) - 200) . " more\n";
+            }
+        }
+        if ($files !== []) {
+            $text .= "\n" . ($markdown ? '### ' : '') . 'Files changed' . ($markdown ? '' : ':') . "\n\n";
+            foreach (array_slice($files, 0, 200) as $file) {
+                $text .= $markdown ? "- `{$file}`\n" : "- {$file}\n";
+            }
+            if (count($files) > 200) {
+                $text .= '- ... and ' . (count($files) - 200) . " more\n";
+            }
+        }
+        return $text;
     }
 
     // ── summary & report ─────────────────────────────────────────────────────
+
+    /**
+     * When the run found fixes it did not apply or publish, say so and print
+     * the command that would, built from the one that was run.
+     */
+    private function nextSteps(): void
+    {
+        $c       = $this->console;
+        $reasons = [];
+        $add     = [];
+        $check   = $this->opt->mode === 'check';
+        $git     = $this->target->remote || file_exists($this->root . '/.git');
+        $changed = false;
+
+        if ($check) {
+            $vulns = 0;
+            foreach ($this->summary as $key => $row) {
+                if (in_array($key, Options::ECOSYSTEMS, true) && $row['status'] === 'FAIL') {
+                    $vulns += $row['vulns'];
+                }
+            }
+            if ($vulns > 0) {
+                $reasons[] = "the audits found {$vulns} vulnerabilities; update mode updates the dependencies and audits again";
+            }
+            if ($this->readyFixes > 0) {
+                $reasons[] = "{$this->readyFixes} fix(es) from GitHub's alerts and issues would be written into the manifests";
+            }
+            if ($this->mergeablePrs > 0) {
+                $reasons[] = "{$this->mergeablePrs} dependency-bot pull request(s) can be merged";
+            }
+        } elseif (!$this->opt->push && $git && $this->cleanAtStart === true
+            && (new BranchPublisher($this->ctx->runner, $c, $this->root))->isClean() === false) {
+            $changed   = true;
+            $reasons[] = "this run's changes are only in {$this->root}"
+                . ($this->target->remote ? ', a cache clone the next run resets' : ', uncommitted');
+        }
+        if ($this->wouldClose > 0) {
+            $reasons[] = "{$this->wouldClose} issue(s) can be closed once the fixes are on the base branch";
+        }
+        if ($this->needsMajor > 0 && !$this->opt->allowMajor) {
+            $reasons[]  = "{$this->needsMajor} fix(es) or bot pull request(s) need a major version upgrade, which may break the code that uses them";
+            $add[]      = '--allow-major';
+        }
+        if (!$this->opt->closeFixed && $this->openIssueRecords > 0 && $this->target->githubRepo !== '') {
+            $reasons[] = 'security issues are recorded; --close-fixed closes the ones the manifests prove fixed';
+            $add[]     = '--close-fixed';
+        }
+        if ($reasons === []) {
+            return;
+        }
+
+        $c->line();
+        $c->heading('Next steps');
+        foreach ($reasons as $reason) {
+            $c->info($reason);
+        }
+        if (($check || $changed || !$this->opt->push) && $git && $this->target->githubRepo !== '') {
+            $base = $this->target->remote ? 'the default branch' : 'the checked-out branch';
+            $c->line('  Apply the fixes, commit them, open a pull request and merge it:');
+            $c->line('    ' . NextSteps::command($this->argv, array_merge(['--update', '--pr'], $add)));
+            $c->line("  Or commit straight to {$base}:");
+            $c->line('    ' . NextSteps::command($this->argv, array_merge(['--update', '--push-direct'], $add)));
+            $c->line('  Or push a branch for review only:');
+            $c->line('    ' . NextSteps::command($this->argv, array_merge(['--update', '--push'], $add)));
+        } elseif ($check || !$this->opt->push) {
+            $c->line('  Apply the fixes:');
+            $c->line('    ' . NextSteps::command($this->argv, array_merge(['--update'], $add)));
+        } elseif ($add !== []) {
+            $c->line('  Run again with:');
+            $c->line('    ' . NextSteps::command($this->argv, $add, false));
+        }
+    }
 
     private function record(string $key, string $status, int $vulns = 0, int $outdated = 0): void
     {
@@ -1112,6 +1517,20 @@ final class SecurityRun
             $this->console->warn("failed to update vuln DB: {$this->vulnDb} ({$e->getMessage()})");
             return false;
         }
+    }
+
+    /**
+     * Absolute path of a manifest named by a record, or null when it does not
+     * exist or resolves (through "..", or a symlink) outside the tree.
+     */
+    private function insideRoot(string $rel): ?string
+    {
+        $real = realpath($this->root . '/' . $rel);
+        $root = realpath($this->root);
+        if ($real === false || $root === false || !is_file($real) || !str_starts_with($real, rtrim($root, '/') . '/')) {
+            return null;
+        }
+        return $real;
     }
 
     private function dirLister(): callable

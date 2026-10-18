@@ -33,9 +33,12 @@ final class WorkspaceGuard
     private array $before = [];
     /** @var array<string, string> file => content, for restoring in check mode */
     private array $contents = [];
+    /** @var array<int, self> guards of audits in progress in this process */
+    private static array $active = [];
 
     public function __construct(private string $dir, private bool $checkMode)
     {
+        self::$active[spl_object_id($this)] = $this;
         foreach (['', 'project/'] as $prefix) {
             $entries = @scandir($this->dir . '/' . $prefix);
             if ($entries === false) {
@@ -56,10 +59,22 @@ final class WorkspaceGuard
     }
 
     /**
+     * Restore every guard whose audit is still running: a signal handler
+     * exits without unwinding to the finally that would do it.
+     */
+    public static function restoreAll(): void
+    {
+        foreach (self::$active as $guard) {
+            $guard->restore();
+        }
+    }
+
+    /**
      * @return list<string> human-readable list of what was undone
      */
     public function restore(): array
     {
+        unset(self::$active[spl_object_id($this)]);
         $undone = [];
         foreach (['', 'project/'] as $prefix) {
             if ($prefix !== '' && !isset($this->before['project'])) {

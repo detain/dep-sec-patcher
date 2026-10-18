@@ -187,11 +187,29 @@ final class TargetResolver
     }
 
     /**
+     * Options for every git command. With a GitHub token in the environment
+     * (possibly harvested from an rc file) git authenticates to github.com
+     * over HTTPS as the same account the gh steps use, through gh, ahead of
+     * any stored credential that may belong to someone else. (On the command
+     * line because proc_open drops the empty value that resets the helpers.)
+     *
+     * @return list<string>
+     */
+    public static function gitOptions(): array
+    {
+        if (((string)getenv('GH_TOKEN') === '' && (string)getenv('GITHUB_TOKEN') === '') || !ProcessRunner::has('gh')) {
+            return [];
+        }
+        // An empty helper resets the list collected from the config files
+        return ['-c', 'credential.https://github.com.helper=', '-c', 'credential.https://github.com.helper=!gh auth git-credential'];
+    }
+
+    /**
      * @param list<string> $args
      */
     private function git(string $cwd, array $args, int $timeout): CommandResult
     {
-        return $this->runner->run(array_merge(['git'], $args), $cwd, [
+        return $this->runner->run(array_merge(['git'], self::gitOptions(), $args), $cwd, [
             'timeout' => $timeout,
             'label'   => 'git',
             'env'     => self::gitEnv(),

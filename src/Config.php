@@ -25,7 +25,8 @@ use JsonException;
  *     "close-delay":    5,
  *     "close-limit":    400,
  *     "allow-http":     ["intranet.example.com/", "*.corp.example/"],
- *     "exclude-dirs":   ["docs", "test/fixtures"]
+ *     "exclude-dirs":   ["docs", "test/fixtures"],
+ *     "allow-major":    false
  *   }
  *
  * Keys starting with "$" or "_" are ignored (for "$schema" and comments).
@@ -46,7 +47,7 @@ final class Config
     ];
     private const KEYS = [
         'ecosystems', 'scanners', 'only', 'threads', 'timeout', 'nvd-timeout', 'cvss-threshold', 'max-issues',
-        'close-label', 'close-delay', 'close-limit', 'allow-http', 'exclude-dirs',
+        'close-label', 'close-delay', 'close-limit', 'allow-http', 'exclude-dirs', 'allow-major',
     ];
 
     /** @var array<string, bool> */
@@ -63,6 +64,7 @@ final class Config
     public array $allowHttp = [];
     /** @var list<string> */
     public array $excludeDirs = [];
+    public ?bool $allowMajor = null;
 
     private function __construct(public readonly string $source)
     {
@@ -135,6 +137,12 @@ final class Config
                         $c->strings($key, $value)
                     );
                     break;
+                case 'allow-major':
+                    if (!is_bool($value)) {
+                        throw $c->error('"allow-major" must be true or false, got ' . self::show($value));
+                    }
+                    $c->allowMajor = $value;
+                    break;
                 case 'exclude-dirs':
                     $c->excludeDirs = array_map(
                         fn (string $p): string => $c->wrap(static fn () => Options::relativePath($p, '"exclude-dirs"')),
@@ -182,6 +190,9 @@ final class Config
         }
         if ($this->closeLabel !== null) {
             $o->closeLabel = $this->closeLabel;
+        }
+        if ($this->allowMajor !== null) {
+            $o->allowMajor = $this->allowMajor;
         }
         $o->allowHttp   = array_merge($this->allowHttp, $o->allowHttp);
         $o->excludeDirs = array_merge($this->excludeDirs, $o->excludeDirs);

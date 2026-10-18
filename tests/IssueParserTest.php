@@ -121,4 +121,40 @@ class IssueParserTest extends TestCase
         ));
         $this->assertCount(1, $records);
     }
+
+    public function testGroupedMendIssueGivesOneRecordPerCve(): void
+    {
+        $body = "<details><summary> Vulnerable Library - <b>axios-1.3.5.tgz</b></summary>\n"
+            . "<p>Sample Path to Dependency File: /package.json</p>\n</details>\n\n## Vulnerabilities\n\n"
+            . "| Vulnerability | Severity | CVSS | Dependency | Type | Fixed in (axios version) | Remediation Possible** |\n"
+            . "| --- | --- | --- | --- | --- | --- | --- |\n"
+            . "| [CVE-2026-1](https://x) | <img src='x'> Critical | 9.3 | axios-1.3.5.tgz | Direct | 1.20.0 | &#10060; |\n"
+            . "| [CVE-2026-2](https://x) | <img src='x'> High | 8.7 | axios-1.3.5.tgz | Direct | axios - 1.16.0 | &#10060; |\n"
+            . "| [CVE-2026-3](https://x) | <img src='x'> Medium | 5.0 | axios-1.3.5.tgz | Direct | N/A | &#10060; |\n"
+            . "\n## Details\n\n<details>\n\n<summary> CVE-2026-1</summary>\n\n###  Vulnerable Library - <b>axios-1.3.5.tgz</b>\n"
+            . "<p>Sample Path to Dependency File: /package.json</p>\n<p>Fix Resolution: 1.20.0</p>\n</details>";
+        $records = IssueParser::parseIssue(self::issue('axios-1.3.5.tgz: 3 vulnerabilities (highest severity is: 9.3)', $body, 24));
+        $rows = array_map(static fn ($r) => [$r['id'], $r['package'], $r['fixed_version'], $r['severity'], $r['state'] ?? 'pending'], $records);
+        $this->assertSame([
+            ['CVE-2026-1', 'axios', '1.20.0', 'critical', 'pending'],
+            ['CVE-2026-2', 'axios', '1.16.0', 'high', 'pending'],       // table only: details were truncated
+            ['CVE-2026-3', 'axios', '', 'medium', 'skipped'],           // no fix known: keeps the issue open
+        ], $rows);
+        $this->assertSame('package.json|axios|CVE-2026-1', $records[0]['key']);
+        $this->assertSame([24], $records[0]['refs']);
+    }
+
+    public function testHostileBodiesAreNeutralised(): void
+    {
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-9 (High) detected in lib-1.0.0.jar',
+            "<p>Path to dependency file: /build.gradle</p>\n<p>Fix Resolution (com.acme:lib): 9.9.9\" + Eval.me('x') + \"</p>\n"
+        ));
+        $this->assertSame('', $records[0]['fixed_version'], 'not a version: never written anywhere');
+        $this->assertSame('skipped', $records[0]['state']);
+        $this->assertSame([], IssueParser::parseIssue(self::issue(
+            'CVE-2026-9 (High) detected in lib-1.0.0.tgz',
+            "<p>Path to dependency file: /../../etc/package.json</p>\n<p>Fix Resolution (lib): 1.0.1</p>\n"
+        )), 'a path outside the repository is dropped');
+    }
 }

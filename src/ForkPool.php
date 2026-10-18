@@ -30,9 +30,17 @@ final class ForkPool
      * @param array<string, int> $limits  group => max concurrent (missing = unlimited)
      * @param callable           $work    (job): result; runs in the worker, result must be serialisable
      * @param callable           $done    (job, result): void; runs in the parent, in completion order
+     * @param callable|null      $locksOf (job): list<string>; two jobs sharing a lock never run at once
      */
-    public static function run(array $jobs, int $threads, callable $groupOf, array $limits, callable $work, callable $done): void
-    {
+    public static function run(
+        array $jobs,
+        int $threads,
+        callable $groupOf,
+        array $limits,
+        callable $work,
+        callable $done,
+        ?callable $locksOf = null
+    ): void {
         if ($threads <= 1 || count($jobs) <= 1 || !function_exists('pcntl_fork')) {
             foreach ($jobs as $job) {
                 $done($job, $work($job));
@@ -41,8 +49,9 @@ final class ForkPool
         }
 
         $launched = [];  // job index => true once started
-        $running  = [];  // pid => [job, tmpfile, group]
+        $running  = [];  // pid => [job, tmpfile, group, locks]
         $inGroup  = [];  // group => running count
+        $held     = [];  // lock => true while a running job holds it
 
         while (count($launched) < count($jobs) || $running !== []) {
             // Start whatever fits, in queue order, skipping jobs whose group is full
@@ -57,6 +66,12 @@ final class ForkPool
                 $limit = $limits[$group] ?? PHP_INT_MAX;
                 if (($inGroup[$group] ?? 0) >= $limit) {
                     continue;
+                }
+                $locks = $locksOf !== null ? $locksOf($job) : [];
+                foreach ($locks as $lock) {
+                    if (isset($held[$lock])) {
+                        continue 2;
+                    }
                 }
                 $launched[$i] = true;
 
@@ -88,8 +103,11 @@ final class ForkPool
                     exit(0);
                 }
                 self::$children[$pid] = true;
-                $running[$pid]        = [$job, $tmp, $group];
+                $running[$pid]        = [$job, $tmp, $group, $locks];
                 $inGroup[$group]      = ($inGroup[$group] ?? 0) + 1;
+                foreach ($locks as $lock) {
+                    $held[$lock] = true;
+                }
             }
 
             if ($running === []) {
@@ -99,9 +117,12 @@ final class ForkPool
             if ($pid <= 0 || !isset($running[$pid])) {
                 continue;   // interrupted by a signal, or not one of ours
             }
-            [$job, $tmp, $group] = $running[$pid];
+            [$job, $tmp, $group, $locks] = $running[$pid];
             unset($running[$pid], self::$children[$pid]);
             $inGroup[$group]--;
+            foreach ($locks as $lock) {
+                unset($held[$lock]);
+            }
 
             $raw    = @file_get_contents($tmp);
             $result = is_string($raw) && $raw !== '' ? @unserialize($raw) : false;

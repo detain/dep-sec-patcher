@@ -100,9 +100,10 @@ final class VulnDb
             $db['vulns'][$key] = array_merge($v, [
                 'first_seen'   => self::orDefault($old['first_seen'] ?? null, $now),
                 'last_seen'    => $now,
-                'state'        => self::orDefault($old['state'] ?? null, 'pending'),
+                // A record can arrive already settled (an issue CVE with no known fix)
+                'state'        => self::orDefault($old['state'] ?? null, $v['state'] ?? 'pending'),
                 'applied_at'   => self::orDefault($old['applied_at'] ?? null, null),
-                'note'         => self::orDefault($old['note'] ?? null, ''),
+                'note'         => self::orDefault($old['note'] ?? null, $v['note'] ?? ''),
                 'refs'         => self::unique(array_merge(self::listOf($old['refs'] ?? null), self::listOf($v['refs'] ?? null))),
                 'fix_versions' => self::unique(array_merge(self::listOf($old['fix_versions'] ?? null), self::listOf($v['fix_versions'] ?? null))),
             ]);
@@ -111,6 +112,36 @@ final class VulnDb
             $db['repo'] = $repo;
         }
         $db['updated'] = $now;
+        return $db;
+    }
+
+    /**
+     * Retire pending records of one source that GitHub no longer reports:
+     * an alert that was fixed or dismissed, an issue that was closed. Only
+     * called with a complete listing, never after a failed or partial one.
+     *
+     * @param array<string, mixed> $db
+     * @param array<string, true>  $seenKeys keys of the records just collected from $source
+     * @param array<int, true>|null $openRefs for issues: the open issue numbers (a record
+     *                                        stays while any of its refs is open)
+     * @return array<string, mixed>
+     */
+    public static function retire(array $db, string $source, array $seenKeys, string $now, ?array $openRefs = null): array
+    {
+        foreach ($db['vulns'] as $key => $v) {
+            if (($v['source'] ?? null) !== $source || ($v['state'] ?? null) !== 'pending' || isset($seenKeys[$key])) {
+                continue;
+            }
+            if ($openRefs !== null) {
+                foreach (self::listOf($v['refs'] ?? null) as $ref) {
+                    if (is_int($ref) && isset($openRefs[$ref])) {
+                        continue 2;
+                    }
+                }
+            }
+            $db['vulns'][$key]['state'] = 'resolved';
+            $db['vulns'][$key]['note']  = "no longer open on GitHub as of {$now}";
+        }
         return $db;
     }
 

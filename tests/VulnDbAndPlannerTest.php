@@ -104,4 +104,32 @@ class VulnDbAndPlannerTest extends TestCase
         // Conservative for ranges: judged by the lower bound
         $this->assertFalse(FixPlanner::requirementMet('[2.8.3,3)', ['fixed_version' => '2.21.3', 'fix_versions' => ['2.21.3']]));
     }
+
+    public function testRetireOnlyPendingRecordsGithubNoLongerReports(): void
+    {
+        $db = VulnDb::upsert(VulnDb::empty(), [
+            ['key' => 'gone', 'source' => 'dependabot', 'refs' => [1]],
+            ['key' => 'open', 'source' => 'dependabot', 'refs' => [2]],
+            ['key' => 'done', 'source' => 'dependabot', 'refs' => [3]],
+            ['key' => 'iss-closed', 'source' => 'issue', 'refs' => [10]],
+            ['key' => 'iss-open', 'source' => 'issue', 'refs' => [10, 11]],
+        ], 't0', '');
+        $db = VulnDb::applyStates($db, [['key' => 'done', 'state' => 'applied', 'note' => '']], 't0');
+        $db = VulnDb::retire($db, 'dependabot', ['open' => true], 't1');
+        $this->assertSame('resolved', $db['vulns']['gone']['state']);
+        $this->assertSame('pending', $db['vulns']['open']['state']);
+        $this->assertSame('applied', $db['vulns']['done']['state'], 'settled records keep their outcome');
+        $this->assertSame('pending', $db['vulns']['iss-closed']['state'], 'other sources untouched');
+
+        $db = VulnDb::retire($db, 'issue', [], 't1', [11 => true]);
+        $this->assertSame('resolved', $db['vulns']['iss-closed']['state']);
+        $this->assertSame('pending', $db['vulns']['iss-open']['state'], 'one of its issues is still open');
+    }
+
+    public function testUpsertKeepsAnArrivingState(): void
+    {
+        $db = VulnDb::upsert(VulnDb::empty(), [['key' => 'k', 'state' => 'skipped', 'note' => 'no fixed version known']], 't', '');
+        $this->assertSame('skipped', $db['vulns']['k']['state']);
+        $this->assertSame('no fixed version known', $db['vulns']['k']['note']);
+    }
 }

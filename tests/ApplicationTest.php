@@ -221,4 +221,115 @@ class ApplicationTest extends TestCase
         $this->assertStringContainsString('push: the working tree had uncommitted changes before the run', $out);
         $this->assertSame('', $this->git($remote['bare'], ['branch', '--list', 'dep-sec-patcher/*']));
     }
+
+    public function testPushDirectCommitsOntoTheDefaultBranch(): void
+    {
+        $remote = $this->makeRemote(['web/package.json' => "{\n  \"dependencies\": {\n    \"qs\": \"^6.11.0\"\n  }\n}\n"]);
+        $db     = $this->scratchDir('db') . '/vulns.json';
+        VulnDb::save($db, VulnDb::upsert(VulnDb::empty(), [[
+            'key' => 'web/package.json|qs|CVE-1', 'source' => 'dependabot', 'id' => 'CVE-1', 'ref' => 1, 'refs' => [1],
+            'ecosystem' => 'npm', 'package' => 'qs', 'manifest' => 'web/package.json',
+            'fixed_version' => '6.15.2', 'fix_versions' => ['6.15.2'],
+        ]], '2026-01-01T00:00:00Z', ''));
+
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--push-direct', '--vuln-db', $db, $remote['url']], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('push: pushed the changes straight to main on origin', $out);
+        $this->assertStringContainsString('"qs": "^6.15.2"', $this->git($remote['bare'], ['show', 'main:web/package.json']));
+        $msg = $this->git($remote['bare'], ['log', '-1', '--format=%B', 'main']);
+        $this->assertStringContainsString('npm qs -> 6.15.2 in web/package.json', $msg);
+        $this->assertStringContainsString('- web/package.json', $msg);
+        $this->assertSame('', $this->git($remote['bare'], ['branch', '--list', 'dep-sec-patcher/*']), 'no side branch');
+    }
+
+    public function testPrWithoutGithubKeepsThePushedBranch(): void
+    {
+        $remote = $this->makeRemote(['web/package.json' => "{\"dependencies\": {\"qs\": \"^6.11.0\"}}\n"]);
+        $db     = $this->scratchDir('db') . '/vulns.json';
+        VulnDb::save($db, VulnDb::upsert(VulnDb::empty(), [[
+            'key' => 'web/package.json|qs|CVE-1', 'source' => 'dependabot', 'id' => 'CVE-1', 'ref' => 1, 'refs' => [1],
+            'ecosystem' => 'npm', 'package' => 'qs', 'manifest' => 'web/package.json',
+            'fixed_version' => '6.15.2', 'fix_versions' => ['6.15.2'],
+        ]], '2026-01-01T00:00:00Z', ''));
+
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--pr', '--branch', 'sec/qs', '--vuln-db', $db, $remote['url']], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('push: pushed branch sec/qs to origin', $out);
+        $this->assertStringContainsString('push: --pr needs gh and a GitHub repository; open a pull request for sec/qs by hand', $out);
+        $this->assertStringContainsString('"qs": "^6.15.2"', $this->git($remote['bare'], ['show', 'sec/qs:web/package.json']));
+    }
+
+    /**
+     * @param list<array<string, mixed>> $records
+     */
+    private function storedDb(array $records): string
+    {
+        $db = $this->scratchDir('db') . '/vulns.json';
+        VulnDb::save($db, VulnDb::upsert(VulnDb::empty(), $records, '2026-01-01T00:00:00Z', ''));
+        return $db;
+    }
+
+    public function testMajorUpgradesWaitForAllowMajor(): void
+    {
+        $dir = $this->scratchDir('major');
+        file_put_contents($dir . '/package.json', "{\n  \"dependencies\": {\n    \"bootstrap\": \"^3\"\n  }\n}\n");
+        $db = $this->storedDb([[
+            'key' => 'package.json|bootstrap|CVE-1', 'source' => 'issue', 'id' => 'CVE-1', 'ecosystem' => 'npm',
+            'package' => 'bootstrap', 'manifest' => 'package.json', 'fixed_version' => '4.0.0', 'fix_versions' => ['4.0.0'],
+        ]]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('npm bootstrap needs a major upgrade (^3 -> 4.0.0) in package.json', $out);
+        $this->assertStringContainsString('"bootstrap": "^3"', (string)file_get_contents($dir . '/package.json'));
+        $this->assertSame('pending', VulnDb::load($db)['vulns']['package.json|bootstrap|CVE-1']['state'], 'retried on a later run');
+
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--allow-major', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('"bootstrap": "^4.0.0"', (string)file_get_contents($dir . '/package.json'));
+    }
+
+    public function testTransitiveFixesFollowTheLockfile(): void
+    {
+        $dir = $this->scratchDir('transitive');
+        file_put_contents($dir . '/package.json', "{\n  \"dependencies\": {\n    \"minimatch\": \"^3.0.0\"\n  }\n}\n");
+        file_put_contents($dir . '/yarn.lock', "brace-expansion@^1.1.7:\n  version \"1.1.14\"\n\nqs@^6.0.0:\n  version \"6.15.2\"\n\n"
+            . "nanoid@^3.3.1:\n  version \"3.3.4\"\n\nnanoid@^5.0.0:\n  version \"5.0.1\"\n");
+        $record = static fn (string $pkg, array $fixes): array => [
+            'key' => "yarn.lock|{$pkg}|GHSA-{$pkg}", 'source' => 'dependabot', 'id' => "GHSA-{$pkg}", 'ecosystem' => 'npm',
+            'package' => $pkg, 'manifest' => 'yarn.lock', 'fixed_version' => $fixes[0], 'fix_versions' => $fixes,
+        ];
+        $db = $this->storedDb([
+            $record('brace-expansion', ['1.1.21', '2.0.2']),
+            $record('qs', ['6.14.1']),
+            $record('nanoid', ['3.3.8', '5.0.9']),
+        ]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $doc = json_decode((string)file_get_contents($dir . '/package.json'), true);
+        $this->assertSame(['brace-expansion' => '^1.1.21'], $doc['resolutions'], 'pinned on the release line the lockfile holds');
+        $this->assertArrayNotHasKey('overrides', $doc, 'a yarn project gets no npm overrides');
+
+        $vulns = VulnDb::load($db)['vulns'];
+        $this->assertSame('applied', $vulns['yarn.lock|qs|GHSA-qs']['state']);
+        $this->assertStringContainsString('the lockfile resolves qs to 6.15.2', $vulns['yarn.lock|qs|GHSA-qs']['note']);
+        $this->assertSame('pending', $vulns['yarn.lock|nanoid|GHSA-nanoid']['state']);
+        $this->assertStringContainsString('several major versions', $vulns['yarn.lock|nanoid|GHSA-nanoid']['note']);
+    }
+
+    public function testCheckModeSuggestsTheCommandThatAppliesTheFixes(): void
+    {
+        $dir = $this->scratchDir('suggest');
+        file_put_contents($dir . '/package.json', "{\"dependencies\": {\"qs\": \"^6.11.0\"}}\n");
+        $db = $this->storedDb([[
+            'key' => 'package.json|qs|CVE-1', 'source' => 'dependabot', 'id' => 'CVE-1', 'ecosystem' => 'npm',
+            'package' => 'qs', 'manifest' => 'package.json', 'fixed_version' => '6.15.2', 'fix_versions' => ['6.15.2'],
+        ]]);
+        [$rc, $out] = $this->cli(['--check', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('Next steps', $out);
+        $this->assertStringContainsString('would set npm qs -> 6.15.2 in package.json', $out);
+        $this->assertStringContainsString('1 fix(es) from GitHub\'s alerts and issues would be written', $out);
+        $this->assertMatchesRegularExpression('#Apply the fixes:\n\S+ +\S*dep-sec-patcher --update --apply-stored --vuln-db \S+ ' . preg_quote($dir, '#') . '\n#', $out);
+        $this->assertStringContainsString('"qs": "^6.11.0"', (string)file_get_contents($dir . '/package.json'), 'check mode changed nothing');
+    }
 }

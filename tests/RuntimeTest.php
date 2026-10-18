@@ -130,6 +130,40 @@ class RuntimeTest extends TestCase
         $this->assertLessThan($free[0][1], $free[1][0], 'unlimited jobs do overlap');
     }
 
+    public function testForkPoolLocksKeepSameDirectoryJobsApart(): void
+    {
+        if (!function_exists('pcntl_fork') || !function_exists('posix_getpid')) {
+            $this->markTestSkipped('pcntl and posix extensions required');
+        }
+        $log  = $this->dir . '/log';
+        // Different unlimited groups, but two of them work in the same directory
+        $jobs = [['npm', 'web'], ['composer', 'web'], ['go', 'api']];
+        ForkPool::run(
+            $jobs,
+            4,
+            static fn (array $j): string => $j[0],
+            [],
+            static function (array $j) use ($log): bool {
+                $start = microtime(true);
+                usleep(300000);
+                file_put_contents($log, "{$j[1]} {$start} " . microtime(true) . "\n", FILE_APPEND | LOCK_EX);
+                return true;
+            },
+            static function (): void {
+            },
+            static fn (array $j): array => [$j[1]]
+        );
+        $spans = [];
+        foreach (file($log) ?: [] as $line) {
+            [$dir, $s, $e] = explode(' ', trim($line));
+            $spans[$dir][] = [(float)$s, (float)$e];
+        }
+        usort($spans['web'], static fn ($a, $b) => $a[0] <=> $b[0]);
+        $this->assertCount(2, $spans['web']);
+        $this->assertGreaterThanOrEqual($spans['web'][0][1], $spans['web'][1][0], 'same directory never overlaps');
+        $this->assertLessThan($spans['web'][0][1], $spans['api'][0][0], 'another directory still runs alongside');
+    }
+
     public function testForkPoolSequentialFallback(): void
     {
         $pids = [];
@@ -173,6 +207,22 @@ class RuntimeTest extends TestCase
         $this->assertDirectoryDoesNotExist($this->dir . '/vendor');
         $this->assertContains('restored composer.json', $undone);
         $this->assertContains('removed composer.lock', $undone);
+    }
+
+    public function testRestoreAllUndoesAuditsStillRunning(): void
+    {
+        file_put_contents($this->dir . '/package.json', '{"a":1}');
+        $guard = new WorkspaceGuard($this->dir, true);
+        file_put_contents($this->dir . '/package.json', '{"a":2}');
+        file_put_contents($this->dir . '/yarn.lock', '');
+        WorkspaceGuard::restoreAll();
+        $this->assertSame('{"a":1}', file_get_contents($this->dir . '/package.json'));
+        $this->assertFileDoesNotExist($this->dir . '/yarn.lock');
+
+        file_put_contents($this->dir . '/yarn.lock', 'kept');
+        WorkspaceGuard::restoreAll();
+        $this->assertFileExists($this->dir . '/yarn.lock', 'a restored guard is no longer active');
+        unset($guard);
     }
 
     public function testManifestIndexPrunesDependencyDirs(): void

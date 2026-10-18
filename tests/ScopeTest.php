@@ -146,8 +146,19 @@ class ScopeTest extends TestCase
         $this->assertSame('/usr/local/go/bin:/h/go/bin:/h/.cargo/bin:/h/.dotnet/tools:/sdk/candidates/maven/current/bin:/usr/bin:/bin', $path);
 
         $path = Environment::toolPath(['HOME' => '/h', 'PATH' => '/bin', 'GOPATH' => '/g1:/g2', 'CARGO_HOME' => '/c'], static fn (string $d): bool => true, static fn (string $p): array => []);
-        $this->assertSame('/usr/local/go/bin:/g1/bin:/g2/bin:/c/bin:/h/.dotnet/tools:/bin', $path);
+        $this->assertSame('/usr/local/go/bin:/g1/bin:/g2/bin:/c/bin:/h/.dotnet/tools:/bin:/usr/local/bin:/h/.local/bin:/h/.yarn/bin:/h/.local/share/swiftly/bin:/h/.local/share/pnpm', $path);
 
         $this->assertSame('/usr/local/bin:/usr/bin:/bin', Environment::toolPath([], static fn (string $d): bool => false), 'no HOME, no PATH');
+    }
+
+    public function testToolPathAppendsRcFileInstalls(): void
+    {
+        $dirs  = ['/h/.yarn/bin', '/h/.nvm/versions/node/v9.11.2/bin', '/h/.nvm/versions/node/v24.1.0/bin', '/gems/bin', '/usr/bin', '/usr/local/bin'];
+        $isDir = static fn (string $d): bool => in_array($d, $dirs, true);
+        $glob  = static fn (string $p): array => $p === '/h/.nvm/versions/node/v*/bin'
+            ? ['/h/.nvm/versions/node/v24.1.0/bin', '/h/.nvm/versions/node/v9.11.2/bin']
+            : [];
+        $path = Environment::toolPath(['HOME' => '/h', 'PATH' => '/usr/bin:/h/.yarn/bin', 'GEM_HOME' => '/gems'], $isDir, $glob);
+        $this->assertSame('/usr/bin:/h/.yarn/bin:/usr/local/bin:/gems/bin:/h/.nvm/versions/node/v24.1.0/bin', $path, 'behind PATH, newest node only');
     }
 }

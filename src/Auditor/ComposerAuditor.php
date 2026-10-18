@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Detain\DepSecPatcher\Auditor;
 
+use Detain\DepSecPatcher\CommandResult;
 use Detain\DepSecPatcher\Context;
 use Detain\DepSecPatcher\TargetResult;
 
@@ -44,13 +45,13 @@ final class ComposerAuditor extends Auditor
     {
         $notes = [];
         if (!$ctx->checkMode()) {
-            $r = $this->run($ctx, $dir, array_merge(['composer', 'update', '-W'], self::FLAGS));
+            $r = $this->update($ctx, $dir, ['-W'], $notes);
             if (!$r->ok()) {
                 $notes[] = 'composer update ' . $r->failureReason();
             }
         } elseif (!$this->exists($ctx, $dir, 'composer.lock')) {
             // composer audit needs a lockfile; the guard removes it again
-            $r = $this->run($ctx, $dir, array_merge(['composer', 'update'], self::FLAGS));
+            $r = $this->update($ctx, $dir, [], $notes);
             if (!$r->ok()) {
                 return TargetResult::fromFailure($r, 'composer update (to create a lockfile)');
             }
@@ -82,5 +83,26 @@ final class ComposerAuditor extends Auditor
         }
         $t->notes = array_merge($notes, $t->notes);
         return $t;
+    }
+
+    /**
+     * composer update. Composer 2.9+ refuses to resolve to versions with
+     * security advisories, so a requirement only an insecure version meets
+     * fails the whole update; retry with that blocking off, so everything
+     * else still updates and the audit reports what stayed insecure.
+     *
+     * @param list<string> $extra
+     * @param list<string> $notes
+     */
+    private function update(Context $ctx, string $dir, array $extra, array &$notes): CommandResult
+    {
+        $argv = array_merge(['composer', 'update'], $extra, self::FLAGS);
+        $r    = $this->run($ctx, $dir, $argv);
+        if ($r->ok() || preg_match('/affected by security advisories|policy\.advisories|block-insecure/', $r->output) !== 1) {
+            return $r;
+        }
+        $notes[] = 'only versions with security advisories satisfy the requirements; resolved with Composer\'s advisory blocking off';
+        // COMPOSER_NO_SECURITY_BLOCKING is the Composer 2.9 name
+        return $this->run($ctx, $dir, $argv, null, ['COMPOSER_NO_BLOCKING' => '1', 'COMPOSER_NO_SECURITY_BLOCKING' => '1']);
     }
 }

@@ -44,15 +44,58 @@ class ManifestEditorTest extends TestCase
         $json = "{\n  \"name\": \"x\",\n  \"dependencies\": {}\n}\n";
         $res  = self::apply('npm', 'package.json', $json, 'minimatch', '3.1.2', '3.1.4', true);
         $doc  = json_decode($res['content'], true);
-        $this->assertSame(['minimatch' => '3.1.4'], $doc['overrides']);
-        $this->assertSame(['minimatch' => '3.1.4'], $doc['resolutions'], 'yarn honours resolutions');
+        $this->assertSame(['minimatch' => '^3.1.4'], $doc['resolutions'], 'yarn honours resolutions, as a caret range');
+        $this->assertArrayNotHasKey('overrides', $doc, 'yarn ignores npm overrides');
         $this->assertSame([], $doc['dependencies'], 'empty object survives');
         $this->assertStringContainsString('"dependencies": {}', $res['content']);
+
+        $doc = json_decode(self::apply('npm', 'package.json', $json, 'minimatch', '3.1.2', '3.1.4')['content'], true);
+        $this->assertSame(['minimatch' => '^3.1.4'], $doc['overrides'], 'npm: overrides');
+        $this->assertArrayNotHasKey('resolutions', $doc);
+    }
+
+    public function testNpmWildcardGetsAFloorAndOptionalDependenciesCount(): void
+    {
+        $json = "{\n  \"dependencies\": {\n    \"axios\": \"*\"\n  },\n  \"optionalDependencies\": {\n    \"fsevents\": \"^2.3.0\"\n  }\n}\n";
+        $doc  = json_decode(self::apply('npm', 'package.json', $json, 'axios', '1.20.0', '1.20.0', true)['content'], true);
+        $this->assertSame('>=1.20.0', $doc['dependencies']['axios'], 'open-ended, not pinned');
+        $this->assertArrayNotHasKey('resolutions', $doc, 'a direct dependency is not pinned package-wide');
+
+        $doc = json_decode(self::apply('npm', 'package.json', $json, 'fsevents', '2.3.3')['content'], true);
+        $this->assertSame('^2.3.3', $doc['optionalDependencies']['fsevents']);
+        $this->assertArrayNotHasKey('overrides', $doc, 'an override would conflict with the direct dependency');
+    }
+
+    public function testNpmLeavesUnionsAndNonRegistrySpecsAlone(): void
+    {
+        foreach (['^1.2.3 || ^2.0.0', 'github:xmldom/xmldom#fork', 'file:../lib', 'next', 'npm:other@^1.0.0'] as $spec) {
+            $json = json_encode(['dependencies' => ['a' => $spec]]) . "\n";
+            $res  = self::apply('npm', 'package.json', $json, 'a', '2.0.5');
+            $this->assertSame(ManifestEditor::UNSUPPORTED, $res['status'], $spec);
+            $this->assertSame($json, $res['content'], $spec);
+        }
+    }
+
+    public function testUnsafePackageOrVersionIsNeverWritten(): void
+    {
+        $gradle = "implementation 'com.acme:lib:1.0.0'\n";
+        $res    = self::apply('gradle', 'build.gradle', $gradle, 'com.acme:lib', "9.9.9\" + Eval.me('x') + \"");
+        $this->assertSame(ManifestEditor::UNSUPPORTED, $res['status']);
+        $this->assertSame($gradle, $res['content']);
+        $this->assertSame(ManifestEditor::UNSUPPORTED, self::apply('rubygems', 'Gemfile', "gem 'a', '1.0'\n", "a'; system('id')", '2.0')['status']);
+    }
+
+    public function testEcosystemComesFromTheManifest(): void
+    {
+        // GitHub reports Cargo as "rust" and Gradle builds as "maven"
+        $this->assertSame("serde = \"1.0.200\"\n", self::apply('rust', 'Cargo.toml', "serde = \"1.0.100\"\n", 'serde', '1.0.200')['content']);
+        $g = "implementation 'com.acme:lib:1.0.0'\n";
+        $this->assertSame("implementation 'com.acme:lib:1.2.0'\n", self::apply('maven', 'build.gradle', $g, 'com.acme:lib', '1.2.0')['content']);
     }
 
     public function testNpmNoValueChangeLeavesFormattingAlone(): void
     {
-        $json = "{\"overrides\":{\"a\":\"1.0.0\"}}";
+        $json = "{\"overrides\":{\"a\":\"^1.0.0\"}}";
         $res  = self::apply('npm', 'package.json', $json, 'a', '1.0.0', '1.0.0');
         $this->assertSame($json, $res['content']);
     }
@@ -83,6 +126,17 @@ class ManifestEditorTest extends TestCase
         $this->assertSame("certifi>=2023.1.1\nurllib3==2.6.3\npython-dateutil[extra]==2.9.0\nrequests-toolbelt==1.0\n", $res['content']);
     }
 
+    public function testRequirementsKeepMarkersAndRefuseHashes(): void
+    {
+        $txt = "requests>=2.0 ; python_version >= '3.8'  # http\nboto3==1.26.0\n";
+        $res = self::apply('pip', 'requirements.txt', $txt, 'requests', '2.31.0');
+        $this->assertSame("requests==2.31.0 ; python_version >= '3.8'  # http\nboto3==1.26.0\n", $res['content']);
+        $this->assertSame($txt, self::apply('pip', 'requirements.txt', $txt, 'boto', '2.49.0')['content'], 'boto is not boto3');
+
+        $hashed = "requests==2.25.1 \\\n    --hash=sha256:abc\n";
+        $this->assertSame(ManifestEditor::UNSUPPORTED, self::apply('pip', 'requirements.txt', $hashed, 'requests', '2.31.0')['status']);
+    }
+
     public function testPyprojectTableAndArrayForms(): void
     {
         $toml = "[tool.poetry.dependencies]\npytest = \">= 8.4.2\"\n[project]\ndependencies = [\n  \"urllib3>=1.25\",\n]\n";
@@ -90,14 +144,17 @@ class ManifestEditorTest extends TestCase
         $res  = self::apply('pip', 'pyproject.toml', $res['content'], 'urllib3', '2.6.3');
         $this->assertSame("[tool.poetry.dependencies]\npytest = \">= 9.0.3\"\n[project]\ndependencies = [\n  \"urllib3>=2.6.3\",\n]\n", $res['content']);
         // The original shell script could not read the TOML table form back
-        $this->assertSame('9.0.3', ManifestEditor::declared('pip', 'pyproject.toml', $res['content'], 'pytest'));
-        $this->assertSame('2.6.3', ManifestEditor::declared('pip', 'pyproject.toml', $res['content'], 'urllib3'));
+        $this->assertSame('>= 9.0.3', ManifestEditor::declared('pip', 'pyproject.toml', $res['content'], 'pytest'));
+        $this->assertSame('>=2.6.3', ManifestEditor::declared('pip', 'pyproject.toml', $res['content'], 'urllib3'));
     }
 
     public function testPipNameMatchingIsNormalised(): void
     {
-        $this->assertSame('2.8.2', ManifestEditor::declared('pip', 'requirements.txt', "Python_DateUtil>=2.8.2\n", 'python-dateutil'));
+        $this->assertSame('>=2.8.2', ManifestEditor::declared('pip', 'requirements.txt', "Python_DateUtil>=2.8.2\n", 'python-dateutil'));
         $this->assertSame('', ManifestEditor::declared('pip', 'requirements.txt', "pytest-cov==4.0\n", 'pytest'));
+        $this->assertSame('', ManifestEditor::declared('pip', 'requirements.txt', "boto3==1.26.0\n", 'boto'), 'boto is not boto3');
+        $this->assertSame('<2', ManifestEditor::declared('pip', 'requirements.txt', "urllib3<2\n", 'urllib3'));
+        $this->assertSame('<1.27,>=1.21.1', ManifestEditor::declared('pip', 'requirements.txt', "urllib3<1.27,>=1.21.1\n", 'urllib3'));
     }
 
     // ── maven ────────────────────────────────────────────────────────────────
@@ -189,6 +246,26 @@ XML;
         $this->assertSame($mod, self::apply('go', 'go.mod', $mod, 'net', '0.55.0')['content'], 'short names never match');
         $this->assertSame('0.3.0', ManifestEditor::declared('go', 'go.mod', $mod, 'golang.org/x/text'), 'single-line require');
         $this->assertStringContainsString('require golang.org/x/text v0.3.8', self::apply('go', 'go.mod', $mod, 'golang.org/x/text', 'v0.3.8')['content']);
+    }
+
+    public function testGoOnlyRequireLinesChange(): void
+    {
+        $mod = "module x\n\nrequire (\n\tgithub.com/docker/docker v20.10.7+incompatible\n\tgolang.org/x/net v0.47.0\n)\n\n"
+            . "exclude (\n\tgolang.org/x/net v0.40.0\n)\n\nreplace golang.org/x/net v0.30.0 => golang.org/x/net v0.31.0\n";
+        $res = self::apply('go', 'go.mod', $mod, 'golang.org/x/net', '0.55.0')['content'];
+        $this->assertStringContainsString("\tgolang.org/x/net v0.55.0\n", $res);
+        $this->assertStringContainsString("exclude (\n\tgolang.org/x/net v0.40.0\n)", $res, 'exclude untouched');
+        $this->assertStringContainsString('replace golang.org/x/net v0.30.0 => golang.org/x/net v0.31.0', $res, 'replace untouched');
+        $res = self::apply('go', 'go.mod', $mod, 'github.com/docker/docker', '20.10.11')['content'];
+        $this->assertStringContainsString("\tgithub.com/docker/docker v20.10.11+incompatible\n", $res);
+        $this->assertSame('20.10.7', ManifestEditor::declared('go', 'go.mod', $mod, 'github.com/docker/docker'));
+    }
+
+    public function testPubspecLeavesNestedKeysAlone(): void
+    {
+        $pub = "name: app\ndependencies:\n  path: ^1.8.0\n  mylib:\n    path: ../mylib\ndev_dependencies:\n  test: ^1.0.0\n";
+        $res = self::apply('pub', 'pubspec.yaml', $pub, 'path', '1.9.0')['content'];
+        $this->assertSame("name: app\ndependencies:\n  path: ^1.9.0\n  mylib:\n    path: ../mylib\ndev_dependencies:\n  test: ^1.0.0\n", $res);
     }
 
     public function testNugetBothAttributeOrders(): void

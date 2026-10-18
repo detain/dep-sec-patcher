@@ -127,7 +127,14 @@ final class NodeAuditor extends Auditor
             if ($berry) {
                 $notes[] = 'yarn ' . $this->yarnVersion($ctx) . ': dependency upgrade not automated for Yarn 2+';
             } else {
-                $r = $this->run($ctx, $dir, ['yarn', 'upgrade', '--ignore-scripts', '--non-interactive']);
+                // Bring the lockfile in line with package.json first (auto-fix
+                // may have just edited it); `yarn upgrade` refuses an
+                // outdated lockfile
+                $r = $this->run($ctx, $dir, ['yarn', 'install', '--ignore-scripts', '--non-interactive', '--no-progress']);
+                if (!$r->ok()) {
+                    $notes[] = 'yarn install ' . $r->failureReason();
+                }
+                $r = $this->run($ctx, $dir, ['yarn', 'upgrade', '--ignore-scripts', '--non-interactive', '--no-progress']);
                 if (!$r->ok()) {
                     $notes[] = 'yarn upgrade ' . $r->failureReason();
                 }

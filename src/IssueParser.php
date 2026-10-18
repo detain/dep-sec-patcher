@@ -48,22 +48,95 @@ final class IssueParser
         $title  = self::utf8((string)($issue['title'] ?? ''));
         $body   = self::utf8((string)($issue['body'] ?? ''));
         $number = $issue['number'] ?? 0;
+        $url    = (string)($issue['url'] ?? '');
 
-        if (!str_contains($body, 'Fix Resolution')) {
+        // "Path to dependency file:", or "Sample Path to Dependency File:" in
+        // the grouped format
+        $manifests = [];
+        preg_match_all("/Path to dependency file: ([^<\n]+)/iu", $body, $mm);
+        foreach ($mm[1] as $path) {
+            $path = self::manifestPath($path);
+            if ($path !== '') {
+                $manifests[] = $path;
+            }
+        }
+        $manifests = self::uniqueSorted($manifests);
+        if ($manifests === []) {
             return [];
         }
 
-        $cve  = preg_match('/^(?<c>(?:CVE|WS)-[0-9A-Za-z-]+)/u', $title, $m) === 1 ? $m['c'] : '';
+        $cve = preg_match('/^(?<c>(?:CVE|WS)-[0-9A-Za-z-]+)/u', $title, $m) === 1 ? $m['c'] : '';
+        if ($cve === '' && preg_match('/^## Vulnerabilities/mu', $body) === 1) {
+            return self::grouped($title, $body, $number, $url, $manifests);
+        }
+        if (!str_contains($body, 'Fix Resolution')) {
+            return [];
+        }
         $sev  = preg_match('/\((?<s>Critical|High|Medium|Low)\)/u', $title, $m) === 1 ? $m['s'] : '';
         $cvss = preg_match('/CVSS 3 Score Details \(<b>(?<v>[0-9.]+)<\/b>\)/u', $body, $m) === 1 ? $m['v'] : '0';
+        $id   = $cve === '' ? 'ISSUE-' . $number : $cve;
+        return self::records(self::fixes($title, $body), $id, $cve, $sev, $cvss, $number, $title, $url, $manifests);
+    }
 
-        $manifests = [];
-        preg_match_all("/Path to dependency file: ([^<\n]+)/u", $body, $mm);
-        foreach ($mm[1] as $path) {
-            $manifests[] = (string)preg_replace('#^/#', '', self::trim($path), 1);
+    /**
+     * Mend's grouped format: one issue per vulnerable library, a summary
+     * table with a row per CVE, then a <details> section per CVE carrying its
+     * own "Fix Resolution". GitHub's size limit truncates the sections
+     * ("Partial details (22 vulnerabilities)"), so a CVE with no section is
+     * taken from its table row, whose "Fixed in (axios version)" column names
+     * the library the issue is about.
+     *
+     * A CVE with no known fix becomes a record without a fixed version, so
+     * close-fixed can never call the issue resolved while it stands.
+     *
+     * @param list<string> $manifests
+     * @return list<array<string, mixed>>
+     */
+    private static function grouped(string $title, string $body, mixed $number, string $url, array $manifests): array
+    {
+        $library = preg_match('/Fixed in \((?<l>[^)]+?) version\)/u', $body, $m) === 1 ? self::cleanPkg($m['l']) : '';
+        if ($library === '') {
+            $library = (string)(self::libname(preg_match('/^(\S+?):/u', $title, $m) === 1 ? $m[1] : '') ?? '');
         }
-        $manifests = self::uniqueSorted($manifests);
 
+        $sections = [];
+        $parts    = preg_split('/<summary>\s*(?=(?:CVE|WS)-[0-9A-Za-z-]+\s*<\/summary>)/u', $body) ?: [];
+        foreach (array_slice($parts, 1) as $part) {
+            if (preg_match('/^((?:CVE|WS)-[0-9A-Za-z-]+)/u', $part, $m) === 1) {
+                $sections[$m[1]] = $part;
+            }
+        }
+
+        $records = [];
+        preg_match_all('/^\|\s*\[(?<id>(?:CVE|WS)-[0-9A-Za-z-]+)\][^|]*\|[^|]*?(?<sev>Critical|High|Medium|Low)\s*\|\s*(?<cvss>[0-9.]*)\s*\|[^|]*\|[^|]*\|\s*(?<fix>[^|]*?)\s*\|/mu', $body, $rows, PREG_SET_ORDER);
+        foreach ($rows as $row) {
+            $id    = $row['id'];
+            $fixes = [];
+            if (isset($sections[$id])) {
+                $fixes = self::fixes('', $sections[$id]);
+            } elseif ($library !== '' && preg_match('/^(?:.+?\s+-\s+)?v?([0-9][^\s|]*)$/u', $row['fix'], $m) === 1) {
+                $fixes = [['package' => $library, 'version' => self::cleanVer($m[1]), 'direct' => true]];
+            }
+            $fixes = array_values(array_filter($fixes, static fn ($f) => $f['package'] !== '' && $f['version'] !== ''));
+            if ($fixes === [] && $library !== '') {
+                // No fix known for this CVE: keep the issue from being closed
+                $fixes = [['package' => $library, 'version' => '', 'direct' => true]];
+            }
+            $records = array_merge(
+                $records,
+                self::records($fixes, $id, $id, $row['sev'], $row['cvss'] !== '' ? $row['cvss'] : '0', $number, $title, $url, $manifests)
+            );
+        }
+        return $records;
+    }
+
+    /**
+     * The (package, version) pairs a body's "Fix Resolution" lines name.
+     *
+     * @return list<array{package: string, version: string, direct: bool}>
+     */
+    private static function fixes(string $title, string $body): array
+    {
         // Affected package names, from the title ("detected in js-yaml-3.14.2.tgz")
         // and from the <b>-wrapped filenames in the body, which is the only
         // source when the title just says "detected in multiple libraries".
@@ -105,15 +178,29 @@ final class IssueParser
                 }
             }
         }
+        return $fixes;
+    }
 
-        if ($fixes === [] || $manifests === []) {
-            return [];
-        }
-
-        $id      = $cve === '' ? 'ISSUE-' . $number : $cve;
+    /**
+     * @param list<array{package: string, version: string, direct: bool}> $fixes
+     * @param list<string> $manifests
+     * @return list<array<string, mixed>>
+     */
+    private static function records(
+        array $fixes,
+        string $id,
+        string $cve,
+        string $sev,
+        string $cvss,
+        mixed $number,
+        string $title,
+        string $url,
+        array $manifests
+    ): array {
         $records = [];
         foreach ($fixes as $fix) {
-            if ($fix['package'] === '' || $fix['version'] === '') {
+            $unfixed = $fix['version'] === '';
+            if ($fix['package'] === '' || ($unfixed && $id === 'ISSUE-' . $number)) {
                 continue;
             }
             foreach ($manifests as $manifest) {
@@ -129,7 +216,7 @@ final class IssueParser
                     // times; carry every issue number so closing retires them all
                     'refs'             => [$number],
                     // Advisories list a fix per release branch; keep them all
-                    'fix_versions'     => [$fix['version']],
+                    'fix_versions'     => $unfixed ? [] : [$fix['version']],
                     'ecosystem'        => '',
                     'package'          => $fix['package'],
                     'manifest'         => $manifest,
@@ -141,11 +228,25 @@ final class IssueParser
                     'fixed_version'    => $fix['version'],
                     'direct'           => $fix['direct'],
                     'summary'          => $title,
-                    'url'              => (string)($issue['url'] ?? ''),
-                ];
+                    'url'              => $url,
+                ] + ($unfixed ? ['state' => 'skipped', 'note' => 'no fixed version known'] : []);
             }
         }
         return $records;
+    }
+
+    /**
+     * A manifest path from an issue body, relative to the repository root;
+     * '' for anything that could point outside it.
+     */
+    private static function manifestPath(string $path): string
+    {
+        $path = (string)preg_replace('#^/#', '', self::trim(self::printable($path)), 1);
+        if ($path === '' || str_starts_with($path, '/') || str_contains($path, '\\')
+            || preg_match('#(^|/)\.\.?(/|$)#', $path) === 1) {
+            return '';
+        }
+        return $path;
     }
 
     /**
@@ -237,12 +338,18 @@ final class IssueParser
         return self::trim(self::printable($s));
     }
 
+    /**
+     * A version from an issue body, or '' when it is not plainly one: the
+     * body is written by whoever opened the issue, and the value ends up in
+     * a manifest.
+     */
     private static function cleanVer(string $s): string
     {
         $s = self::trim(self::printable($s));
         $s = (string)preg_replace('/^[vV]_/u', '', $s, 1);
         $s = (string)preg_replace('/^[vV](?=[0-9])/u', '', $s, 1);
-        return self::trim($s);
+        $s = self::trim($s);
+        return preg_match('/^[0-9A-Za-z][0-9A-Za-z.+_~-]*$/', $s) === 1 ? $s : '';
     }
 
     private static function printable(string $s): string

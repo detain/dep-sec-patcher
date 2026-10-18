@@ -215,9 +215,12 @@ final class MavenAuditor extends Auditor
     private function env(Context $ctx): array
     {
         $opts = trim((string)getenv('MAVEN_OPTS'));
-        if (!str_contains($opts, '--enable-native-access')) {
+        // The JVM option only exists from Java 17; older JVMs refuse to start
+        // with it. (mvn -v reports the Java it runs on: "Java version: 21.0.2")
+        $java = $ctx->toolVersion('mvn-java', ['mvn', '-v'], '/Java version: (\d+(?:\.\d+)*)/');
+        if (!str_contains($opts, '--enable-native-access') && $java !== '' && Version::gte($java, '17')) {
             $opts = trim($opts . ' --enable-native-access=ALL-UNNAMED');
         }
-        return ['MAVEN_OPTS' => $opts];
+        return $opts === '' ? [] : ['MAVEN_OPTS' => $opts];
     }
 }
