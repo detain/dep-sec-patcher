@@ -51,7 +51,8 @@ class StatePathsTest extends TestCase
         $env = ['XDG_STATE_HOME' => '/xdg'];
         $s   = StatePaths::resolve(Options::parse([], []), 'o__r', $env, '/cwd');
         $this->assertSame('/xdg/dep-sec-patcher/o__r', $s->stateDir);
-        $this->assertSame('/xdg/dep-sec-patcher/o__r/vulns.json', $s->vulnDb);
+        $this->assertSame('/xdg/dep-sec-patcher/vulns/o__r.json', $s->vulnDb, 'outside the per-target directory');
+        $this->assertSame('/xdg/dep-sec-patcher/o__r/vulns.json', $s->legacyVulnDb);
         $this->assertSame('/xdg/dep-sec-patcher/o__r/reports', $s->reportDir);
         $this->assertSame('/xdg/dep-sec-patcher/o__r/checkout', $s->workdir);
         $this->assertSame('/xdg/dep-sec-patcher/o__r/run.lock', $s->lockFile);
@@ -59,12 +60,18 @@ class StatePathsTest extends TestCase
         $s = StatePaths::resolve(Options::parse(['--state-dir', 'st', '--vuln-db', '../db.json', '--report-dir', '/r', '--workdir', 'w'], []), 'o__r', $env, '/cwd/sub');
         $this->assertSame('/cwd/sub/st', $s->stateDir);
         $this->assertSame('/cwd/db.json', $s->vulnDb);
+        $this->assertSame('', $s->legacyVulnDb, 'a database given explicitly is never moved');
         $this->assertSame('/r', $s->reportDir);
         $this->assertSame('/cwd/sub/w', $s->workdir);
         $this->assertSame('/cwd/sub/st/run.lock', $s->lockFile);
 
+        $s = StatePaths::resolve(Options::parse(['--state-dir', '/st'], []), 'o__r', $env, '/');
+        $this->assertSame('/st/vulns.json', $s->vulnDb, '--state-dir keeps the database with the rest');
+        $this->assertSame('', $s->legacyVulnDb);
+
         $s = StatePaths::resolve(Options::parse([], ['VULN_DB' => '/env/db.json']), 's', $env, '/');
         $this->assertSame('/env/db.json', $s->vulnDb, 'VULN_DB still works');
+        $this->assertSame('', $s->legacyVulnDb);
     }
 
     public function testAbsoluteAndInside(): void

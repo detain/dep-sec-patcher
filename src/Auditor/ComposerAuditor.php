@@ -12,6 +12,10 @@ use Detain\DepSecPatcher\TargetResult;
  * PHP / Composer. Resolves with --no-install (the lockfile is all an audit
  * needs; vendor/ was deleted afterwards anyway) and without scripts or
  * plugins from the resolved packages.
+ *
+ * composer audit needs a lockfile. A project that does not keep one (a
+ * library, usually) gets one for the audit, deleted again afterwards in both
+ * modes, so it is neither left behind nor committed by --push.
  */
 final class ComposerAuditor extends Auditor
 {
@@ -43,17 +47,29 @@ final class ComposerAuditor extends Auditor
 
     public function audit(Context $ctx, string $dir): TargetResult
     {
+        $hadLock = $this->exists($ctx, $dir, 'composer.lock');
+        try {
+            return $this->updateAndAudit($ctx, $dir, $hadLock);
+        } finally {
+            if (!$hadLock) {
+                @unlink($this->abs($ctx, $dir) . '/composer.lock');
+            }
+        }
+    }
+
+    private function updateAndAudit(Context $ctx, string $dir, bool $hadLock): TargetResult
+    {
         $notes = [];
-        if (!$ctx->checkMode()) {
+        if (!$hadLock) {
+            $r = $this->update($ctx, $dir, ['-W'], $notes);
+            if (!$r->ok()) {
+                return TargetResult::fromFailure($r, 'composer update (to create a lockfile)');
+            }
+            $notes[] = 'no composer.lock: audited a fresh resolution, then deleted it';
+        } elseif (!$ctx->checkMode()) {
             $r = $this->update($ctx, $dir, ['-W'], $notes);
             if (!$r->ok()) {
                 $notes[] = 'composer update ' . $r->failureReason();
-            }
-        } elseif (!$this->exists($ctx, $dir, 'composer.lock')) {
-            // composer audit needs a lockfile; the guard removes it again
-            $r = $this->update($ctx, $dir, [], $notes);
-            if (!$r->ok()) {
-                return TargetResult::fromFailure($r, 'composer update (to create a lockfile)');
             }
         }
 

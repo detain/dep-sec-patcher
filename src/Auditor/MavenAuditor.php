@@ -94,6 +94,10 @@ final class MavenAuditor extends Auditor
 
         if (!$ctx->checkMode()) {
             $common = ['-DgenerateBackupPoms=false', '-DallowSnapshots=false'];
+            if (!$ctx->opt->allowMajor) {
+                // The same opt-in as an auto-fix crossing a major line
+                $common[] = '-DallowMajorUpdates=false';
+            }
             $r = $this->run($ctx, $dir, array_merge($base, ['versions:use-latest-releases'], $common), null, $env);
             // Fall back only on failure. The original shell script's `a || echo && b`
             // always ran use-latest-versions too, which accepts prereleases.
@@ -103,6 +107,12 @@ final class MavenAuditor extends Auditor
                 if (!$r->ok()) {
                     $notes[] = 'versions:use-latest-versions ' . $r->failureReason();
                 }
+            }
+            // A version taken from <properties> (${jackson-version}, as
+            // generated clients declare theirs) is only moved by update-properties
+            $r = $this->run($ctx, $dir, array_merge($base, ['versions:update-properties'], $common), null, $env);
+            if (!$r->ok()) {
+                $notes[] = 'versions:update-properties ' . $r->failureReason();
             }
         }
 

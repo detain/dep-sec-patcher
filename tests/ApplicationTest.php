@@ -67,7 +67,7 @@ class ApplicationTest extends TestCase
 
         $state = $this->xdg . '/dep-sec-patcher/' . StatePaths::slug('', $dir);
         $this->assertFileExists($state . '/reports/security-scan-report.json');
-        $this->assertFileExists($state . '/run.lock');
+        $this->assertFileDoesNotExist($state . '/run.lock', 'the lock is deleted when the run ends');
         $report = json_decode((string)file_get_contents($state . '/reports/security-scan-report.json'), true);
         $this->assertIsArray($report);
         $this->assertSame('WARN', $report['ecosystems']['network-security']['status']);
@@ -151,10 +151,43 @@ class ApplicationTest extends TestCase
         fwrite($lock, '424242');
         fflush($lock);
         [$rc, $out] = $this->cli(['--check', '--only', 'netsec', '--state-dir', $state], $dir);
+        $this->assertFileExists($state . '/run.lock', "the other run's lock is left alone");
         flock($lock, LOCK_UN);
         fclose($lock);
         $this->assertSame(1, $rc);
         $this->assertStringContainsString('another run is already in progress (pid 424242)', $out);
+    }
+
+    public function testNothingIsLeftPerTargetWhenTheReportsGoElsewhere(): void
+    {
+        $dir     = $this->project();
+        $reports = $this->scratchDir('reports');
+        [$rc, $out] = $this->cli(['--check', '--only', 'netsec', '--report-dir', $reports], $dir);
+        $this->assertSame(0, $rc, $out);
+        $this->assertFileExists($reports . '/security-scan-report.json');
+        $this->assertSame([], array_values(array_diff(scandir($this->xdg . '/dep-sec-patcher') ?: [], ['.', '..'])));
+    }
+
+    public function testADatabaseInTheOldLocationIsMovedOut(): void
+    {
+        $dir = $this->scratchDir('legacy');
+        file_put_contents($dir . '/package.json', "{\"dependencies\": {\"qs\": \"^6.11.0\"}}\n");
+        $base = $this->xdg . '/dep-sec-patcher';
+        $slug = StatePaths::slug('', $dir);
+        $old  = $base . '/' . $slug . '/vulns.json';
+        $new  = $base . '/vulns/' . $slug . '.json';
+        VulnDb::save($old, VulnDb::upsert(VulnDb::empty(), [[
+            'key' => 'package.json|qs|CVE-1', 'source' => 'dependabot', 'id' => 'CVE-1', 'ecosystem' => 'npm',
+            'package' => 'qs', 'manifest' => 'package.json', 'fixed_version' => '6.15.2', 'fix_versions' => ['6.15.2'],
+        ]], '2026-01-01T00:00:00Z', ''));
+
+        [$rc, $out] = $this->cli(['--check', '--apply-stored', $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString("moved the vulnerability database from {$old} to {$new}", $out);
+        $this->assertStringContainsString("vuln db: {$new}", $out);
+        $this->assertStringContainsString('would set npm qs -> 6.15.2 in package.json', $out, 'its records are used');
+        $this->assertFileDoesNotExist($old);
+        $this->assertArrayHasKey('package.json|qs|CVE-1', VulnDb::load($new)['vulns']);
     }
 
     public function testOriginRepoSubdirAndSlug(): void
@@ -170,7 +203,17 @@ class ApplicationTest extends TestCase
         $this->assertDirectoryExists($this->xdg . '/dep-sec-patcher/acme__widgets');
     }
 
-    public function testRemoteTargetCheckModeLeavesTheClonePristine(): void
+    /**
+     * The per-target state directory of a remote target.
+     *
+     * @param array{bare: string, work: string, url: string} $remote
+     */
+    private function remoteState(array $remote): string
+    {
+        return $this->xdg . '/dep-sec-patcher/' . StatePaths::slug('', GitUrl::normalize($remote['url']), GitUrl::basename($remote['url']));
+    }
+
+    public function testRemoteTargetCloneIsDeletedWhenTheRunEnds(): void
     {
         $remote = $this->makeRemote([
             'conf/app.yaml'         => "url: http://api.vendor.test/v1\n",
@@ -178,18 +221,88 @@ class ApplicationTest extends TestCase
         ]);
         [$rc, $out] = $this->cli(['--check', $remote['url']], '/');
         $this->assertSame(0, $rc, $out);
-        $slug  = StatePaths::slug('', GitUrl::normalize($remote['url']), GitUrl::basename($remote['url']));
-        $clone = $this->xdg . '/dep-sec-patcher/' . $slug . '/checkout';
+        $state = $this->remoteState($remote);
+        $clone = $state . '/checkout';
         $this->assertStringContainsString("cloning {$remote['url']} into {$clone}", $out);
         $this->assertStringContainsString('github repo: none (the target URL is not on github.com)', $out);
         $this->assertStringContainsString('config: ' . $clone . '/.dep-sec-patcher.json', $out, 'config read from the clone');
         $this->assertStringContainsString('conf/app.yaml', $out);
-        $this->assertSame('', $this->git($clone, ['status', '--porcelain', '--ignored']));
+        $this->assertStringContainsString("deleted the clone {$clone}", $out);
+        $this->assertSame(['reports'], array_values(array_diff(scandir($state) ?: [], ['.', '..'])), 'only the reports are left');
+    }
 
-        // A second run reuses (and refreshes) the clone
+    public function testKeepCloneLeavesAPristineCloneForTheNextRun(): void
+    {
+        $remote = $this->makeRemote([
+            'conf/app.yaml'         => "url: http://api.vendor.test/v1\n",
+            '.dep-sec-patcher.json' => '{"only": ["netsec"]}',
+        ]);
+        [$rc, $out] = $this->cli(['--check', '--keep-clone', $remote['url']], '/');
+        $this->assertSame(0, $rc, $out);
+        $clone = $this->remoteState($remote) . '/checkout';
+        $this->assertStringNotContainsString('deleted the clone', $out);
+        $this->assertSame('', $this->git($clone, ['status', '--porcelain', '--ignored']), 'check mode leaves it pristine');
+
+        // The next run refreshes and reuses it, and without --keep-clone deletes it
         [$rc, $out] = $this->cli(['--check', $remote['url']], '/');
         $this->assertSame(0, $rc, $out);
         $this->assertStringContainsString('updating the clone of', $out);
+        $this->assertStringContainsString("deleted the clone {$clone}", $out);
+        $this->assertDirectoryDoesNotExist($clone);
+    }
+
+    public function testARunThatFailsAfterCloningStillDeletesTheClone(): void
+    {
+        $remote = $this->makeRemote();
+        [$rc, $out] = $this->cli(['--check', '--only', 'netsec', '--subdir', 'missing', $remote['url']], '/');
+        $this->assertSame(1, $rc, $out);
+        $this->assertStringContainsString('--subdir not found', $out);
+        $this->assertStringContainsString('deleted the clone', $out);
+        $this->assertDirectoryDoesNotExist($this->remoteState($remote), 'the lock went too, leaving the directory empty');
+    }
+
+    public function testAWorkdirTheToolDidNotCreateIsNeverDeleted(): void
+    {
+        $remote  = $this->makeRemote();
+        $workdir = $this->scratchDir('mine');
+        file_put_contents($workdir . '/notes.txt', 'mine');
+        [$rc, $out] = $this->cli(['--check', '--only', 'netsec', '--workdir', $workdir, $remote['url']], '/');
+        $this->assertSame(1, $rc, $out);
+        $this->assertStringContainsString('is not a clone made by dep-sec-patcher', $out);
+        $this->assertStringNotContainsString('deleted the clone', $out);
+        $this->assertFileExists($workdir . '/notes.txt');
+    }
+
+    public function testAnInterruptedRunStillDeletesTheClone(): void
+    {
+        if (!function_exists('posix_kill') || !function_exists('pcntl_signal')) {
+            $this->markTestSkipped('needs the pcntl and posix extensions');
+        }
+        $remote = $this->makeRemote(['package.json' => "{}\n"]);
+        $bin    = $this->scratchDir('bin');
+        $marker = $bin . '/started';
+        // An npm that hangs, so the run can be stopped in the middle of an audit
+        file_put_contents($bin . '/npm', "#!/bin/sh\ntouch " . escapeshellarg($marker) . "\nexec sleep 60\n");
+        chmod($bin . '/npm', 0755);
+        $env  = array_merge(getenv(), ['XDG_STATE_HOME' => $this->xdg, 'NVD_API_KEY' => '', 'GH_TOKEN' => '',
+            'PATH' => $bin . ':' . getenv('PATH')]);
+        // exec: the pid signalled below is the tool's, not the shell's
+        $cmd  = ['sh', '-c', 'exec "$0" "$@" 2>&1', PHP_BINARY, dirname(__DIR__) . '/bin/dep-sec-patcher', '--check', '--only', 'node', $remote['url']];
+        $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w']], $pipes, '/', $env);
+        $this->assertIsResource($proc);
+        for ($i = 0; $i < 300 && !is_file($marker); $i++) {
+            usleep(100000);
+        }
+        $this->assertFileExists($marker, 'the audit started');
+        posix_kill(proc_get_status($proc)['pid'], SIGINT);
+        $out = (string)stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        $this->assertSame(130, proc_close($proc), $out);
+
+        $state = $this->remoteState($remote);
+        $this->assertStringContainsString("deleted the clone {$state}/checkout", $out);
+        $this->assertDirectoryDoesNotExist($state . '/checkout');
+        $this->assertFileDoesNotExist($state . '/run.lock');
     }
 
     public function testUpdateModeAppliesStoredFixesAndPushesABranch(): void
@@ -302,6 +415,7 @@ class ApplicationTest extends TestCase
             $record('brace-expansion', ['1.1.21', '2.0.2']),
             $record('qs', ['6.14.1']),
             $record('nanoid', ['3.3.8', '5.0.9']),
+            $record('babel', ['7.29.6', '8.0.0-rc.6']),
         ]);
         [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
         $this->assertSame(0, $rc, $out);
@@ -314,6 +428,8 @@ class ApplicationTest extends TestCase
         $this->assertStringContainsString('the lockfile resolves qs to 6.15.2', $vulns['yarn.lock|qs|GHSA-qs']['note']);
         $this->assertSame('pending', $vulns['yarn.lock|nanoid|GHSA-nanoid']['state']);
         $this->assertStringContainsString('several major versions', $vulns['yarn.lock|nanoid|GHSA-nanoid']['note']);
+        $this->assertSame('skipped', $vulns['yarn.lock|babel|GHSA-babel']['state'], 'nothing installs it, so no pin');
+        $this->assertStringContainsString('neither declared in package.json nor in its lockfile', $vulns['yarn.lock|babel|GHSA-babel']['note']);
     }
 
     public function testCheckModeSuggestsTheCommandThatAppliesTheFixes(): void

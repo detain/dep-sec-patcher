@@ -90,13 +90,18 @@ final class GoAuditor extends Auditor
         if ($r->exitCode === 1 && !$r->timedOut) {
             $first = $r;
             $r     = $this->run($ctx, $dir, ['govulncheck', '-scan', 'module']);
-            $mode  = 'module-level (the package does not build)';
+            $mode  = 'module-level';
             if (!$r->ok() && $r->exitCode !== 3) {
                 return TargetResult::fromFailure($first, 'govulncheck');
             }
         }
+        $why = $mode === 'module-level' ? 'the packages do not build, so only go.mod was scanned, not which code is reachable' : '';
         if ($r->ok()) {
-            return new TargetResult(TargetResult::PASS, "govulncheck: no {$mode} vulnerabilities");
+            $t = new TargetResult(TargetResult::PASS, "govulncheck: no {$mode} vulnerabilities");
+            if ($why !== '') {
+                $t->note($why);
+            }
+            return $t;
         }
         if ($r->exitCode !== 3 || $r->timedOut) {
             return TargetResult::fromFailure($r, 'govulncheck');
@@ -109,6 +114,9 @@ final class GoAuditor extends Auditor
         $t = $n > 0
             ? new TargetResult(TargetResult::FAIL, "govulncheck: {$n} {$mode} vulnerabilit" . ($n === 1 ? 'y' : 'ies') . ' in dependencies', $n)
             : new TargetResult(TargetResult::PASS, "govulncheck: no {$mode} vulnerabilities in dependencies");
+        if ($why !== '') {
+            $t->note($why);
+        }
         foreach (array_slice($modules, 0, 10) as $line) {
             $t->note($line);
         }

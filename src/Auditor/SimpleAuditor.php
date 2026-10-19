@@ -21,6 +21,7 @@ final class SimpleAuditor extends Auditor
      * @param ?string           $serialWhy  set when the tool must not run concurrently
      * @param list<string>      $versionArgv
      * @param list<string>      $prepareArgv one-off setup run in the parent
+     * @param list<string>      $majorOnly  update-mode arguments dropped without --allow-major
      */
     public function __construct(
         private string $name,
@@ -33,6 +34,7 @@ final class SimpleAuditor extends Auditor
         private array $prepareArgv = [],
         private string $note = '',
         private string $versionPattern = '/(\d+\.\d+(?:\.\d+)?)/',
+        private array $majorOnly = [],
     ) {
     }
 
@@ -45,7 +47,8 @@ final class SimpleAuditor extends Auditor
             [['dart', 'pub', 'outdated']],
             [['dart', 'pub', 'upgrade', '--major-versions']],
             'pub has no documented locking for concurrent runs against the shared pub cache (no fixed version known)',
-            ['dart', '--version']
+            ['dart', '--version'],
+            majorOnly: ['--major-versions'],
         );
     }
 
@@ -135,6 +138,9 @@ final class SimpleAuditor extends Auditor
     public function audit(Context $ctx, string $dir): TargetResult
     {
         $steps = $ctx->checkMode() ? $this->checkArgv : $this->updateArgv;
+        if (!$ctx->opt->allowMajor && $this->majorOnly !== []) {
+            $steps = array_map(fn (array $argv): array => array_values(array_diff($argv, $this->majorOnly)), $steps);
+        }
         foreach ($steps as $argv) {
             $r = $this->run($ctx, $dir, $argv);
             if (!$r->ok()) {

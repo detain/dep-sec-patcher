@@ -10,8 +10,8 @@ namespace Detain\DepSecPatcher;
  * started on afterwards) or straight onto the checked-out branch.
  *
  * Only a tree that was clean before the run is published, so nothing but
- * this run's changes can end up in the commit. A remote target's cache clone
- * is always clean at the start.
+ * this run's changes can end up in the commit. A remote target's clone is
+ * always clean at the start.
  */
 final class BranchPublisher
 {

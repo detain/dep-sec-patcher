@@ -11,9 +11,10 @@ use RuntimeException;
  * Turns the positional TARGET into a directory to scan.
  *
  * A local directory is used in place. A git URL, or the GitHub OWNER/NAME
- * shorthand, is cloned into a cache workdir that dep-sec-patcher owns: it is
- * reset to the remote's default branch, with untracked and ignored files
- * removed, at the start of every run.
+ * shorthand, is cloned into a workdir that dep-sec-patcher owns and deletes
+ * when the run ends. A clone kept with --keep-clone (or left by a run that
+ * was killed) is reset to the remote's default branch, with untracked and
+ * ignored files removed, and reused.
  *
  * Every git command runs through ProcessRunner (timeout, stdin closed) with
  * terminal prompts disabled, so a missing credential fails instead of hanging.
@@ -123,6 +124,19 @@ final class TargetResolver
     }
 
     /**
+     * Whether a run may delete $workdir when it ends: nothing is there yet,
+     * or it is an empty directory or a clone this tool made. Anything else
+     * checkout() refuses to touch.
+     */
+    public static function ownsWorkdir(string $workdir): bool
+    {
+        if (!is_dir($workdir)) {
+            return !file_exists($workdir) && !is_link($workdir);
+        }
+        return (scandir($workdir) ?: []) === ['.', '..'] || is_file($workdir . '/.git/' . self::CLONE_MARKER);
+    }
+
+    /**
      * Clone $url into $workdir, or refresh an earlier clone there, leaving it
      * clean at the tip of the remote's default branch.
      *
@@ -154,7 +168,7 @@ final class TargetResolver
             $dirty = $this->git($workdir, ['status', '--porcelain'], 120);
             if ($dirty->ok() && trim($dirty->stdout) !== '') {
                 $n = count(array_filter(explode("\n", trim($dirty->stdout))));
-                $this->console->warn("discarding {$n} local change(s) left in the cache clone {$workdir}");
+                $this->console->warn("discarding {$n} local change(s) left in the clone {$workdir}");
             }
             $this->must($workdir, ['fetch', '--prune', '--quiet', 'origin'], $this->timeout);
         }

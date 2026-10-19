@@ -3,6 +3,7 @@
 namespace Detain\DepSecPatcher\Tests;
 
 use Detain\DepSecPatcher\Console;
+use Detain\DepSecPatcher\Filesystem;
 use Detain\DepSecPatcher\ForkPool;
 use Detain\DepSecPatcher\ManifestIndex;
 use Detain\DepSecPatcher\ProcessRunner;
@@ -223,6 +224,33 @@ class RuntimeTest extends TestCase
         WorkspaceGuard::restoreAll();
         $this->assertFileExists($this->dir . '/yarn.lock', 'a restored guard is no longer active');
         unset($guard);
+    }
+
+    public function testRemoveNeverFollowsSymlinks(): void
+    {
+        // A cloned repository can carry links to anything on the host
+        mkdir($this->dir . '/outside/keep', 0775, true);
+        file_put_contents($this->dir . '/outside/secret', 'key');
+        chmod($this->dir . '/outside/secret', 0600);
+        file_put_contents($this->dir . '/outside/keep/f', 'x');
+        mkdir($this->dir . '/tree/sub/ro', 0775, true);
+        file_put_contents($this->dir . '/tree/sub/ro/f', 'x');
+        chmod($this->dir . '/tree/sub/ro', 0555);
+        symlink($this->dir . '/outside/secret', $this->dir . '/tree/sub/to-file');
+        symlink($this->dir . '/outside/keep', $this->dir . '/tree/to-dir');
+        symlink($this->dir . '/missing', $this->dir . '/tree/dangling');
+
+        Filesystem::remove($this->dir . '/tree');
+        clearstatcache();
+        $this->assertFileDoesNotExist($this->dir . '/tree');
+        $this->assertSame('key', file_get_contents($this->dir . '/outside/secret'));
+        $this->assertSame(0600, fileperms($this->dir . '/outside/secret') & 0777, 'a link target is never chmod()ed');
+        $this->assertFileExists($this->dir . '/outside/keep/f', 'a linked directory is not emptied');
+
+        Filesystem::remove($this->dir . '/outside/missing');   // nothing there: no error
+        symlink($this->dir . '/outside/keep', $this->dir . '/link');
+        Filesystem::remove($this->dir . '/link');
+        $this->assertFileExists($this->dir . '/outside/keep/f', 'removing a link removes only the link');
     }
 
     public function testManifestIndexPrunesDependencyDirs(): void

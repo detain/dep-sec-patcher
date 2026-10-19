@@ -178,6 +178,14 @@ class VersionTest extends TestCase
         $this->assertSame('', Version::max([]));
     }
 
+    public function testMaxReleasePassesOverPrereleases(): void
+    {
+        $this->assertSame('7.29.6', Version::maxRelease(['7.29.6', '8.0.0-rc.6']), 'an override is never pinned to a release candidate');
+        $this->assertSame('4.2', Version::maxRelease(['4.2', '5.0rc1', '5.0.0.dev1']));
+        $this->assertSame('8.0.0-rc.6', Version::maxRelease(['8.0.0-rc.5', '8.0.0-rc.6']), 'unless that is all there is');
+        $this->assertSame('', Version::maxRelease([]));
+    }
+
     public function testMajorLineAndClearsAll(): void
     {
         $this->assertSame('4', Version::majorLine('^4.17.1'));

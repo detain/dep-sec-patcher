@@ -80,18 +80,29 @@ final class NodeAuditor extends Auditor
     private function npm(Context $ctx, string $dir): TargetResult
     {
         $quiet = ['--ignore-scripts', '--no-audit', '--no-fund'];
+        $peers = [];
         $notes = [];
         // npm audit needs a lockfile; in check mode the guard removes it again
         $r = $this->run($ctx, $dir, array_merge(['npm', 'install', '--package-lock-only'], $quiet));
+        if (!$r->ok() && stripos($r->output, 'ERESOLVE') !== false) {
+            // A peer dependency conflict in package.json itself: resolving
+            // the way npm 6 did still gives the audit a lockfile to read
+            $peers   = ['--legacy-peer-deps'];
+            $notes[] = 'conflicting peer dependencies in package.json (npm ERESOLVE); resolved with --legacy-peer-deps';
+            $r       = $this->run($ctx, $dir, array_merge(['npm', 'install', '--package-lock-only'], $quiet, $peers));
+        }
         if (!$r->ok()) {
             return TargetResult::fromFailure($r, 'npm install --package-lock-only');
         }
         if (!$ctx->checkMode()) {
-            $r = $this->run($ctx, $dir, array_merge(['npm', 'update', '--package-lock-only'], $quiet));
+            $r = $this->run($ctx, $dir, array_merge(['npm', 'update', '--package-lock-only'], $quiet, $peers));
             if (!$r->ok()) {
                 $notes[] = 'npm update ' . $r->failureReason();
             }
-            $r = $this->run($ctx, $dir, ['npm', 'audit', 'fix', '--force', '--package-lock-only', '--ignore-scripts', '--no-fund']);
+            // --force is npm's opt-in to breaking (major) upgrades: the same
+            // opt-in as an auto-fix crossing a major line
+            $fix = array_merge(['npm', 'audit', 'fix'], $ctx->opt->allowMajor ? ['--force'] : [], ['--package-lock-only', '--ignore-scripts', '--no-fund'], $peers);
+            $r   = $this->run($ctx, $dir, $fix);
             if (!$r->ok()) {
                 $notes[] = 'npm audit fix ' . $r->failureReason();
             }
@@ -109,7 +120,8 @@ final class NodeAuditor extends Auditor
     {
         $notes = [];
         if (!$ctx->checkMode()) {
-            $r = $this->run($ctx, $dir, ['pnpm', 'up', '--latest'], null, ['npm_config_ignore_scripts' => 'true']);
+            // --latest ignores the declared ranges, so it can cross a major line
+            $r = $this->run($ctx, $dir, $ctx->opt->allowMajor ? ['pnpm', 'up', '--latest'] : ['pnpm', 'up'], null, ['npm_config_ignore_scripts' => 'true']);
             if (!$r->ok()) {
                 $notes[] = 'pnpm up ' . $r->failureReason();
             }

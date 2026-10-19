@@ -14,7 +14,7 @@ final class Target
      * @param string $subdir     part of $root to scan ('' = all of it)
      * @param string $githubRepo OWNER/NAME for the GitHub steps ('' = none)
      * @param string $repoNote   where $githubRepo came from, or why there is none
-     * @param bool   $remote     whether $root is a cache clone of $url
+     * @param bool   $remote     whether $root is a clone of $url made for the run
      * @param string $url        remote URL ('' for a local target)
      * @param string $source     TARGET as given on the command line
      */

@@ -95,7 +95,7 @@ final class WorkspaceGuard
                 }
                 $isBuildDir = in_array($rel, self::BUILD_DIRS, true);
                 if ($isBuildDir || $this->checkMode) {
-                    self::remove($this->dir . '/' . $rel);
+                    Filesystem::remove($this->dir . '/' . $rel);
                     if (!$isBuildDir) {
                         $undone[] = "removed {$rel}";
                     }
@@ -110,43 +110,5 @@ final class WorkspaceGuard
             }
         }
         return $undone;
-    }
-
-    private static function remove(string $path): void
-    {
-        if (is_link($path) || is_file($path)) {
-            @unlink($path);
-            return;
-        }
-        if (!is_dir($path)) {
-            return;
-        }
-        // Some tools (go, cargo) create read-only directories, whose entries
-        // cannot be unlinked until the directory is writable again
-        @chmod($path, 0755);
-        $dirs = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::SELF_FIRST
-        );
-        foreach ($dirs as $item) {
-            /** @var \SplFileInfo $item */
-            if ($item->isDir() && !$item->isLink()) {
-                @chmod($item->getPathname(), 0755);
-            }
-        }
-        $it = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::CHILD_FIRST
-        );
-        foreach ($it as $item) {
-            /** @var \SplFileInfo $item */
-            if ($item->isDir() && !$item->isLink()) {
-                @rmdir($item->getPathname());
-            } else {
-                @chmod($item->getPathname(), 0644);
-                @unlink($item->getPathname());
-            }
-        }
-        @rmdir($path);
     }
 }

@@ -357,10 +357,6 @@ final class SecurityRun
         }
         if ($this->opt->wants('grype')) {
             foreach (Scanners::grype($this->ctx) as [$dir, $result]) {
-                if ($result->status === TargetResult::SKIP && $dir === '') {
-                    // Optional tool pair; absent on most hosts, not worth a SKIP line
-                    continue;
-                }
                 $this->report('grype', $dir, $result);
             }
         }
@@ -517,6 +513,10 @@ final class SecurityRun
             $c->warn("Could not list issues for {$repo}");
             $this->record('sec-issues', 'SKIP');
         } else {
+            if (count($issues) >= $limit) {
+                // Records for the rest arrive as earlier issues are closed
+                $c->warn("Security issues: only the first {$limit} open issues were read (--max-issues; 0 reads them all)");
+            }
             // Issue bodies become manifest edits, so only a security bot's count
             $issueRecords = IssueParser::parse(array_values(array_filter($issues, static fn ($i) => self::isBot($i['author'] ?? null))));
             if ($issueRecords !== []) {
@@ -912,14 +912,19 @@ final class SecurityRun
                     $ver = Version::chooseTarget($declared, $row['spec'], $pin);
                 }
 
-                if ($ver === null) {
+                if ($locked === []) {
+                    // The lockfile is what gets installed, and it holds no
+                    // copy: an override would add a pin that fixes nothing
+                    $notDeclared++;
+                    [$state, $note] = ['skipped', "{$pkg} is neither declared in {$target} nor in its lockfile"];
+                } elseif ($ver === null) {
                     $unsupported++;
                     $note = "{$pkg} is locked at " . implode(', ', $locked) . " in several major versions; pin it by hand";
                 } elseif ($ver === '') {
                     // Every advisory for this package is already cleared
                     $satisfied++;
                     $state = 'applied';
-                    $note  = $locked !== null && $locked !== []
+                    $note  = $locked !== null
                         ? "already satisfied: the lockfile resolves {$pkg} to " . implode(', ', $locked)
                         : "already satisfied: {$target} declares {$declared}";
                 } elseif (!$this->opt->allowMajor && Version::floor($current) !== '' && Version::majorLine($current) !== Version::majorLine($ver)) {
@@ -1017,8 +1022,8 @@ final class SecurityRun
             $c->info("close-fixed: this run's changes have not reached the base branch; only listing what would close");
             $update = false;
         } elseif ($update && $this->landed === null && (new BranchPublisher($this->ctx->runner, $c, $this->root))->isClean() === false) {
-            // Uncommitted edits are not a fix yet, and a cache clone's are
-            // discarded by the next run
+            // Uncommitted edits are not a fix yet, and a clone's are deleted
+            // with it
             $c->info('close-fixed: the tree has uncommitted changes; only listing what would close'
                 . ' (commit and push them, or use --push-direct or --pr)');
             $update = false;
@@ -1374,8 +1379,11 @@ final class SecurityRun
         } elseif (!$this->opt->push && $git && $this->cleanAtStart === true
             && (new BranchPublisher($this->ctx->runner, $c, $this->root))->isClean() === false) {
             $changed   = true;
-            $reasons[] = "this run's changes are only in {$this->root}"
-                . ($this->target->remote ? ', a cache clone the next run resets' : ', uncommitted');
+            $reasons[] = "this run's changes are only in {$this->root}" . match (true) {
+                !$this->target->remote => ', uncommitted',
+                $this->opt->keepClone  => ', a clone the next run resets',
+                default                => ', a clone that is deleted when this run ends (--keep-clone keeps it)',
+            };
         }
         if ($this->wouldClose > 0) {
             $reasons[] = "{$this->wouldClose} issue(s) can be closed once the fixes are on the base branch";

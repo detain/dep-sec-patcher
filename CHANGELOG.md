@@ -15,16 +15,21 @@ First release: a standalone, generic port of MyAdmin's
   (works from a clone without `composer install`, as a project dependency, or
   installed globally).
 - Positional TARGET: a local directory, a git URL, or a GitHub `OWNER/NAME`.
-  Remote targets are cloned into a cache workdir that is reset to the remote's
-  default branch on every run.
+  Remote targets are cloned for the run, and the clone is deleted when the run
+  ends, also after an error or Ctrl-C. `--keep-clone` keeps it; the next run
+  resets it to the remote's default branch and reuses it.
 - `--subdir` to scan part of a repository while keeping manifest paths
   relative to its root; auto-fix and close-fixed act only inside it.
 - The GitHub repository is taken from `--repo` or the target's `origin`
   remote; without one, the GitHub steps print a SKIP line.
-- Per-target state under `${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/<slug>/`
-  (vulnerability database, reports, run lock, clone), with `--state-dir`,
-  `--vuln-db`, `--report-dir` and `--workdir` overrides. State inside the
-  scanned tree is refused.
+- State under `${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/`: each
+  target's vulnerability database in `vulns/<slug>.json`, kept between runs,
+  and a `<slug>/` directory holding the latest reports, plus the run lock and
+  the clone only while a run is going (the directory goes too once empty). A
+  database at the old default, `<slug>/vulns.json`, is moved on the next run.
+  `--state-dir` (everything, the database included, in one directory that is
+  never deleted), `--vuln-db`, `--report-dir` and `--workdir` override it.
+  State inside the scanned tree is refused.
 - Optional `.dep-sec-patcher.json` config file (or `--config`) for option
   defaults, validated strictly.
 - `--exclude-dir` and `--allow-http` (also in the config file), `--grype` /
@@ -113,6 +118,36 @@ First release: a standalone, generic port of MyAdmin's
   `--enable-native-access` only on Java 17+; gh before 2.48 is supported.
 - Two audits of the same directory never run at once, and a signal restores
   the workspace guard of the audit it interrupted.
+- Deleting a directory (the workspace guard's build directories, the clone)
+  unlinks symlinks without `chmod`ing their targets, which made a linked
+  private file world-readable.
+- Composer: a project without `composer.lock` is audited from a fresh
+  `composer update -W --no-install` in both modes, and the lockfile is deleted
+  afterwards, so update mode no longer leaves one for `--push` to commit.
+- sbt: when neither the project nor the global plugins have sbt-updates, it
+  is added for the one command with `--addPluginSbtFile` (sbt 1.4+), which is
+  the only way on sbt 2 (it ignores global plugins); older sbt is SKIPped with
+  the line to add and where. sbt always runs in the foreground (`--server` on
+  sbt 2, `SBT_NATIVE_CLIENT=false`), so sbt 2 no longer leaves a server JVM
+  running after every project. Update mode no longer sets an `onlyEval` key
+  sbt-updates does not have (every project failed), and sbt before 1.6 on
+  Java 18 to 23 gets `-Djava.security.manager=allow` so it can start.
+- Maven update mode also runs `versions:update-properties`, so versions
+  declared through `${...}` properties move too.
+- `--allow-major` now also governs the updaters: Maven's versions plugin gets
+  `-DallowMajorUpdates=false`, `npm audit fix` runs without `--force`, `pnpm up`
+  without `--latest` and `dart pub upgrade` without `--major-versions` unless
+  it is given. (`npm audit fix --force` had moved `@babel/cli` to 8 beside
+  `@babel/core` 7, a peer conflict that broke `npm install`.)
+- npm steps are retried with `--legacy-peer-deps` when `package.json` has
+  conflicting peer dependencies (`ERESOLVE`), instead of failing the audit.
+- Auto-fix no longer pins an npm package its lockfile holds no copy of, and
+  a pin prefers the highest release over a prerelease (it had written
+  `"babel": "^8.0.0-rc.6"` and `"multer": "^3.0.0-alpha.2"` overrides).
+- A WARN says when the issue listing stopped at `--max-issues`.
+- grype checks the docker daemon once and SKIPs with the reason, instead of
+  a tool error per Dockerfile; a bash `gradlew` is run with bash; govulncheck's
+  module-level fallback is explained in a note.
 
 ### Kept
 

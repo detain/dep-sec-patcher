@@ -166,18 +166,26 @@ final class Scanners
     }
 
     /**
-     * Build each Dockerfile's image and scan it with grype (only when both
-     * grype and docker are installed).
+     * Build each Dockerfile's image and scan it with grype. Nothing at all
+     * when grype or docker is not installed (an optional pair, absent on most
+     * hosts), one SKIP when the docker daemon cannot be reached.
      *
      * @return list<array{0: string, 1: TargetResult}>
      */
     public static function grype(Context $ctx): array
     {
-        if (!ProcessRunner::has('grype') || !ProcessRunner::has('docker')) {
-            return [['', new TargetResult(TargetResult::SKIP, 'grype or docker not installed')]];
+        $dirs = array_slice($ctx->files->dirsWith(['Dockerfile']), 0, 5);
+        if (!ProcessRunner::has('grype') || !ProcessRunner::has('docker') || $dirs === []) {
+            return [];
+        }
+        // Otherwise every build fails the same way and shows as a tool error
+        $info = $ctx->runner->run(['docker', 'info', '--format', '{{.ServerVersion}}'], $ctx->root, ['label' => 'grype:docker', 'timeout' => 60]);
+        if (!$info->ok()) {
+            $why = $info->tail(1)[0] ?? $info->failureReason();
+            return [['', new TargetResult(TargetResult::SKIP, 'docker daemon not reachable: ' . $why)]];
         }
         $out = [];
-        foreach (array_slice($ctx->files->dirsWith(['Dockerfile']), 0, 5) as $dir) {
+        foreach ($dirs as $dir) {
             $cwd = $dir === '' ? $ctx->root : $ctx->root . '/' . $dir;
             $tag = 'dep-sec-patcher-scan-' . getmypid() . '-' . count($out);
             $b   = $ctx->runner->run(['docker', 'build', '-q', '-t', $tag, '.'], $cwd, ['label' => 'grype:build']);

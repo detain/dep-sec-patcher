@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace Detain\DepSecPatcher\Tests;
 
+use Detain\DepSecPatcher\Auditor\ComposerAuditor;
+use Detain\DepSecPatcher\Auditor\MavenAuditor;
+use Detain\DepSecPatcher\Auditor\NodeAuditor;
+use Detain\DepSecPatcher\Auditor\SbtAuditor;
 use Detain\DepSecPatcher\Auditor\SimpleAuditor;
 use Detain\DepSecPatcher\Context;
 use Detain\DepSecPatcher\ManifestIndex;
@@ -14,8 +18,9 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Trivy's Maven Central rate-limit handling and Elixir's check-mode steps,
- * driven through stand-in tools on PATH.
+ * Trivy's Maven Central rate-limit handling, Elixir's check-mode steps,
+ * Maven's, npm's and Dart's update steps, Composer without a lockfile and
+ * how sbt is invoked, driven through stand-in tools on PATH.
  */
 class ScannersTest extends TestCase
 {
@@ -92,6 +97,275 @@ class ScannersTest extends TestCase
 
         $this->assertSame(TargetResult::PASS, $t->status);
         $this->assertSame(['deps.get', 'hex.audit'], file($log, FILE_IGNORE_NEW_LINES));
+    }
+
+    /**
+     * @return array<string, array{list<string>, bool}>
+     */
+    public static function mavenUpdates(): array
+    {
+        return [
+            'without --allow-major' => [['--update'], true],
+            'with --allow-major'    => [['--update', '--allow-major'], false],
+        ];
+    }
+
+    /**
+     * @param list<string> $args
+     */
+    #[DataProvider('mavenUpdates')]
+    public function testMavenUpdateModeAlsoMovesVersionProperties(array $args, bool $capped): void
+    {
+        $bin = $this->scratchDir('bin');
+        $log = $bin . '/calls.log';
+        file_put_contents($bin . '/mvn', <<<SH
+            #!/bin/sh
+            echo "\$*" >> '{$log}'
+            for a in "\$@"; do
+              case "\$a" in -Dodc.outputDirectory=*) echo '{"dependencies": []}' > "\${a#*=}/dependency-check-report.json" ;; esac
+            done
+            SH);
+        chmod($bin . '/mvn', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $root = $this->scratchDir('java');
+        file_put_contents($root . '/pom.xml', '<project/>');
+
+        $t = (new MavenAuditor())->audit($this->context($root, $args), '');
+        $this->assertSame(TargetResult::PASS, $t->status, $t->detail);
+        $goals = array_values(array_filter(file($log, FILE_IGNORE_NEW_LINES) ?: [], static fn (string $c): bool => str_contains($c, 'versions:')));
+        $this->assertCount(2, $goals);
+        $this->assertStringContainsString('versions:use-latest-releases', $goals[0]);
+        $this->assertStringContainsString('versions:update-properties', $goals[1], 'versions declared through ${...} properties');
+        foreach ($goals as $goal) {
+            $this->assertSame($capped, str_contains($goal, '-DallowMajorUpdates=false'));
+        }
+    }
+
+    /**
+     * @param list<string> $args
+     */
+    #[DataProvider('mavenUpdates')]
+    public function testNpmPeerConflictsAreResolvedTheLegacyWayAndForceNeedsAllowMajor(array $args, bool $capped): void
+    {
+        $bin = $this->scratchDir('bin');
+        $log = $bin . '/calls.log';
+        file_put_contents($bin . '/npm', <<<SH
+            #!/bin/sh
+            echo "\$*" >> '{$log}'
+            case " \$* " in
+              *" --legacy-peer-deps "*) ;;
+              *" install "*) echo 'npm error code ERESOLVE' >&2; echo 'npm error Conflicting peer dependency: @babel/core@8.0.7' >&2; exit 1 ;;
+            esac
+            case " \$* " in *" audit --json "*) echo '{"metadata": {"vulnerabilities": {"high": 0, "critical": 0}}}' ;; esac
+            SH);
+        chmod($bin . '/npm', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $root = $this->scratchDir('js');
+        file_put_contents($root . '/package.json', '{}');
+
+        $t     = (new NodeAuditor())->audit($this->context($root, $args), '');
+        $calls = file($log, FILE_IGNORE_NEW_LINES) ?: [];
+        $this->assertSame(TargetResult::PASS, $t->status, $t->detail);
+        $this->assertContains('conflicting peer dependencies in package.json (npm ERESOLVE); resolved with --legacy-peer-deps', $t->notes);
+        $this->assertStringNotContainsString('--legacy-peer-deps', $calls[0], 'tried the normal way first');
+        foreach (array_slice($calls, 1, 3) as $call) {
+            $this->assertStringContainsString('--legacy-peer-deps', $call, $call);
+        }
+        $fix = (string)current(array_filter($calls, static fn (string $c): bool => str_starts_with($c, 'audit fix')));
+        $this->assertSame(!$capped, str_contains($fix, '--force'), 'npm audit fix --force makes major upgrades');
+    }
+
+    /**
+     * @param list<string> $args
+     */
+    #[DataProvider('mavenUpdates')]
+    public function testDartMajorVersionsNeedAllowMajor(array $args, bool $capped): void
+    {
+        $bin = $this->scratchDir('bin');
+        $log = $bin . '/calls.log';
+        file_put_contents($bin . '/dart', "#!/bin/sh\necho \"\$*\" >> " . escapeshellarg($log) . "\n");
+        chmod($bin . '/dart', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $root = $this->scratchDir('dart');
+        file_put_contents($root . '/pubspec.yaml', '');
+
+        SimpleAuditor::dart()->audit($this->context($root, $args), '');
+        $this->assertSame([$capped ? 'pub upgrade' : 'pub upgrade --major-versions'], file($log, FILE_IGNORE_NEW_LINES));
+    }
+
+    public function testOldSbtIsAllowedItsSecurityManagerOnNewJava(): void
+    {
+        [$root, $home, $log] = $this->sbtProject('0.13.15');
+        mkdir($home . '/.sbt/0.13/plugins', 0775, true);
+        file_put_contents($home . '/.sbt/0.13/plugins/p.sbt', 'addSbtPlugin("com.timushev.sbt" % "sbt-updates" % "0.6.4")');
+        $bin = dirname($log);
+        file_put_contents($bin . '/java', "#!/bin/sh\necho 'openjdk version \"21.0.12.1\" 2026-08-18' >&2\n");
+        chmod($bin . '/java', 0755);
+        (new SbtAuditor())->audit($this->context($root, ['--check']), '');
+        $this->assertStringContainsString(' -Djava.security.manager=allow -batch ', (string)file_get_contents($log));
+
+        [$root, , $log] = $this->sbtProject('1.10.11');
+        file_put_contents(dirname($log) . '/java', "#!/bin/sh\necho 'openjdk version \"21.0.12.1\"' >&2\n");
+        chmod(dirname($log) . '/java', 0755);
+        (new SbtAuditor())->audit($this->context($root, ['--check']), '');
+        $this->assertStringNotContainsString('java.security.manager', (string)file_get_contents($log), 'not needed from sbt 1.6');
+    }
+
+    public function testSbtUpdateModeOnlyReports(): void
+    {
+        [$root, , $log] = $this->sbtProject('1.10.11');
+        (new SbtAuditor())->audit($this->context($root, ['--update']), '');
+        $this->assertStringEndsWith(' -batch dependencyUpdates' . "\n", (string)file_get_contents($log), 'no settings sbt-updates does not have');
+    }
+
+    /**
+     * @return array<string, array{list<string>}>
+     */
+    public static function modes(): array
+    {
+        return ['check' => [['--check']], 'update' => [['--update']]];
+    }
+
+    /**
+     * @param list<string> $mode
+     */
+    #[DataProvider('modes')]
+    public function testComposerWithoutALockfileAuditsAFreshResolutionAndDeletesIt(array $mode): void
+    {
+        $log  = $this->fakeComposer();
+        $root = $this->scratchDir('lib');
+        file_put_contents($root . '/composer.json', '{"require": {"psr/log": "^1.0"}}');
+        $t = (new ComposerAuditor())->audit($this->context($root, $mode), '');
+
+        $this->assertSame(TargetResult::PASS, $t->status, $t->detail);
+        $calls = file($log, FILE_IGNORE_NEW_LINES) ?: [];
+        $this->assertCount(2, $calls);
+        $this->assertStringStartsWith('update -W --no-install', $calls[0]);
+        $this->assertStringStartsWith('audit --locked', $calls[1]);
+        $this->assertFileDoesNotExist($root . '/composer.lock', 'neither left behind nor committed');
+        $this->assertContains('no composer.lock: audited a fresh resolution, then deleted it', $t->notes);
+    }
+
+    public function testComposerKeepsALockfileTheProjectHas(): void
+    {
+        $log  = $this->fakeComposer();
+        $root = $this->scratchDir('app');
+        file_put_contents($root . '/composer.json', '{}');
+        file_put_contents($root . '/composer.lock', '{"old": true}');
+
+        (new ComposerAuditor())->audit($this->context($root, ['--check']), '');
+        $this->assertSame(['audit --locked --no-interaction --format=json'], file($log, FILE_IGNORE_NEW_LINES), 'check mode only audits');
+        $this->assertSame('{"old": true}', file_get_contents($root . '/composer.lock'));
+
+        unlink($log);
+        (new ComposerAuditor())->audit($this->context($root, ['--update']), '');
+        $calls = file($log, FILE_IGNORE_NEW_LINES) ?: [];
+        $this->assertStringStartsWith('update -W', $calls[0]);
+        $this->assertSame("{}\n", file_get_contents($root . '/composer.lock'), 'update mode keeps the updated lockfile');
+    }
+
+    /**
+     * @return array<string, array{string, string, bool, bool}>
+     */
+    public static function sbtProjects(): array
+    {
+        // build.properties version ('' = none: the runner's 2.0.10), where the plugin is, --server, injected
+        return [
+            'sbt 2, no plugin'                   => ['2.0.10', '', true, true],
+            'sbt 2 ignores global plugins'       => ['2.0.10', '.sbt/1.0/plugins/p.sbt', true, true],
+            'sbt 2 by the runner default'        => ['', '', true, true],
+            'sbt 1, no plugin'                   => ['1.10.11', '', false, true],
+            'sbt 1, global plugin'               => ['1.10.11', '.sbt/1.0/plugins/p.sbt', false, false],
+            'sbt 1, plugin in the project'       => ['1.13.0', 'project/plugins.sbt', false, false],
+            'sbt 0.13, global plugin'            => ['0.13.15', '.sbt/0.13/plugins/p.sbt', false, false],
+        ];
+    }
+
+    #[DataProvider('sbtProjects')]
+    public function testSbtRunsInTheForegroundWithThePluginAddedWhenMissing(string $version, string $plugin, bool $server, bool $injected): void
+    {
+        [$root, $home, $log] = $this->sbtProject($version);
+        if ($plugin !== '') {
+            $file = (str_starts_with($plugin, 'project/') ? $root : $home) . '/' . $plugin;
+            @mkdir(dirname($file), 0775, true);
+            file_put_contents($file, 'addSbtPlugin("com.timushev.sbt" % "sbt-updates" % "0.7.1")');
+        }
+        $ctx = $this->context($root, ['--check']);
+        $t   = (new SbtAuditor())->audit($ctx, '');
+
+        $this->assertSame(TargetResult::PASS, $t->status, $t->detail);
+        $call = (string)file_get_contents($log);
+        $this->assertStringStartsWith('SBT_NATIVE_CLIENT=false ', $call, 'never the native client');
+        $this->assertSame($server, str_contains($call, ' --server '));
+        $this->assertSame($injected, str_contains($call, '--addPluginSbtFile='));
+        $this->assertStringEndsWith(" -batch dependencyUpdates\n", $call);
+        if ($injected) {
+            $file = $ctx->reportPath('sbt', '', 'sbt-updates.sbt');
+            $this->assertStringContainsString("--addPluginSbtFile={$file} ", $call, 'kept outside the tree');
+            $this->assertStringContainsString('"sbt-updates" % "0.7.1"', (string)file_get_contents($file));
+            $this->assertSame(['build.sbt', 'project'], array_values(array_diff(scandir($root) ?: [], ['.', '..'])));
+        }
+    }
+
+    public function testOldSbtWithoutThePluginIsSkippedWithTheLineToAdd(): void
+    {
+        [$root, $home, $log] = $this->sbtProject('0.13.15');
+        $t = (new SbtAuditor())->audit($this->context($root, ['--check']), '');
+        $this->assertSame(TargetResult::SKIP, $t->status);
+        $this->assertStringContainsString('addSbtPlugin("com.timushev.sbt" % "sbt-updates" % "0.6.4")', $t->detail);
+        $this->assertStringContainsString("{$home}/.sbt/0.13/plugins/sbt-updates.sbt", $t->detail);
+        $this->assertFileDoesNotExist($log, 'no JVM started for a guaranteed failure');
+    }
+
+    /**
+     * A stand-in composer that logs its arguments: update writes a
+     * lockfile, audit reports no advisories.
+     */
+    private function fakeComposer(): string
+    {
+        $bin = $this->scratchDir('bin');
+        $log = $bin . '/calls.log';
+        file_put_contents($bin . '/composer', <<<SH
+            #!/bin/sh
+            echo "\$*" >> '{$log}'
+            case "\$1" in
+              update) echo '{}' > composer.lock ;;
+              audit) echo '{"advisories": {}, "abandoned": {}}' ;;
+            esac
+            SH);
+        chmod($bin . '/composer', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        return $log;
+    }
+
+    /**
+     * An sbt project (build.properties only when $version is given), a HOME
+     * without global plugins, and a stand-in sbt whose runner is 2.0.10 and
+     * which logs SBT_NATIVE_CLIENT and its arguments.
+     *
+     * @return array{string, string, string} root, home, log
+     */
+    private function sbtProject(string $version): array
+    {
+        $bin  = $this->scratchDir('bin');
+        $log  = $bin . '/calls.log';
+        $home = $this->scratchDir('home');
+        file_put_contents($bin . '/sbt', <<<SH
+            #!/bin/sh
+            if [ "\$1" = --script-version ]; then echo 2.0.10; exit 0; fi
+            echo "SBT_NATIVE_CLIENT=\$SBT_NATIVE_CLIENT \$*" >> '{$log}'
+            SH);
+        chmod($bin . '/sbt', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $this->setEnv('HOME', $home);
+
+        $root = $this->scratchDir('scala');
+        file_put_contents($root . '/build.sbt', '');
+        mkdir($root . '/project');
+        if ($version !== '') {
+            file_put_contents($root . '/project/build.properties', "sbt.version={$version}\n");
+        }
+        return [$root, $home, $log];
     }
 
     /**

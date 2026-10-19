@@ -74,7 +74,7 @@ final class FixPlanner
                 'package'   => $pkg,
                 'spec'      => $spec,
                 'keys'      => array_values(array_unique($keys[$gk] ?? [])),
-                'pkg_max'   => Version::max($maxima[$eco . "\0" . $pkg] ?? []),
+                'pkg_max'   => Version::maxRelease($maxima[$eco . "\0" . $pkg] ?? []),
             ];
         }
         return $plan;

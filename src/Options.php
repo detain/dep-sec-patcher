@@ -39,6 +39,8 @@ final class Options
     public string $vulnDb = '';
     public string $stateDir = '';
     public string $workdir = '';
+    /** Keep a remote TARGET's clone after the run instead of deleting it. */
+    public bool $keepClone = false;
     public string $configFile = '';
     public int $maxIssues = 300;
     public string $github = 'auto';
@@ -161,6 +163,9 @@ final class Options
                     break;
                 case '--workdir':
                     $o->workdir = $take();
+                    break;
+                case '--keep-clone':
+                    $o->keepClone = true;
                     break;
                 case '--config':
                     $o->configFile = $take();
@@ -365,7 +370,8 @@ issues proven fixed.
 TARGET       What to scan (default: the current directory):
                DIR                a local directory
                URL                a git URL (https://, ssh://, git@host:path,
-                                  file://), cloned into a cache workdir
+                                  file://), cloned for the run and deleted
+                                  when it ends (see --keep-clone)
                OWNER/NAME         GitHub shorthand for https://github.com/OWNER/NAME
                                   (when no local directory of that name exists)
 
@@ -376,12 +382,17 @@ Target and state:
                         advisories, settings checks and PR triage (default:
                         parsed from the target's origin remote when it is on
                         github.com; without one the GitHub steps are skipped)
-  --state-dir DIR       Where the vulnerability database, reports, run lock and
-                        clones live (default: \${XDG_STATE_HOME:-~/.local/state}/
-                        dep-sec-patcher/<slug>, never inside the scanned tree)
-  --vuln-db PATH        Local vulnerability database (default: STATE/vulns.json)
+  --state-dir DIR       Where the reports, run lock and clone live (default:
+                        \${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/<slug>,
+                        never inside the scanned tree). The lock and clone are
+                        deleted when the run ends.
+  --vuln-db PATH        Local vulnerability database (default:
+                        \${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/vulns/
+                        <slug>.json, or STATE/vulns.json with --state-dir)
   --report-dir DIR      Where scan reports go (default: STATE/reports)
   --workdir DIR         Clone location for a remote TARGET (default: STATE/checkout)
+  --keep-clone          Keep a remote TARGET's clone after the run; the next
+                        run refreshes and reuses it (default: delete it)
   --config FILE         Config file (default: TARGET/.dep-sec-patcher.json if present)
 
 Options:

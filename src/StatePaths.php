@@ -8,13 +8,17 @@ use InvalidArgumentException;
 
 /**
  * Where a target's state lives: the vulnerability database, reports, the run
- * lock and (for a remote target) the cache clone.
+ * lock and (for a remote target) the clone.
  *
- * Default: ${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/<slug>/ with
- *   vulns.json   the vulnerability database
- *   reports/     scan reports and security-scan-report.json
- *   run.lock     one run per target at a time
- *   checkout/    the clone of a remote target
+ * Default, under ${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/:
+ *   vulns/<slug>.json   the vulnerability database, kept between runs
+ *   <slug>/reports/     the latest run's reports
+ *   <slug>/run.lock     one run per target at a time; deleted when the run ends
+ *   <slug>/checkout/    the clone of a remote target; deleted when the run
+ *                       ends unless --keep-clone
+ *
+ * The database lives outside <slug>/ so that nothing a rerun needs is in
+ * there. With --state-dir everything, the database included, is under STATE.
  *
  * slug(), baseDir() and resolve() are pure.
  */
@@ -26,6 +30,8 @@ final class StatePaths
         public readonly string $reportDir,
         public readonly string $workdir,
         public readonly string $lockFile,
+        /** Where the database used to be by default, to move it from; '' when its location was given */
+        public readonly string $legacyVulnDb = '',
     ) {
     }
 
@@ -71,13 +77,20 @@ final class StatePaths
      */
     public static function resolve(Options $opt, string $slug, array $env, string $cwd): self
     {
-        $state = $opt->stateDir !== '' ? self::absolute($opt->stateDir, $cwd) : self::baseDir($env) . '/' . $slug;
+        $base  = $opt->stateDir === '' ? self::baseDir($env) : '';
+        $state = $opt->stateDir !== '' ? self::absolute($opt->stateDir, $cwd) : $base . '/' . $slug;
+        $db    = match (true) {
+            $opt->vulnDb !== ''   => self::absolute($opt->vulnDb, $cwd),
+            $opt->stateDir !== '' => $state . '/vulns.json',
+            default               => $base . '/vulns/' . $slug . '.json',
+        };
         return new self(
             $state,
-            $opt->vulnDb !== '' ? self::absolute($opt->vulnDb, $cwd) : $state . '/vulns.json',
+            $db,
             $opt->reportDir !== '' ? self::absolute($opt->reportDir, $cwd) : $state . '/reports',
             $opt->workdir !== '' ? self::absolute($opt->workdir, $cwd) : $state . '/checkout',
             $state . '/run.lock',
+            $opt->vulnDb === '' && $opt->stateDir === '' ? $state . '/vulns.json' : '',
         );
     }
 

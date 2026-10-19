@@ -305,6 +305,19 @@ final class Version
     }
 
     /**
+     * Highest of a list, leaving out prereleases unless there is nothing
+     * else: an override pinned to a release candidate would put every copy
+     * of the package on it.
+     *
+     * @param list<string> $versions
+     */
+    public static function maxRelease(array $versions): string
+    {
+        $releases = array_values(array_filter($versions, static fn ($v) => $v !== '' && self::splitPrerelease($v)[1] === null));
+        return self::max($releases !== [] ? $releases : $versions);
+    }
+
+    /**
      * @return array{0: string, 1: ?string} release part, prerelease part (null when absent)
      */
     private static function splitPrerelease(string $v): array

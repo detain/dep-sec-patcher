@@ -40,8 +40,13 @@ final class GradleAuditor extends Auditor
 
     public function audit(Context $ctx, string $dir): TargetResult
     {
-        // sh, not ./gradlew: generated wrappers are often committed without +x
-        $cmd = $this->exists($ctx, $dir, 'gradlew') ? ['sh', 'gradlew'] : ['gradle'];
+        // sh, not ./gradlew: generated wrappers are often committed without +x.
+        // Some are bash scripts (arrays), which sh cannot parse
+        $cmd = ['gradle'];
+        if ($this->exists($ctx, $dir, 'gradlew')) {
+            $first = (string)strtok((string)@file_get_contents($this->abs($ctx, $dir) . '/gradlew', false, null, 0, 200), "\n");
+            $cmd   = [str_contains($first, 'bash') ? 'bash' : 'sh', 'gradlew'];
+        }
         $flags = ['--no-daemon', '-q', '--console=plain'];
 
         if ($ctx->checkMode()) {

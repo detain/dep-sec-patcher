@@ -134,7 +134,7 @@ it found it:
 
 ```bash
 dep-sec-patcher --check                                  # the current directory
-dep-sec-patcher --check -t 4 owner/name                  # a GitHub repository, cloned into the state directory, 4 audits at a time
+dep-sec-patcher --check -t 4 owner/name                  # a GitHub repository, cloned for the run and deleted afterwards, 4 audits at a time
 dep-sec-patcher --check --only node,php -v               # only two ecosystems, streaming every tool's output
 dep-sec-patcher --check --subdir services/api ~/src/monorepo   # only part of a monorepo
 ```
@@ -249,17 +249,17 @@ followed, and `--exclude-dir` adds more. The **Name** column is what
 
 | Language | Name | Detected by | Vulnerability audit | Update mode |
 | --- | --- | --- | --- | --- |
-| Java | `maven` | `pom.xml` | OWASP dependency-check (NVD); fails at CVSS >= `--cvss-threshold` | `versions:use-latest-releases` rewrites `pom.xml` |
+| Java | `maven` | `pom.xml` | OWASP dependency-check (NVD); fails at CVSS >= `--cvss-threshold` | `versions:use-latest-releases` and `versions:update-properties` rewrite `pom.xml` |
 | Java, Kotlin | `gradle` | `gradlew` | none: outdated report only (`dependencyUpdates`) | resolves dependencies (informational) |
 | Scala | `sbt` | `build.sbt` | none: outdated report only (`dependencyUpdates`) | `dependencyUpdates` (informational) |
-| JavaScript, TypeScript | `node` | `package.json` | `npm audit`, `yarn audit` / `yarn npm audit`, or `pnpm audit` | `npm update` + `npm audit fix --force`, `yarn upgrade` (Yarn 1), `pnpm up --latest` |
+| JavaScript, TypeScript | `node` | `package.json` | `npm audit`, `yarn audit` / `yarn npm audit`, or `pnpm audit` | `npm update` + `npm audit fix` (`--force` with `--allow-major`), `yarn upgrade` (Yarn 1), `pnpm up` (`--latest` with `--allow-major`) |
 | PHP | `php` | `composer.json` | `composer audit` (also lists abandoned packages) | `composer update -W` rewrites `composer.lock` |
 | Python | `python` | `requirements.txt` | `pip-audit`, or `safety` | `pip-audit --fix` rewrites `requirements.txt` |
 | Ruby | `ruby` | `Gemfile` | `bundle-audit` (bundler-audit) | `bundle lock --update` rewrites `Gemfile.lock` |
 | Go | `go` | `go.mod` | `govulncheck` (plus a `gosec` source scan) | `go get -u ./...` and `go mod tidy` |
 | Rust | `rust` | `Cargo.toml` | `cargo audit` | `cargo update` rewrites `Cargo.lock` |
 | C#, F# (.NET) | `dotnet` | `*.sln`, `*.csproj`, `*.fsproj` | `dotnet list package --vulnerable --include-transitive` | `dotnet-outdated -u:Auto` rewrites project files |
-| Dart | `dart` | `pubspec.yaml` | none: outdated report only (`dart pub outdated`) | `dart pub upgrade --major-versions` |
+| Dart | `dart` | `pubspec.yaml` | none: outdated report only (`dart pub outdated`) | `dart pub upgrade` (`--major-versions` with `--allow-major`) |
 | Elixir | `elixir` | `mix.exs` | `mix hex.audit` (retired packages) | `mix deps.update --all` |
 | Swift | `swift` | `Package.swift` | none: dependency listing only | `swift package update` |
 | R | `r` | `DESCRIPTION`, `renv.lock` | none: lists outdated packages in the host R library | nothing written |
@@ -272,9 +272,12 @@ Notes:
 - **Python** directories that only have a `pyproject.toml` or `Pipfile` are
   found but skipped (`no requirements.txt to audit`). Auto-fix still edits
   those files.
-- **Gradle** in check mode, and **sbt** in both modes, need a plugin for their
-  report (the ben-manes gradle-versions-plugin and sbt-updates); without it the
-  project is SKIPped with that reason. See [Ecosystem tools](#ecosystem-tools).
+- **Gradle** in check mode needs the ben-manes gradle-versions-plugin for its
+  report; without it the project is SKIPped with that reason. **sbt** needs
+  sbt-updates: when neither the project nor the global plugins have it, the
+  tool adds it for the one command (sbt 1.4 and later, sbt 2 included), and
+  only an older sbt is SKIPped, with the line to add. See
+  [Ecosystem tools](#ecosystem-tools).
 - Trivy and the GitHub collection run whatever the per-ecosystem audits find
   or skip.
 
@@ -294,17 +297,17 @@ failing the project.
 
 | Name | Tools | Check mode runs | Update mode changes | Concurrent runs |
 | --- | --- | --- | --- | --- |
-| `maven` | `mvn`, OWASP `dependency-check-maven` (`--enable-native-access=ALL-UNNAMED` is added to `MAVEN_OPTS` when mvn runs on Java 17+) | `dependency-check:check` against the database refreshed once per run (`autoUpdate=false`) | `versions:use-latest-releases` (falling back to `use-latest-versions` only if that fails) rewrites `pom.xml` | Maven >= 3.9.0, with resolver file locks; serial below |
-| `gradle` | the project's `gradlew`, run with `sh` | `dependencyUpdates` if the ben-manes versions plugin is applied, else SKIP | `dependencies` (resolves; informational) | yes |
-| `sbt` | `sbt` + `sbt-updates` plugin | `dependencyUpdates` if the plugin is configured, else SKIP | `dependencyUpdates` with `onlyEval := false` (informational) | sbt >= 1.3.0 (Coursier); serial below |
-| `node` | `npm`, or `yarn` / `pnpm` when their lockfile is present | npm: `npm install --package-lock-only`, then `npm audit --omit=dev`; Yarn 1: `yarn audit`; Yarn 2+: `yarn npm audit --all`; pnpm: `pnpm audit` | `npm update` and `npm audit fix --force` (lockfile only, scripts disabled), Yarn 1: `yarn install` then `yarn upgrade` (scripts disabled), `pnpm up --latest` (scripts disabled) | npm, pnpm: yes; yarn >= 2.0.0, serial for Yarn 1 |
-| `php` | `composer` | `composer update --no-install` if there is no lockfile, then `composer audit --locked` | `composer update -W --no-install` rewrites `composer.lock`. If Composer refuses because only versions with security advisories meet a requirement, the update is retried with its advisory blocking off, and a note says so | always serial |
+| `maven` | `mvn`, OWASP `dependency-check-maven` (`--enable-native-access=ALL-UNNAMED` is added to `MAVEN_OPTS` when mvn runs on Java 17+) | `dependency-check:check` against the database refreshed once per run (`autoUpdate=false`) | `versions:use-latest-releases` (falling back to `use-latest-versions` only if that fails), then `versions:update-properties` for versions taken from `<properties>`, rewrite `pom.xml`; both with `-DallowMajorUpdates=false` unless `--allow-major` | Maven >= 3.9.0, with resolver file locks; serial below |
+| `gradle` | the project's `gradlew`, run with `sh` (or `bash` when its first line names bash) | `dependencyUpdates` if the ben-manes versions plugin is applied, else SKIP | `dependencies` (resolves; informational) | yes |
+| `sbt` | `sbt` + `sbt-updates` plugin, always in the foreground (`--server` on sbt 2, `SBT_NATIVE_CLIENT=false`), so no sbt server is left running | `dependencyUpdates`; without the plugin in `project/*.sbt` or the global plugins, it is added with `--addPluginSbtFile` (sbt 1.4+), else SKIP. sbt before 1.6 on Java 18 to 23 gets `-Djava.security.manager=allow`, without which it cannot start | `dependencyUpdates` (informational) | sbt >= 1.3.0 (Coursier); serial below |
+| `node` | `npm`, or `yarn` / `pnpm` when their lockfile is present | npm: `npm install --package-lock-only`, then `npm audit --omit=dev`; Yarn 1: `yarn audit`; Yarn 2+: `yarn npm audit --all`; pnpm: `pnpm audit` | `npm update` and `npm audit fix` (lockfile only, scripts disabled; `--force`, which makes major upgrades, only with `--allow-major`), Yarn 1: `yarn install` then `yarn upgrade` (scripts disabled), `pnpm up` (scripts disabled; `--latest` only with `--allow-major`). When `package.json` itself has conflicting peer dependencies (npm `ERESOLVE`), every npm step is retried with `--legacy-peer-deps` and a note says so | npm, pnpm: yes; yarn >= 2.0.0, serial for Yarn 1 |
+| `php` | `composer` | `composer update -W --no-install` if there is no lockfile, then `composer audit --locked`; a lockfile created for the audit is deleted afterwards | `composer update -W --no-install` rewrites `composer.lock`, or creates one for the audit and deletes it afterwards when the project had none (so `--push` never commits it). If Composer refuses because only versions with security advisories meet a requirement, the update is retried with its advisory blocking off, and a note says so | always serial |
 | `python` | `python3`, plus `pip-audit` or `safety` | `pip-audit -r requirements.txt` (or `safety check -r requirements.txt`) | `pip-audit --fix` rewrites `requirements.txt` (`safety` changes nothing) | yes |
 | `ruby` | `bundle`, `bundle-audit` (installed with `gem` if missing) | advisory database refreshed once, `bundle lock` if there is no lockfile, then `bundle-audit check` | `bundle lock --update` rewrites `Gemfile.lock` (no gems installed) | Bundler >= 2.6.0; serial below |
 | `go` | `go`, `govulncheck`, optional `gosec` | `go list -m -u all` (outdated count), `govulncheck` (reachable code, falling back to `-scan module` when the package does not build) | `go get -u ./...` and `go mod tidy` | yes |
 | `rust` | `cargo`, `cargo-audit` | `cargo generate-lockfile` if needed, then `cargo audit` | `cargo update` rewrites `Cargo.lock` | yes |
 | `dotnet` | `dotnet`, `dotnet-outdated` | `dotnet restore`, `dotnet list package --vulnerable --include-transitive` (a solution owns the projects it references, so they are audited once) | `dotnet-outdated -u:Auto` rewrites project files | always serial |
-| `dart` | `dart` | `dart pub outdated` (informational, no advisory database) | `dart pub upgrade --major-versions` | always serial |
+| `dart` | `dart` | `dart pub outdated` (informational, no advisory database) | `dart pub upgrade`, with `--major-versions` only under `--allow-major` | always serial |
 | `elixir` | `mix` (Hex set up once with `mix local.hex --force`) | `mix deps.get`, then `mix hex.audit` (retired packages) | `mix deps.update --all`, then `mix hex.audit` | always serial |
 | `swift` | `swift` | `swift package show-dependencies` (informational) | `swift package update` | always serial |
 | `r` | `Rscript` | `old.packages()` on the host R library (informational) | same; nothing is written | yes |
@@ -389,8 +392,8 @@ supported.
 | Name | Needs (else the ecosystem is SKIPped) | Optional extras | Get it |
 | --- | --- | --- | --- |
 | `maven` | `mvn` | none to install: Maven fetches the OWASP `dependency-check-maven` and `versions-maven-plugin` plugins itself. An [NVD API key](#nvd-api-key) is strongly recommended | [maven.apache.org](https://maven.apache.org/install.html) |
-| `gradle` | a `gradlew` wrapper in the project (run with `sh`, so it need not be executable) | the [gradle-versions-plugin](https://github.com/ben-manes/gradle-versions-plugin) (`com.github.ben-manes.versions`), applied in `build.gradle(.kts)`, `settings.gradle(.kts)` or `~/.gradle/init.d/`, for the check-mode report | ships with the project |
-| `sbt` | `sbt` | the [sbt-updates](https://github.com/rtimush/sbt-updates) plugin, in `project/*.sbt` or `~/.sbt/1.0/plugins/*.sbt`; without it each project is SKIPped | [scala-sbt.org](https://www.scala-sbt.org/download/) |
+| `gradle` | a `gradlew` wrapper in the project (run with `sh`, or `bash` when it is a bash script, so it need not be executable) | the [gradle-versions-plugin](https://github.com/ben-manes/gradle-versions-plugin) (`com.github.ben-manes.versions`), applied in `build.gradle(.kts)`, `settings.gradle(.kts)` or `~/.gradle/init.d/`, for the check-mode report | ships with the project |
+| `sbt` | `sbt` | none for sbt 1.4+ and 2: the [sbt-updates](https://github.com/rtimush/sbt-updates) plugin is used from `project/*.sbt` or the global plugins (`~/.sbt/1.0/plugins/`; sbt 2 has none), and otherwise added for the command. Older sbt needs it in `~/.sbt/0.13/plugins/` or `project/`, else its projects are SKIPped | [scala-sbt.org](https://www.scala-sbt.org/download/) |
 | `node` | `npm` | `yarn` and `pnpm`, for projects with their lockfile (npm is used otherwise) | [nodejs.org](https://nodejs.org/) |
 | `php` | `composer` | | [getcomposer.org](https://getcomposer.org/download/) |
 | `python` | `python3`, plus `pip-audit` or `safety` | `pip-audit` is preferred: it lists each finding and `--fix` updates `requirements.txt`. `safety` is a check-only fallback | [pip-audit](https://github.com/pypa/pip-audit) |
@@ -409,7 +412,7 @@ supported.
 | --- | --- | --- | --- |
 | Trivy | `trivy` | `[SKIP] trivy (trivy not installed)` | [aquasecurity/trivy](https://github.com/aquasecurity/trivy) |
 | bandit | `bandit` | `[SKIP] bandit (bandit not installed)` | [PyCQA/bandit](https://github.com/PyCQA/bandit) |
-| grype | `grype` and `docker` | skipped without a line | [anchore/grype](https://github.com/anchore/grype), [Docker](https://docs.docker.com/engine/install/) |
+| grype | `grype` and `docker`, with the daemon running | skipped without a line when either is missing, with one SKIP line when the daemon cannot be reached | [anchore/grype](https://github.com/anchore/grype), [Docker](https://docs.docker.com/engine/install/) |
 | gosec | `gosec` (runs inside the Go audit) | not run, without a line | [securego/gosec](https://github.com/securego/gosec) |
 | govulncheck | `govulncheck` (the Go audit) | Go projects are not audited, `[WARN]` | [golang.org/x/vuln](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) |
 | OWASP dependency-check | `mvn` (the Maven audit) | the `maven` ecosystem is SKIPped | fetched by Maven |
@@ -465,7 +468,7 @@ nvm (`$NVM_DIR`, or `~/.nvm`).
 | --- | --- |
 | `[SKIP] go (go not installed)` | the ecosystem's main tool is missing, so none of its projects run |
 | `[SKIP] maven (no pom.xml found)` | nothing in the tree needs that ecosystem |
-| `[SKIP] [sbt] svc — sbt-updates plugin not configured (dependencyUpdates unavailable)` | the project needs a plugin or a file it does not have |
+| `[SKIP] [sbt] svc — sbt-updates plugin not configured for sbt 0.13.15 (...): add addSbtPlugin(...) to ~/.sbt/0.13/plugins/sbt-updates.sbt` | the project needs a plugin or a file it does not have; the line says what to add |
 | `[WARN] [go] api — govulncheck not installed, not audited` | the project was updated or listed, but its optional audit tool is missing |
 | `[SKIP] gh (not installed - GitHub checks unavailable)` | the GitHub steps are skipped; everything local still runs |
 
@@ -509,13 +512,15 @@ Until a release is tagged, Composer installs need the development version:
 | `owner/name` | GitHub shorthand for `https://github.com/owner/name.git`, used when no local directory of that name exists. |
 
 **Remote targets.** A remote target is cloned into `STATE/checkout` (or
-`--workdir`). Every run fetches it and resets it to the tip of the remote's
-default branch, deleting untracked and ignored files, so a run always starts
-from a pristine tree. Local changes left in the clone by an earlier run are
-discarded, with a warning. The tool only resets a directory it cloned itself
-(it leaves a marker in `.git/`), and refuses to reuse anything else. Check mode
-leaves the clone pristine. Update mode leaves its changes there for you to
-inspect, or publishes them with `--push`, `--pr` or `--push-direct`. Private
+`--workdir`) for the run and deleted when the run ends, however it ends: after
+the summary, after an error, or on Ctrl-C. Update mode's changes are deleted
+with it, so publish them with `--push`, `--pr` or `--push-direct`.
+`--keep-clone` keeps the clone instead, for inspecting what update mode did;
+the next run then fetches it and resets it to the tip of the remote's default
+branch, deleting untracked and ignored files and warning about local changes,
+so a run always starts from a pristine tree. The tool only resets or deletes a
+directory it cloned itself (it leaves a marker in `.git/`) or one that was
+empty, and refuses to use anything else. Private
 repositories need git credentials that work without a prompt: an SSH key, or
 `gh auth setup-git` for HTTPS. When `GH_TOKEN` or `GITHUB_TOKEN` is set (or
 harvested, see [GitHub integration](#github-integration)) and `gh` is
@@ -540,23 +545,33 @@ is not on github.com and no `--repo` is given, every GitHub step prints a
 `[SKIP]` line saying why. GitHub Enterprise hosts are not detected
 automatically; pass `--repo` and configure `gh` for the host.
 
-**State** lives outside the scanned tree, by default in
-`${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/<slug>/`:
+**State** lives outside the scanned tree, by default under
+`${XDG_STATE_HOME:-~/.local/state}/dep-sec-patcher/`:
 
 ```text
-<slug>/
-├── vulns.json        vulnerability database (--vuln-db)
-├── reports/          scan reports (--report-dir)
-├── run.lock          one run per target at a time
-└── checkout/         clone of a remote target (--workdir)
+dep-sec-patcher/
+├── vulns/
+│   └── <slug>.json   vulnerability database, kept between runs (--vuln-db)
+└── <slug>/
+    ├── reports/      the latest run's reports (--report-dir)
+    ├── run.lock      only while a run is going
+    └── checkout/     a remote target's clone, only while a run is going (--workdir, --keep-clone)
 ```
+
+Nothing a rerun needs is in `<slug>/`: the lock and the clone are deleted when
+the run ends, and the directory itself when nothing is left in it (the reports
+stay until the next run replaces them). The tools' own advisory databases (the
+NVD copy dependency-check keeps, Trivy's, govulncheck's, ...) are in each tool's
+cache and shared by every target. A database left at the old default,
+`<slug>/vulns.json`, is moved to `vulns/<slug>.json` by the next run.
 
 The slug is `owner__name` (lowercased) when there is a GitHub repository, and
 `<directory-name>-<8 hex chars>` otherwise, where the hash comes from the
-target's realpath or from its normalised URL. `--state-dir` moves the whole
-directory, and `--vuln-db`, `--report-dir` and `--workdir` move individual
-parts. A state directory, database or report directory inside the scanned tree
-is refused: it would be audited, wiped by check mode, or committed.
+target's realpath or from its normalised URL. `--state-dir` puts everything,
+the database included (`STATE/vulns.json`), in one directory of your choosing,
+which is never deleted. `--vuln-db`, `--report-dir` and `--workdir` move
+individual parts. A state directory, database or report directory inside the
+scanned tree is refused: it would be audited, wiped by check mode, or committed.
 
 ## Options
 
@@ -570,10 +585,11 @@ the same list.
 | `TARGET` | current directory | Directory, git URL or `OWNER/NAME` to scan |
 | `--subdir PATH` | | Scan only `PATH` inside the target |
 | `--repo OWNER/NAME` | from the target's `origin` / URL | GitHub repository for the GitHub steps (env `GH_REPO`) |
-| `--state-dir DIR` | `$XDG_STATE_HOME/dep-sec-patcher/<slug>` | Base for the database, reports, lock and clone |
-| `--vuln-db PATH` | `STATE/vulns.json` | Vulnerability database (env `VULN_DB`) |
+| `--state-dir DIR` | `$XDG_STATE_HOME/dep-sec-patcher/<slug>` | Base for the reports, lock and clone, and with this option the database too |
+| `--vuln-db PATH` | `$XDG_STATE_HOME/dep-sec-patcher/vulns/<slug>.json` (`STATE/vulns.json` with `--state-dir`) | Vulnerability database (env `VULN_DB`) |
 | `--report-dir DIR` | `STATE/reports` | Where reports are written |
-| `--workdir DIR` | `STATE/checkout` | Clone location for a remote target |
+| `--workdir DIR` | `STATE/checkout` | Clone location for a remote target, deleted when the run ends |
+| `--keep-clone` | | Keep a remote target's clone after the run; the next run refreshes and reuses it |
 | `--config FILE` | `TARGET/.dep-sec-patcher.json` if present | Config file |
 
 ### Mode
@@ -638,7 +654,7 @@ config file turned it off.
 | `--no-github` | | Skip every GitHub step |
 | `--no-merge-prs` | | Skip dependency-bot PR triage: no merges, auto-merges or rebase requests |
 | `--no-auto-fix` | | Record vulnerabilities but never edit manifests |
-| `--allow-major` | | Let auto-fix move a dependency to a new major version when that is the only fix (by default such fixes are reported and left pending) |
+| `--allow-major` | | Let auto-fix move a dependency to a new major version when that is the only fix (by default such fixes are reported and left pending), and let the updaters cross major lines (Maven's versions plugin, `npm audit fix --force`, `pnpm up --latest`, `dart pub upgrade --major-versions`) |
 | `--close-fixed` | | Close security issues whose fixes the manifests now declare |
 | `--close-label NAME` | `security: verified fixed` | Label added before closing (created if missing; empty disables) |
 | `--close-delay N` | 5 | Seconds between closes |
@@ -710,7 +726,7 @@ the publishing options (`--push`, `--pr`, `--pr-merge`, `--push-direct`,
 | --- | --- | --- |
 | `trivy` | `trivy fs --scanners vuln,misconfig,secret` over the scanned tree, once. If Maven Central rate-limits its POM lookups (HTTP 429), a `Retry-After` of up to 5 minutes is waited out and the scan retried once; a longer block, or a second 429, reruns it with `--offline-scan` | Secrets or high/critical vulnerabilities fail; misconfigurations warn. An offline fallback adds "offline scan" to the result. Report `trivy/_root/trivy-fs-results.json`. |
 | `bandit` | `bandit -r .` once, when there are `.py` files | HIGH findings fail, others warn. Report `bandit/_root/bandit-results.json`. |
-| `grype` | Builds an image from each of up to 5 `Dockerfile`s and scans it; needs `grype` and `docker`; images are removed afterwards | By severity. Skipped silently when either tool is missing. |
+| `grype` | Builds an image from each of up to 5 `Dockerfile`s and scans it; needs `grype` and `docker`; images are removed afterwards | By severity. Skipped silently when either tool is missing, and with one SKIP line when the docker daemon is not reachable. |
 | `gosec` | Inside each Go audit | Finding count as a note; report under `gosec/`. |
 | `netsec` | Built in, over every indexed file | See below. |
 
@@ -769,7 +785,8 @@ so that a renamed repository resolves to its current name.
   `security_events` scope).
 - *Repository security advisories*: published, draft and triage advisories. A
   404 counts as none.
-- *Security issues*: up to `--max-issues` open issues. Their bodies become
+- *Security issues*: up to `--max-issues` open issues (a WARN says when the
+  listing stopped there; the rest are read as earlier ones close). Their bodies become
   manifest edits, so only issues opened by a GitHub App bot whose login starts
   with `mend`, `whitesource`, `snyk`, `renovate` or `dependabot` (optionally
   prefixed `app/`) are read; anything a person could have written is ignored.
@@ -838,7 +855,9 @@ group:
 - a fix that needs a new major version is held back unless `--allow-major` is
   given;
 - a transitive dependency is pinned instead: npm `overrides` / `resolutions`,
-  or Maven `<dependencyManagement>`;
+  or Maven `<dependencyManagement>`. An npm package that the lockfile holds no
+  copy of is not pinned at all (nothing installs it), and a pin never goes to
+  a prerelease when a release fixes the same advisories;
 - Maven `${property}` versions are bumped at the property definition.
 
 The files it can edit, how each writes the version, and the rules for major
@@ -970,8 +989,10 @@ where other users could read it with `ps`. The run warns when no key is set.
 
 ## Vulnerability database
 
-`STATE/vulns.json` (or `--vuln-db`) is a JSON file holding one record per
-vulnerability, package and manifest:
+`dep-sec-patcher/vulns/<slug>.json` (`STATE/vulns.json` with `--state-dir`, or
+`--vuln-db`) is a JSON file per target holding one record per vulnerability,
+package and manifest. It is per target because its records are: they name that
+repository's manifest paths and issue numbers, and what was applied there.
 
 - `source` is `dependabot`, `advisory` or `issue`. Keys are
   `ecosystem|package|manifest|id` for alerts, `ecosystem|package||ghsa` for
@@ -1154,7 +1175,14 @@ in-process.
   without installing gems.
 - **Run lock.** One run per target at a time (`STATE/run.lock`, `flock`). The
   lock is opened close-on-exec, so a daemon a tool leaves behind cannot keep
-  holding it.
+  holding it. The run deletes the file while still holding the lock, and a
+  starting run checks that the file it locked is still the one at that path,
+  so two runs never hold locks on different files.
+- **Deleting the clone.** The clone is moved aside before it is deleted, so a
+  deletion cut short never leaves a half-deleted tree in the next run's way.
+  Symlinks inside it are unlinked, never followed or `chmod`ed (a cloned
+  repository can link anywhere on the host), and only a clone the tool made,
+  or an empty directory, is ever deleted.
 - **Workers.** A forked worker writes its result to a temp file and then kills
   itself with SIGKILL, so shutdown handlers and destructors inherited from the
   parent never run twice. SIGINT, SIGTERM and SIGHUP are passed on to workers
@@ -1211,7 +1239,8 @@ Normal runs clean up after themselves.
 
 **`another run is already in progress (pid N)`.** Another run holds this
 target's lock. If that process is gone, the lock was already released when it
-exited (the lock is an `flock`, not the file's existence).
+exited (the lock is an `flock`, not the file's existence; a run that was
+killed with SIGKILL leaves the file, and the next run simply takes it).
 
 **`Dependabot: could not list alerts`.** The token cannot read the repository's
 security alerts. That needs admin access or the `security_events` scope.
@@ -1238,9 +1267,10 @@ the block has cleared, scans online again.
 bin/dep-sec-patcher        finds an autoloader (Composer's, or a built-in PSR-4 one)
 src/Application            options, TARGET/state resolution, config, lock, signals
 src/Options, Config        command line and config file, merged in precedence order
-src/GitUrl, Target,        remote URL parsing, TARGET classification and cache clones,
+src/GitUrl, Target,        remote URL parsing, TARGET classification and clones,
     TargetResolver,        state directory derivation, tool PATH
     StatePaths, Environment
+src/Filesystem             recursive deletion that never follows symlinks
 src/SecurityRun            the run: audits, scanners, GitHub, auto-fix, close-fixed, publishing, summary
 src/ProcessRunner          timeouts, process groups, heartbeat, output capture
 src/ForkPool               forked workers with per-group concurrency limits
@@ -1292,12 +1322,12 @@ were specific to that repository.
 | `--profile NAME`, `--project DIR`, `--list-profiles` | Removed. Pass the directory as TARGET, and narrow it with `--subdir` |
 | `API_SAMPLES_PROFILE`, `API_SAMPLES_PROJECT` | Removed (ignored) |
 | `--repo` default: origin remote, then the profile's samples repo | Origin remote only; without one the GitHub steps SKIP |
-| Vuln DB default: the parent project's `logs/security-vulns.json` | `STATE/vulns.json`. Pass `--vuln-db` to keep using an existing database: the format is unchanged |
+| Vuln DB default: the parent project's `logs/security-vulns.json` | `$XDG_STATE_HOME/dep-sec-patcher/vulns/<slug>.json`. Pass `--vuln-db` to keep using an existing database: the format is unchanged |
 | Reports: `logs/security-reports/` beside the database | `STATE/reports/` |
 | Lock: `.update-samples-security.lock` in the report directory | `STATE/run.lock` |
 | Output prefix `[security-update]` | `[dep-sec-patcher]` |
 | Always exits 0 after a run | Still 0; `--strict` adds status 3 on failures |
-| | New: `--subdir`, `--state-dir`, `--workdir`, `--config`, `--exclude-dir`, `--allow-http`, `--grype`/`--no-grype`, `--netsec`/`--no-netsec`, `--push`, `--pr`, `--pr-merge`, `--push-direct`, `--branch`, `--allow-major`, `--strict`, `-V` |
+| | New: `--subdir`, `--state-dir`, `--workdir`, `--keep-clone`, `--config`, `--exclude-dir`, `--allow-http`, `--grype`/`--no-grype`, `--netsec`/`--no-netsec`, `--push`, `--pr`, `--pr-merge`, `--push-direct`, `--branch`, `--allow-major`, `--strict`, `-V` |
 | PR markers `<!-- security-update:rebase -->` and `<!-- security-update:closed-verified -->` | Unchanged, so rebase requests posted by the old tool are still recognised |
 
 The old default run is equivalent to:
