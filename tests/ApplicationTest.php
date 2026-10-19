@@ -460,6 +460,34 @@ class ApplicationTest extends TestCase
         $this->assertStringContainsString('<version>6.2.19</version>', (string)file_get_contents($dir . '/pom.xml'), 'the lowest major that fixes it');
     }
 
+    public function testAPrereleaseAboveEveryFixIsLeftForAPerson(): void
+    {
+        $dir = $this->scratchDir('prerelease');
+        $pom = "<project>\n  <dependencies>\n    <dependency>\n      <groupId>io.netty</groupId>\n      <artifactId>netty-codec-http</artifactId>\n"
+            . "      <version>5.0.0.Alpha2</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        file_put_contents($dir . '/pom.xml', $pom);
+        $record = static fn (string $pkg, array $fixes, array $installed): array => [
+            'key' => "pom.xml|{$pkg}|CVE-1", 'source' => 'issue', 'id' => 'CVE-1', 'ecosystem' => 'maven', 'package' => $pkg,
+            'manifest' => 'pom.xml', 'fixed_version' => $fixes[0], 'fix_versions' => $fixes, 'installed' => $installed,
+        ];
+        $db = $this->storedDb([
+            $record('io.netty:netty-codec-http', ['4.1.137.Final', '4.2.17.Final'], []),
+            $record('org.springframework:spring-webmvc', ['6.2.19', '7.0.8'], ['7.1.0-M2']),
+        ]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--allow-major', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertSame($pom, (string)file_get_contents($dir . '/pom.xml'), 'not moved back to a release, nor pinned at the prerelease');
+        $this->assertStringContainsString('maven io.netty:netty-codec-http is on prerelease 5.0.0.Alpha2 in pom.xml, above every fix', $out);
+        $this->assertStringNotContainsString('already-ok=1', $out);
+        $vulns = VulnDb::load($db)['vulns'];
+        $netty = $vulns['pom.xml|io.netty:netty-codec-http|CVE-1'];
+        $this->assertSame('pending', $netty['state']);
+        $this->assertStringContainsString('declared as prerelease 5.0.0.Alpha2 in pom.xml, which sorts above every fix (4.1.137.Final, 4.2.17.Final)', $netty['note']);
+        $spring = $vulns['pom.xml|org.springframework:spring-webmvc|CVE-1'];
+        $this->assertSame('pending', $spring['state']);
+        $this->assertStringContainsString('found in use at prerelease 7.1.0-M2', $spring['note']);
+    }
+
     public function testCheckModeSuggestsTheCommandThatAppliesTheFixes(): void
     {
         $dir = $this->scratchDir('suggest');

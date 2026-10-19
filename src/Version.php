@@ -164,6 +164,13 @@ final class Version
      * release line (tomcat 9.0.110 vs fixes 9.0.106 / 10.1.42 / 11.0.8), or
      * above every fix listed.
      *
+     * A prerelease can sort above every fix and still predate them all
+     * (netty 5.0.0.Alpha2 is from 2015 and has none of 4.1.137.Final's
+     * fixes). Above every fix it only counts when its major line had a
+     * release before it and needed no fix: spring-boot 4.2.0-M2 follows 4.0
+     * and 4.1, against a fix in 3.0.0. Not so spring 7.1.0-M2 against 7.0.8,
+     * which it may predate.
+     *
      * @param list<string> $fixes
      */
     public static function satisfies(string $declaredFloor, array $fixes): bool
@@ -183,7 +190,48 @@ final class Version
                 $allBelow = false;
             }
         }
-        return $allBelow;
+        if (!$allBelow || !self::isPrerelease($declaredFloor)) {
+            return $allBelow;
+        }
+        return !self::opensItsLine($declaredFloor)
+            && !in_array(self::majorLine($declaredFloor), array_map([self::class, 'majorLine'], $fixes), true);
+    }
+
+    /**
+     * Whether a version is the first release of its major line, or a
+     * prerelease of it: "5.0.0.Alpha2", "8.0.0-rc.6", "0.9.0-beta" (below
+     * 1.0 the line is the minor version, as in majorLine()).
+     */
+    private static function opensItsLine(string $version): bool
+    {
+        $parts = preg_match('/^v?(\d+(?:\.\d+)*)/', $version, $m) === 1 ? explode('.', $m[1]) : [];
+        $rest  = array_slice($parts, ($parts[0] ?? '') === '0' ? 2 : 1);
+        return array_filter($rest, static fn (string $p): bool => ltrim($p, '0') !== '') === [];
+    }
+
+    /**
+     * Whether a version is an alpha, beta, milestone, release candidate,
+     * snapshot, dev or preview build: "5.0.0.Alpha2", "7.1.0-M2",
+     * "2.0.0-rc.1", "4.2rc1". A qualifier naming a flavour of a release is
+     * not one ("33.0.0-jre", "28.2-android", "4.1.42.Final").
+     */
+    public static function isPrerelease(string $version): bool
+    {
+        return preg_match('/^v?\d+(?:\.\d+)*[-._]?(?:alpha|a|beta|b|c|milestone|m|rc|cr|pre|preview|ea|snapshot|dev|next|canary|nightly)(?![a-z])/i', $version) === 1;
+    }
+
+    /**
+     * Whether a declared prerelease leaves an advisory with no fix to move up
+     * to: it sorts above every fix without being known to include one (netty
+     * 5.0.0.Alpha2 against 4.1.137.Final / 4.2.17.Final, spring 7.1.0-M2
+     * against 6.2.19 / 7.0.8). Going back to a release is for a person to
+     * decide.
+     *
+     * @param array<string, list<string>> $spec
+     */
+    public static function prereleaseAboveFixes(string $declared, array $spec): bool
+    {
+        return self::isPrerelease(self::floor($declared)) && !self::clearsAll($declared, $spec) && self::chooseTarget($declared, $spec) === '';
     }
 
     /**

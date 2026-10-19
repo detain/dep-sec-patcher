@@ -115,6 +115,67 @@ class VersionTest extends TestCase
         $this->assertFalse(Version::satisfies('', $tomcat));
     }
 
+    #[DataProvider('prereleaseProvider')]
+    public function testIsPrerelease(string $version, bool $expected): void
+    {
+        $this->assertSame($expected, Version::isPrerelease($version), $version);
+    }
+
+    /**
+     * @return array<string, array{string, bool}>
+     */
+    public static function prereleaseProvider(): array
+    {
+        return [
+            'maven alpha'         => ['5.0.0.Alpha2', true],
+            'maven milestone'     => ['7.1.0-M2', true],
+            'maven RC'            => ['3.0.0.RC1', true],
+            'jboss CR'            => ['2.0.0.CR1', true],
+            'snapshot'            => ['1.2.3-SNAPSHOT', true],
+            'semver rc'           => ['2.0.0-rc.1', true],
+            'npm next'            => ['8.0.0-next.3', true],
+            'pep440 rc'           => ['4.2rc1', true],
+            'pep440 dev'          => ['2.0.0.dev1', true],
+            'pep440 beta'         => ['1.0b2', true],
+            'preview'             => ['9.0.0-preview.7', true],
+            'early access'        => ['21-ea', true],
+            'release'             => ['4.1.137', false],
+            'maven Final'         => ['4.1.42.Final', false],
+            'spring RELEASE'      => ['5.1.17.RELEASE', false],
+            'guava jre'           => ['33.4.0-jre', false],
+            'guava android'       => ['28.2-android', false],
+            'jetty build date'    => ['9.4.44.v20210927', false],
+            'go pseudo-version'   => ['0.0.0-20210101000000-abcdef123456', false],
+            'four-part'           => ['2.12.7.1', false],
+        ];
+    }
+
+    public function testAPrereleaseOnlySatisfiesAFixOnItsOwnReleaseLine(): void
+    {
+        $netty = ['4.1.137.Final', '4.2.17.Final'];
+        $this->assertFalse(Version::satisfies('5.0.0.Alpha2', $netty), 'sorts above every fix, but is from 2015');
+        $this->assertFalse(Version::satisfies('7.1.0-M2', ['6.2.19', '7.0.8']), 'a milestone of a line with no fix');
+        $this->assertTrue(Version::satisfies('7.0.9-RC1', ['6.2.19', '7.0.8']), 'past the fix on its own line');
+        $this->assertTrue(Version::satisfies('4.2.0-rc1', ['4.1.137', '4.2.0-beta3']));
+        $this->assertTrue(Version::satisfies('33.4.0-jre', ['32.0.0-android']), 'a guava flavour is a release');
+        $this->assertTrue(Version::satisfies('5.0.0', $netty), 'a release above every fix still counts');
+        // Above every fix, a prerelease counts once its line has had a release that needed no fix
+        $this->assertTrue(Version::satisfies('4.2.0-M2', ['3.0.0']), 'spring-boot 4.2 milestones follow 4.0 and 4.1');
+        $this->assertTrue(Version::satisfies('7.1.0-M2', ['6.2.19']), 'no 7.x fix, and 7.0 came before it');
+        $this->assertTrue(Version::satisfies('0.9.3-rc.1', ['0.8.4']));
+        $this->assertFalse(Version::satisfies('7.1.0-M2', ['7.0.9']), 'the 7.x line needed a fix, which it may predate');
+        $this->assertFalse(Version::satisfies('8.0.0-rc.6', ['7.26.10']), 'nothing on the 8.x line was released before it');
+        $this->assertFalse(Version::satisfies('0.9.0-beta', ['0.8.4']));
+
+        $this->assertTrue(Version::prereleaseAboveFixes('5.0.0.Alpha2', ['CVE' => $netty]));
+        $this->assertTrue(Version::prereleaseAboveFixes('^8.0.0-rc.1', ['A' => ['7.29.6'], 'B' => ['7.20.0']]));
+        $this->assertFalse(Version::prereleaseAboveFixes('1.0.0-beta', ['CVE' => ['1.0.0']]), 'its release is a fix to move to');
+        $this->assertFalse(Version::prereleaseAboveFixes('7.0.9-RC1', ['CVE' => ['6.2.19', '7.0.8']]), 'already clear');
+        $this->assertFalse(Version::prereleaseAboveFixes('7.1.0-M2', ['A' => ['6.2.19', '7.0.8'], 'B' => ['7.1.0']]), '7.1.0 clears both');
+        $this->assertFalse(Version::prereleaseAboveFixes('5.0.0', ['CVE' => $netty]));
+        $this->assertSame('1.0.0', Version::chooseTarget('1.0.0-beta', ['CVE' => ['1.0.0']]));
+    }
+
     public function testChooseTargetStaysOnReleaseLine(): void
     {
         $spec = ['CVE-2025-49124' => ['9.0.106', '10.1.42', '11.0.8']];

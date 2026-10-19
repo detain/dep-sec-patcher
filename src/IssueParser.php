@@ -268,15 +268,16 @@ final class IssueParser
                 // it; otherwise every library reported, as a monorepo builds them all
                 $own = array_values(array_filter($affected, static fn (string $lib): bool => self::normal(self::shortName($lib)) === self::normal($fix['package'])));
                 foreach ($own !== [] ? $own : $affected as $lib) {
-                    // A tag is the library's version on a major line in use,
-                    // or where the list names a sister package (same groupId
-                    // or scope) at that version. A repository's next major can
-                    // ship under other coordinates: jackson-databind 3 is
-                    // tools.jackson.core's, not com.fasterxml.jackson.core's
+                    // A Maven or Go library's next major can ship under other
+                    // coordinates (jackson-databind 3 is tools.jackson.core's,
+                    // not com.fasterxml.jackson.core's), so for one of those a
+                    // tag is its version on a major line in use, or where the
+                    // list names a sister package (same groupId) at that
+                    // version. multiparty 4.3.0 is still multiparty
                     $lines   = array_column(array_filter($inUse, static fn (array $u): bool => self::sameLibrary($u[0], $lib) || self::sameLibrary($lib, $u[0])), 1);
                     $sisters = array_filter($named, static fn (array $n): bool => $n['version'] === $fix['version']
                         && self::family($n['package']) !== '' && self::family($n['package']) === self::family($lib));
-                    if ($lines === [] || in_array(Version::majorLine($fix['version']), $lines, true) || $sisters !== []) {
+                    if ($lines === [] || !self::renamedAcrossMajors($lib) || in_array(Version::majorLine($fix['version']), $lines, true) || $sisters !== []) {
                         $out[] = ['package' => $lib, 'version' => $fix['version']];
                     }
                 }
@@ -451,6 +452,16 @@ final class IssueParser
     private static function isQualified(string $name): bool
     {
         return str_contains($name, ':') || str_contains($name, '/');
+    }
+
+    /**
+     * Whether a library's next major line can be published under another
+     * name: a Maven coordinate (a new groupId or artifactId) or a Go module
+     * (v2 is "<module>/v2"). An npm, PyPI or NuGet package keeps its name.
+     */
+    private static function renamedAcrossMajors(string $lib): bool
+    {
+        return str_contains($lib, ':') || preg_match('#^[a-z0-9-]+(?:\.[a-z0-9-]+)+/#i', $lib) === 1;
     }
 
     /**

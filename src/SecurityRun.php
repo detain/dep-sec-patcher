@@ -932,6 +932,14 @@ final class SecurityRun
                 } elseif ($ver === null) {
                     $unsupported++;
                     $note = "{$pkg} is {$where} " . implode(', ', $inUse) . " in several major versions; pin it by hand";
+                } elseif (Version::prereleaseAboveFixes($current, $row['spec'])) {
+                    // No fix is above it, and going back to a release is not
+                    // a bump to make unasked
+                    $unsupported++;
+                    $fixes = Version::sortAscending(array_values(array_unique(array_merge(...array_values($row['spec'])))));
+                    $note  = "{$pkg} is " . ($inUse !== null ? $where : 'declared as') . " prerelease {$current} in {$target}, which sorts above"
+                        . ' every fix (' . implode(', ', $fixes) . ') without being known to include one; move it to a release by hand';
+                    $c->warn("  {$eco} {$pkg} is on prerelease {$current} in {$target}, above every fix; move it to a release by hand");
                 } elseif ($ver === '') {
                     // Every advisory for this package is already cleared
                     $satisfied++;
@@ -1111,16 +1119,18 @@ final class SecurityRun
                     [$ok, $reason, $detail] = [false, 'unverifiable', "manifest missing: {$target}"];
                     break;
                 }
+                // One fix per release line, any of which will do on its own line
+                $required = implode(' or ', FixPlanner::fixes($need));
                 // Where a lockfile exists, what it resolved is what gets installed
                 $eco    = ManifestPaths::ecosystemFor($target);
                 $locked = in_array($eco, ['npm', 'composer'], true) ? Lockfile::versions(dirname($abs), $eco, $need['package']) : null;
                 if ($locked !== null && $locked !== []) {
                     $behind = array_values(array_filter($locked, static fn (string $v): bool => !FixPlanner::requirementMet($v, $need)));
                     if ($behind !== []) {
-                        [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is locked at " . implode(', ', $behind) . ", needs >= {$need['fixed_version']}"];
+                        [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is locked at " . implode(', ', $behind) . ', ' . FixPlanner::shortfall($behind, $need)];
                         break;
                     }
-                    $evidence .= "| `{$need['package']}` | {$need['fixed_version']} | **" . implode(', ', $locked) . " (locked)** | `{$target}` |\n";
+                    $evidence .= "| `{$need['package']}` | {$required} | **" . implode(', ', $locked) . " (locked)** | `{$target}` |\n";
                     continue;
                 }
                 $contents[$abs] ??= (string)file_get_contents($abs);
@@ -1130,11 +1140,11 @@ final class SecurityRun
                     break;
                 }
                 if (!FixPlanner::requirementMet($cur, $need)) {
-                    [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is {$cur}, needs >= {$need['fixed_version']}"];
+                    [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is {$cur}, " . FixPlanner::shortfall([$cur], $need)];
                     break;
                 }
                 // Record the evidence so the closing comment shows its working
-                $evidence .= "| `{$need['package']}` | {$need['fixed_version']} | **{$cur}** | `{$target}` |\n";
+                $evidence .= "| `{$need['package']}` | {$required} | **{$cur}** | `{$target}` |\n";
             }
 
             if (!$ok) {

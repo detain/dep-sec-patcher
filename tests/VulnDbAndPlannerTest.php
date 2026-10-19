@@ -105,6 +105,27 @@ class VulnDbAndPlannerTest extends TestCase
         $this->assertFalse(FixPlanner::requirementMet('[2.8.3,3)', ['fixed_version' => '2.21.3', 'fix_versions' => ['2.21.3']]));
     }
 
+    public function testARequirementIsMetOnTheDeclaredVersionsOwnReleaseLine(): void
+    {
+        // The recorded fix is whichever branch's fix the issue listed last
+        $need = ['fixed_version' => '4.1.137.Final', 'fix_versions' => ['4.2.17.Final', '4.1.137.Final']];
+        $this->assertFalse(FixPlanner::requirementMet('4.2.5.Final', $need), 'above the 4.1 fix, below the 4.2 one');
+        $this->assertTrue(FixPlanner::requirementMet('4.2.17.Final', $need));
+        $this->assertTrue(FixPlanner::requirementMet('4.1.140.Final', $need));
+        $this->assertFalse(FixPlanner::requirementMet('5.0.0.Alpha2', $need), 'a 2015 alpha has none of the fixes');
+        $this->assertFalse(FixPlanner::requirementMet('7.1.0-M2', ['fixed_version' => '7.0.8', 'fix_versions' => ['6.2.19', '7.0.8']]));
+        $this->assertSame(['4.1.137.Final', '4.2.17.Final'], FixPlanner::fixes($need));
+        $this->assertSame(['2.0'], FixPlanner::fixes(['fixed_version' => '2.0', 'fix_versions' => []]));
+        $this->assertTrue(FixPlanner::requirementMet('4.2.0-M2', ['fixed_version' => '3.0.0', 'fix_versions' => ['3.0.0']]), 'a milestone of a later line');
+
+        $this->assertSame('needs >= 4.1.137.Final or 4.2.17.Final', FixPlanner::shortfall(['4.2.5.Final'], $need));
+        $this->assertSame(
+            'needs >= 4.1.137.Final or 4.2.17.Final (a prerelease above every fix is not known to include one)',
+            FixPlanner::shortfall(['5.0.0.Alpha2'], $need)
+        );
+        $this->assertSame('needs >= 1.0.0', FixPlanner::shortfall(['1.0.0-beta'], ['fixed_version' => '1.0.0', 'fix_versions' => []]));
+    }
+
     public function testRetireOnlyPendingRecordsGithubNoLongerReports(): void
     {
         $db = VulnDb::upsert(VulnDb::empty(), [

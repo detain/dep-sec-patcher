@@ -160,8 +160,10 @@ First release: a standalone, generic port of MyAdmin's
   bare version or tarball name gets its full name (`core-7.29.0.tgz` is
   `@babel/core`; the unscoped `json-schema-ref-parser` had been given
   `@apidevtools/json-schema-ref-parser`'s 15.3.6, which does not exist, and
-  `npm install` failed). On one repository close-fixed could verify 138 issues
-  instead of 56.
+  `npm install` failed). Only for Maven and Go libraries, whose next major can
+  ship under another name, is a repository tag held to the lines in use;
+  npm, PyPI and NuGet packages keep their names (`multiparty.git - 4.3.0` is
+  multiparty's fix).
 - An issue read again replaces the records it yielded before, so records named
   by an earlier parser are dropped rather than holding their issues open.
 - Records keep the versions their issue found in use. Without a lockfile, a
@@ -189,6 +191,22 @@ First release: a standalone, generic port of MyAdmin's
 - Tool output is printed without colour codes and other terminal escape
   sequences.
 - The vulnerability database's directory is created mode 0700.
+- close-fixed no longer closes an issue because the declared version is above
+  one release line's fix: that was the fix the issue happened to list last,
+  and netty `4.2.16.Final` counted as fixed by `4.1.137.Final` with
+  `4.2.17.Final` still to come. A version must be at or above the fix on its
+  own line, or above every fix.
+- A prerelease above every fix no longer counts as fixed unless its major line
+  had a release before it that no fix was listed for. close-fixed would have
+  closed issues on netty `5.0.0.Alpha2` (from 2015) and spring `7.1.0-M2`
+  (against `7.0.8`), neither known to include the fix; spring-boot `4.2.0-M2`
+  against a fix in `3.0.0` still counts. `33.4.0-jre` and `4.1.42.Final` are
+  releases.
+  Auto-fix no longer reports such a prerelease as "already satisfied": it has
+  no fix to move up to, so it stays pending with a warning to move it to a
+  release by hand.
+- close-fixed's log and closing comment give every release line's fix
+  (`needs >= 4.1.137.Final or 4.2.17.Final`), not one of them.
 
 ### Kept
 

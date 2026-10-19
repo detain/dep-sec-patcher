@@ -127,20 +127,44 @@ final class FixPlanner
 
     /**
      * Whether a declared version resolves one requirement: at or above the
-     * recorded fix, or at or above the fix on its own release line.
+     * fix on its own release line, or above every fix.
+     *
+     * Being above the recorded fix is not enough. That is one branch's fix
+     * (whichever the issue listed last), and netty 4.2.5.Final is above
+     * 4.1.137.Final with 4.2.17.Final still to come.
      *
      * @param array{fixed_version: string, fix_versions: list<string>} $need
      */
     public static function requirementMet(string $declared, array $need): bool
     {
         $floor = Version::floor($declared);
-        if ($floor === '') {
-            return false;
-        }
-        if ($need['fixed_version'] !== '' && Version::gte($floor, $need['fixed_version'])) {
-            return true;
-        }
-        $fixes = array_values(array_unique(array_merge($need['fix_versions'], [$need['fixed_version']])));
-        return Version::satisfies($floor, $fixes);
+        return $floor !== '' && Version::satisfies($floor, self::fixes($need));
+    }
+
+    /**
+     * What versions that fall short of a requirement still need, for the
+     * close-fixed log.
+     *
+     * @param list<string> $versions
+     * @param array{fixed_version: string, fix_versions: list<string>} $need
+     */
+    public static function shortfall(array $versions, array $need): string
+    {
+        $fixes = self::fixes($need);
+        $above = array_filter($versions, static fn (string $v): bool => Version::isPrerelease(Version::floor($v))
+            && Version::gte(Version::floor($v), Version::max($fixes)));
+        return 'needs >= ' . implode(' or ', $fixes) . ($above !== [] ? ' (a prerelease above every fix is not known to include one)' : '');
+    }
+
+    /**
+     * Every fix version of one requirement, lowest first.
+     *
+     * @param array{fixed_version: string, fix_versions: list<string>} $need
+     * @return list<string>
+     */
+    public static function fixes(array $need): array
+    {
+        $fixes = array_filter(array_merge($need['fix_versions'], [$need['fixed_version']]), static fn (string $f): bool => $f !== '');
+        return Version::sortAscending(array_values(array_unique($fixes)));
     }
 }

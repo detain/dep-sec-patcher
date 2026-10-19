@@ -181,6 +181,29 @@ class IssueParserTest extends TestCase
         $this->assertSame([['org.springframework:spring-webmvc', '6.2.19']], self::pairs($records));
     }
 
+    public function testANewMajorTagIsTrustedForAPackageThatKeepsItsName(): void
+    {
+        // An npm package is the same package on its next major line
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-8159 (High) detected in multiparty-3.3.2.tgz',
+            "<details><summary>Vulnerable Library - <b>multiparty-3.3.2.tgz</b></summary>\n"
+            . "<p>Sample Path to Dependency File: /web/package.json</p>\n"
+            . "<p>Path to vulnerable library: /web/node_modules/multiparty/package.json</p>\n</details>\n"
+            . '<p>Fix Resolution: https://github.com/pillarjs/multiparty.git - 4.3.0</p>'
+        ));
+        $this->assertSame([['multiparty', '4.3.0']], self::pairs($records));
+        $this->assertSame(['3.3.2'], $records[0]['installed']);
+
+        // A Go module's v2 is another module path
+        $this->assertSame([], IssueParser::parseIssue(self::issue(
+            'CVE-2026-1 (High) detected in github.com/gin-gonic/gin-v1.9.1',
+            "<details><summary>Vulnerable Library - <b>github.com/gin-gonic/gin-v1.9.1</b></summary>\n"
+            . "<p>Sample Path to Dependency File: /svc/go.mod</p>\n"
+            . "<p>Path to vulnerable library: /home/u/go/pkg/mod/cache/download/github.com/gin-gonic/gin/@v/v1.9.1.mod</p>\n</details>\n"
+            . '<p>Fix Resolution: https://github.com/gin-gonic/gin.git - v2.0.0</p>'
+        )));
+    }
+
     public function testOwnRepositoryTagsAddReleaseBranchesOnTheMajorLinesListed(): void
     {
         $records = IssueParser::parseIssue(self::issue(

@@ -814,11 +814,14 @@ so that a renamed repository resolves to its current name.
     its full name (`core-7.29.0.tgz` is `@babel/core`, not the npm package
     `core`); and a repository URL (`https://github.com/netty/netty.git - 4.1.135.Final`)
     becomes the version of the libraries built there, never a package named
-    after the repository. A repository tag is only taken on a major line in
-    use, or where the list names a sister package with the same groupId or
-    scope at that version: jackson-databind's 3.x tags are
-    `tools.jackson.core` releases. Each record also keeps the versions the
-    issue found in use in that manifest;
+    after the repository. For a Maven or Go library, whose next major can be
+    published under another name, a repository tag is only taken on a major
+    line in use, or where the list names a sister package with the same
+    groupId at that version: jackson-databind's 3.x tags are
+    `tools.jackson.core` releases. An npm, PyPI or NuGet package keeps its
+    name, so `multiparty.git - 4.3.0` is multiparty's fix whatever line is in
+    use. Each record also keeps the versions the issue found in use in that
+    manifest;
   - the grouped format, one issue per library (such as
     "axios-1.3.5.tgz: 40 vulnerabilities (highest severity is: 9.3)") with a
     "Sample Path to Dependency File", a summary table and a `<details>` section
@@ -877,6 +880,10 @@ group:
 - nothing is written when the declared version already satisfies every
   advisory, when a Maven/NuGet range already admits a fixed version, or when
   the fix would move a declared version backwards;
+- a prerelease that sorts above every fix without being known to include one
+  (netty `5.0.0.Alpha2` against `4.1.137.Final` / `4.2.17.Final`) has no fix
+  to move up to, and going back to a release is not done unasked: it stays
+  pending with a note and a warning saying so;
 - a fix that needs a new major version is held back unless `--allow-major` is
   given;
 - a transitive dependency is pinned instead: npm `overrides` / `resolutions`,
@@ -911,6 +918,17 @@ Check mode works out the same edits without writing anything: it prints
   lowest alternative.
 - Pre-releases rank below their release, including the forms without a dash:
   `4.2rc1`, `2.0.0.dev1`, `7.0.0.rc1`, `1.0.M1`.
+- An advisory lists one fix per release line. A version is fixed when it is at
+  or above the fix on its own line (Tomcat `9.0.110` against `9.0.106` /
+  `10.1.42` / `11.0.8`), or above every fix. Being above some other line's fix
+  is not enough: netty `4.2.5.Final` is above `4.1.137.Final` and still waits
+  for `4.2.17.Final`.
+- A prerelease above every fix may still predate them all (netty
+  `5.0.0.Alpha2` is from 2015), so it only counts when its major line had a
+  release before it and no fix was listed for that line: spring-boot
+  `4.2.0-M2` against a fix in `3.0.0` does, spring `7.1.0-M2` against `7.0.8`
+  does not. Qualifiers that name a flavour of a release (`33.4.0-jre`,
+  `4.1.42.Final`) are not prereleases.
 - `1.2` and `1.2.0` are the same version.
 - Otherwise versions compare like GNU `sort -V`, with semver pre-release
   ordering.
@@ -922,8 +940,12 @@ database, each package it reports is looked up in the current manifests. For
 npm and Composer, when a lockfile beside the manifest (including
 `composer.lock`) holds the package, every locked copy must meet the fix
 instead, and the evidence shows it as `x.y.z (locked)`. The issue is closed
-only when every package is at or above the required fix, or at or above the
-fix on its own release line. Anything unverifiable (manifest gone, package not
+only when every package is fixed by the rules under "How versions are
+compared" above: at or above the fix on its own
+release line, or above every fix (a prerelease only as described there). With
+`--debug`, each issue left open says what it still needs
+(`io.netty:netty-codec-http is 4.2.16.Final, needs >= 4.1.137.Final or 4.2.17.Final`).
+Anything unverifiable (manifest gone, package not
 declared, a CVE with no known fix) stays open. The issue is labelled
 `--close-label` first, then closed with a comment holding the evidence table
 (package, required version, declared version, manifest) and a hidden
