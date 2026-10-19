@@ -24,6 +24,13 @@ final class MavenAuditor extends Auditor
     /** First release bundling a resolver with cross-process named locks (1.9.x). */
     public const CONCURRENT_SINCE = '3.9.0';
     private const ODC = 'org.owasp:dependency-check-maven';
+    /**
+     * Versions the versions plugin must not move to. It counts anything that
+     * is not a -SNAPSHOT as a release, so without this it picks milestones
+     * (spring-webmvc 7.1.0-M2, spring-boot 4.2.0-M2) over the latest release.
+     * Anchored, so the "-a" of guava's 28.2-android is no alpha.
+     */
+    public const PRERELEASES = '(?i)^.+?[-_.](?:alpha|a|beta|b|milestone|m|rc|cr|pre|preview|ea|snapshot|dev)[-_.]?[0-9]*(?:[-_.+].*)?$';
 
     public function name(): string
     {
@@ -93,7 +100,7 @@ final class MavenAuditor extends Auditor
         $notes = [];
 
         if (!$ctx->checkMode()) {
-            $common = ['-DgenerateBackupPoms=false', '-DallowSnapshots=false'];
+            $common = ['-DgenerateBackupPoms=false', '-DallowSnapshots=false', '-Dmaven.version.ignore=' . self::PRERELEASES];
             if (!$ctx->opt->allowMajor) {
                 // The same opt-in as an auto-fix crossing a major line
                 $common[] = '-DallowMajorUpdates=false';

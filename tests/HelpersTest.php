@@ -4,6 +4,7 @@ namespace Detain\DepSecPatcher\Tests;
 
 use Detain\DepSecPatcher\Auditor\GoAuditor;
 use Detain\DepSecPatcher\Auditor\MavenAuditor;
+use Detain\DepSecPatcher\CommandResult;
 use Detain\DepSecPatcher\JsonFile;
 use Detain\DepSecPatcher\ManifestPaths;
 use Detain\DepSecPatcher\RecordNormalizer;
@@ -18,6 +19,13 @@ use PHPUnit\Framework\TestCase;
  */
 class HelpersTest extends TestCase
 {
+    public function testCommandOutputIsShownAsPlainText(): void
+    {
+        $out = "\e[31m-- [E008] Not Found Error\e[0m\n\e]0;owned\a\e]8;;https://x\e\\link\e]8;;\e\\\r\ntab\there\e[2K\e[1A\x07\n";
+        $r   = new CommandResult('sbt', 1, false, '', $out, 0.0);
+        $this->assertSame(['-- [E008] Not Found Error', 'link', "tab\there"], $r->tail());
+    }
+
     public function testEcosystemFor(): void
     {
         $this->assertSame('npm', ManifestPaths::ecosystemFor('a/b/package-lock.json'));

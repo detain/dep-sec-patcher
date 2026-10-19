@@ -53,7 +53,7 @@ final class Context
             if (ProcessRunner::has($argv[0])) {
                 $r = $this->runner->run($argv, $this->root, ['timeout' => 120, 'label' => $tool]);
                 // Strip ANSI colour: `mvn -v` prints "\e[1mApache Maven 3.8.7\e[m"
-                $out = (string)preg_replace('/\e\[[0-9;]*m/', '', $r->output);
+                $out = CommandResult::plain($r->output);
                 if (preg_match($pattern, $out, $m) === 1) {
                     $version = $m[1];
                 }

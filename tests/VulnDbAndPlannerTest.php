@@ -126,6 +126,25 @@ class VulnDbAndPlannerTest extends TestCase
         $this->assertSame('pending', $db['vulns']['iss-open']['state'], 'one of its issues is still open');
     }
 
+    public function testIssuesJustReadSupersedeWhatTheyReportedBefore(): void
+    {
+        $db = VulnDb::upsert(VulnDb::empty(), [
+            ['key' => 'm|babel|CVE-1', 'source' => 'issue', 'ref' => 7, 'refs' => [7], 'state' => 'applied'],
+            ['key' => 'm|net|CVE-2', 'source' => 'issue', 'ref' => 7, 'refs' => [7, 9]],
+            ['key' => 'm|qs|CVE-3', 'source' => 'issue', 'ref' => 8, 'refs' => [8]],
+            ['key' => 'm|qs|GHSA', 'source' => 'dependabot', 'ref' => 7, 'refs' => [7]],
+        ], 't0', '');
+        $now = [['key' => 'm|@babel/core|CVE-1', 'source' => 'issue', 'ref' => 7, 'refs' => [7]]];
+        $db  = VulnDb::supersede(VulnDb::upsert($db, $now, 't1', ''), $now, [7 => true]);
+
+        $this->assertArrayNotHasKey('m|babel|CVE-1', $db['vulns'], 'issue 7 no longer yields it');
+        $this->assertArrayHasKey('m|@babel/core|CVE-1', $db['vulns']);
+        $this->assertSame([9], $db['vulns']['m|net|CVE-2']['refs'], 'issue 9 was not read, so it still stands');
+        $this->assertSame(9, $db['vulns']['m|net|CVE-2']['ref']);
+        $this->assertSame([8], $db['vulns']['m|qs|CVE-3']['refs'], 'issue 8 was not read');
+        $this->assertArrayHasKey('m|qs|GHSA', $db['vulns'], 'other sources untouched');
+    }
+
     public function testUpsertKeepsAnArrivingState(): void
     {
         $db = VulnDb::upsert(VulnDb::empty(), [['key' => 'k', 'state' => 'skipped', 'note' => 'no fixed version known']], 't', '');

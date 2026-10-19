@@ -192,6 +192,36 @@ class RuntimeTest extends TestCase
         $this->assertSame('{"changed":true}', file_get_contents($this->dir . '/package.json'));
     }
 
+    public function testWorkspaceGuardRemovesTheProjectDirSbtCreatesForItsOutput(): void
+    {
+        file_put_contents($this->dir . '/build.sbt', '');
+        $guard = new WorkspaceGuard($this->dir, false);
+        mkdir($this->dir . '/project/target/streams', 0775, true);
+        mkdir($this->dir . '/target');
+        $guard->restore();
+        $this->assertSame(['build.sbt'], array_values(array_diff(scandir($this->dir) ?: [], ['.', '..'])), 'nothing left for --push to commit');
+
+        // A project/ the run wrote real files into is the run's to keep in update mode
+        $guard = new WorkspaceGuard($this->dir, false);
+        mkdir($this->dir . '/project/target', 0775, true);
+        file_put_contents($this->dir . '/project/plugins.sbt', '');
+        $guard->restore();
+        $this->assertSame(['plugins.sbt'], array_values(array_diff(scandir($this->dir . '/project') ?: [], ['.', '..'])));
+    }
+
+    public function testWorkspaceGuardNeverReachesThroughALinkedProjectDir(): void
+    {
+        $elsewhere = $this->dir . '/elsewhere';
+        mkdir($elsewhere);
+        $tree = $this->dir . '/tree';
+        mkdir($tree);
+        symlink($elsewhere, $tree . '/project');
+        $guard = new WorkspaceGuard($tree, true);
+        mkdir($elsewhere . '/target');
+        $guard->restore();
+        $this->assertDirectoryExists($elsewhere . '/target', 'outside the tree');
+    }
+
     public function testWorkspaceGuardCheckModeUndoesEverything(): void
     {
         file_put_contents($this->dir . '/composer.json', '{"a":1}');

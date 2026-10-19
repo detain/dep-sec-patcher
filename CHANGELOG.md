@@ -148,6 +148,47 @@ First release: a standalone, generic port of MyAdmin's
 - grype checks the docker daemon once and SKIPs with the reason, instead of
   a tool error per Dockerfile; a bash `gradlew` is run with bash; govulncheck's
   module-level fallback is explained in a note.
+- Mend's bare "Fix Resolution:" lists are narrowed to the libraries the issue
+  reports, named in full from the paths Mend found them at (Maven, Gradle and
+  Ivy caches give the groupId, `node_modules` the npm scope, the Go module
+  cache the module path). A repository URL no longer becomes a package named
+  after the repository (`spring-framework`, `netty`, `net`, `grpc-go`, and
+  `babel`, which auto-fix had pinned as an npm override), but the version of
+  the libraries built there, and only on a major line in use or vouched for by
+  a sister package. Alternatives no manifest uses (`bcprov-lts8on`,
+  `tools.jackson.core` beside `com.fasterxml.jackson.core`) are dropped, and a
+  bare version or tarball name gets its full name (`core-7.29.0.tgz` is
+  `@babel/core`; the unscoped `json-schema-ref-parser` had been given
+  `@apidevtools/json-schema-ref-parser`'s 15.3.6, which does not exist, and
+  `npm install` failed). On one repository close-fixed could verify 138 issues
+  instead of 56.
+- An issue read again replaces the records it yielded before, so records named
+  by an earlier parser are dropped rather than holding their issues open.
+- Records keep the versions their issue found in use. Without a lockfile, a
+  transitive npm or Maven pin follows them: it stays on the line in use (netty
+  4.1.76 gets 4.1.135.Final, not 4.2.x), never moves a copy back, and needs
+  `--allow-major` to cross a major line, as a declared bump does (spring-webmvc
+  in use at 5.1 had been pinned to 7.0). A lockfile-held npm pin is likewise
+  chosen from the newest locked copy.
+- Maven's versions plugin no longer moves to milestones, release candidates or
+  other prereleases (it had written spring-webmvc 7.1.0-M2 and spring-boot
+  4.2.0-M2); it counts anything but `-SNAPSHOT` as a release.
+- Gradle: a wrapper too old for the host's Java runs on the newest JDK under
+  `/usr/lib/jvm` it supports, or is SKIPped naming the Java it needs, instead
+  of failing with "Unsupported class file major version". A failed build shows
+  Gradle's "What went wrong" section.
+- sbt: a build without `project/build.properties` runs on sbt 1.10.11 under sbt
+  2's runner (sbt 2 cannot load an sbt 1 build), in the foreground (the runner
+  had handed it to a background server that outlived the run), and sbt no
+  longer writes a `build.properties` into it. The workspace guard removes a
+  `project/` that sbt created only for its output, and no longer looks inside
+  a symlinked `project`.
+- `npm audit fix` exiting 1 because vulnerabilities remain is reported as what
+  remains (how many need a major upgrade, how many have no fix) rather than
+  "exit 1".
+- Tool output is printed without colour codes and other terminal escape
+  sequences.
+- The vulnerability database's directory is created mode 0700.
 
 ### Kept
 

@@ -118,7 +118,7 @@ final class ProcessRunner
                         if ($this->verbose) {
                             $partial[$fd] .= $chunk;
                             while (($nl = strpos($partial[$fd], "\n")) !== false) {
-                                $this->console->detail("[{$label}] " . rtrim(substr($partial[$fd], 0, $nl), "\r"));
+                                $this->console->detail("[{$label}] " . rtrim(CommandResult::plain(substr($partial[$fd], 0, $nl)), "\r"));
                                 $partial[$fd] = substr($partial[$fd], $nl + 1);
                             }
                         }

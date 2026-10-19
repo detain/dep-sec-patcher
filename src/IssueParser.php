@@ -17,8 +17,15 @@ namespace Detain\DepSecPatcher;
  *   <p>Fix Resolution: golang.org/x/net - v0.55.0,https://github.com/... - v0.55.0</p>
  *   <p>Fix Resolution: io.netty:netty-all:4.1.42.Final,...</p>
  * All three shapes are normalised into (package, version) pairs, one record per
- * pair per manifest. This is a line-for-line port of the jq program the shell
- * version used, including its regexes, so stored records keep the same keys.
+ * pair per manifest. It began as a port of the jq program the shell version
+ * used; it differs where that program named the wrong package.
+ *
+ * A bare list names packages loosely: a git URL stands for its repository
+ * ("netty" for io.netty:netty-codec-http2), alternatives sit side by side
+ * (bcprov-lts8on next to bcprov-jdk18on), and tarball names drop the npm
+ * scope ("core-7.29.0.tgz" is @babel/core). The paths Mend found the
+ * libraries at say exactly which packages the issue is about, so a bare list
+ * is narrowed to those.
  *
  * Pure: no I/O.
  */
@@ -75,7 +82,8 @@ final class IssueParser
         $sev  = preg_match('/\((?<s>Critical|High|Medium|Low)\)/u', $title, $m) === 1 ? $m['s'] : '';
         $cvss = preg_match('/CVSS 3 Score Details \(<b>(?<v>[0-9.]+)<\/b>\)/u', $body, $m) === 1 ? $m['v'] : '0';
         $id   = $cve === '' ? 'ISSUE-' . $number : $cve;
-        return self::records(self::fixes($title, $body), $id, $cve, $sev, $cvss, $number, $title, $url, $manifests);
+        $installed = self::installed($body);
+        return self::records(self::fixes($title, $body, self::affected($body), $installed), $id, $cve, $sev, $cvss, $number, $title, $url, $manifests, $installed);
     }
 
     /**
@@ -94,10 +102,12 @@ final class IssueParser
      */
     private static function grouped(string $title, string $body, mixed $number, string $url, array $manifests): array
     {
-        $library = preg_match('/Fixed in \((?<l>[^)]+?) version\)/u', $body, $m) === 1 ? self::cleanPkg($m['l']) : '';
+        $affected = self::affected($body);
+        $library  = preg_match('/Fixed in \((?<l>[^)]+?) version\)/u', $body, $m) === 1 ? self::cleanPkg($m['l']) : '';
         if ($library === '') {
             $library = (string)(self::libname(preg_match('/^(\S+?):/u', $title, $m) === 1 ? $m[1] : '') ?? '');
         }
+        $library = self::qualify($library, $affected);
 
         $sections = [];
         $parts    = preg_split('/<summary>\s*(?=(?:CVE|WS)-[0-9A-Za-z-]+\s*<\/summary>)/u', $body) ?: [];
@@ -113,7 +123,7 @@ final class IssueParser
             $id    = $row['id'];
             $fixes = [];
             if (isset($sections[$id])) {
-                $fixes = self::fixes('', $sections[$id]);
+                $fixes = self::fixes('', $sections[$id], self::affected($sections[$id]) ?: $affected);
             } elseif ($library !== '' && preg_match('/^(?:.+?\s+-\s+)?v?([0-9][^\s|]*)$/u', $row['fix'], $m) === 1) {
                 $fixes = [['package' => $library, 'version' => self::cleanVer($m[1]), 'direct' => true]];
             }
@@ -133,13 +143,16 @@ final class IssueParser
     /**
      * The (package, version) pairs a body's "Fix Resolution" lines name.
      *
+     * @param list<string> $affected the vulnerable libraries' full names, from affected()
+     * @param array<string, list<array{0: string, 1: string}>> $installed from installed()
      * @return list<array{package: string, version: string, direct: bool}>
      */
-    private static function fixes(string $title, string $body): array
+    private static function fixes(string $title, string $body, array $affected, array $installed = []): array
     {
         // Affected package names, from the title ("detected in js-yaml-3.14.2.tgz")
         // and from the <b>-wrapped filenames in the body, which is the only
         // source when the title just says "detected in multiple libraries".
+        // A file name stands for a full name the paths gave unless none matches.
         $libs = [];
         $detected = preg_match('/detected in (?<l>.+)$/u', $title, $m) === 1 ? $m['l'] : '';
         foreach (explode(',', $detected) as $part) {
@@ -155,7 +168,12 @@ final class IssueParser
                 $libs[] = $name;
             }
         }
-        $libs = self::uniqueSorted(array_values(array_filter($libs, static fn ($l) => $l !== '')));
+        foreach ($libs as $lib) {
+            if ($lib !== '' && array_filter($affected, static fn (string $a): bool => self::sameLibrary($lib, $a)) === []) {
+                $affected[] = $lib;
+            }
+        }
+        $affected = self::uniqueSorted($affected);
 
         $fixes = [];
         preg_match_all("/Direct dependency fix Resolution \\(([^)]+)\\): ([^<\n]+)/u", $body, $mm, PREG_SET_ORDER);
@@ -166,6 +184,7 @@ final class IssueParser
         foreach ($mm as $hit) {
             $fixes[] = ['package' => self::cleanPkg($hit[1]), 'version' => self::cleanVer($hit[2]), 'direct' => false];
         }
+        $named = $repos = $versions = [];
         preg_match_all("/(?:^|>|\\s)Fix Resolution: ([^<\n]+)/u", $body, $mm);
         foreach ($mm[1] as $list) {
             foreach (explode(',', $list) as $entry) {
@@ -173,17 +192,302 @@ final class IssueParser
                 if ($entry === '') {
                     continue;
                 }
-                foreach (self::bareEntry($entry, $libs) as $fix) {
-                    $fixes[] = $fix + ['direct' => false];
+                $gav    = self::gav($entry);
+                $dashed = $gav === null ? self::dashed($entry) : null;
+                if ($gav !== null) {
+                    $named[] = $gav;
+                } elseif ($dashed !== null && $dashed['repo']) {
+                    $repos[] = $dashed;
+                } elseif ($dashed !== null) {
+                    $named[] = ['package' => $dashed['package'], 'version' => $dashed['version']];
+                } elseif (preg_match('/^[0-9]/u', $entry) === 1) {
+                    // Bare "Fix Resolution: 3.15.0" names no package; pair the version with
+                    // each affected library instead of dropping it.
+                    $versions[] = self::cleanVer($entry);
                 }
             }
+        }
+        $inUse = [];
+        foreach ($installed as $pairs) {
+            foreach ($pairs as [$name, $version]) {
+                $inUse[] = [$name, Version::majorLine($version)];
+            }
+        }
+        foreach (self::bareList($named, $repos, $versions, $affected, $inUse) as $fix) {
+            $fixes[] = $fix + ['direct' => false];
         }
         return $fixes;
     }
 
     /**
+     * The fixes of a bare "Fix Resolution:" list, narrowed to the libraries the
+     * issue reports. Entries for other packages are alternatives or sister
+     * artifacts that no manifest has to carry; a repository tag stands for the
+     * version of the libraries built from it. When nothing in the list can be
+     * tied to a reported library, it is taken as written.
+     *
+     * @param list<array{package: string, version: string}>             $named
+     * @param list<array{package: string, version: string, repo: bool}> $repos
+     * @param list<string>                                              $versions
+     * @param list<string>                                              $affected
+     * @param list<array{0: string, 1: string}>                         $inUse    [name, major line] found in use
+     * @return list<array{package: string, version: string}>
+     */
+    private static function bareList(array $named, array $repos, array $versions, array $affected, array $inUse = []): array
+    {
+        $out = [];
+        foreach ($named as $fix) {
+            foreach ($affected as $lib) {
+                if (self::sameLibrary($fix['package'], $lib)) {
+                    // "json-schema-ref-parser - 15.3.6" is the scoped package the path names
+                    $out[] = ['package' => self::isQualified($fix['package']) ? $fix['package'] : $lib, 'version' => $fix['version']];
+                }
+            }
+        }
+        // The tags of a library's own repository add its other release
+        // branches (spring-boot 3.3.14 beside 3.5.14), but only on a major
+        // line the list already names for it: jackson-databind's 3.x tags
+        // belong to tools.jackson.core, not com.fasterxml.jackson.core
+        $listed = $out;
+        foreach ($listed !== [] ? $repos : [] as $tag) {
+            $line = Version::majorLine($tag['version']);
+            foreach ($listed as $fix) {
+                if ($line !== '' && Version::majorLine($fix['version']) === $line
+                    && self::normal(self::shortName($fix['package'])) === self::normal($tag['package'])) {
+                    $out[] = ['package' => $fix['package'], 'version' => $tag['version']];
+                }
+            }
+        }
+        if ($out === [] && $affected !== []) {
+            foreach ($repos as $fix) {
+                // "r1rv85" is a tag, not a version
+                if (preg_match('/^[0-9]/', $fix['version']) !== 1) {
+                    continue;
+                }
+                // The library the repository is named after, if the issue reports
+                // it; otherwise every library reported, as a monorepo builds them all
+                $own = array_values(array_filter($affected, static fn (string $lib): bool => self::normal(self::shortName($lib)) === self::normal($fix['package'])));
+                foreach ($own !== [] ? $own : $affected as $lib) {
+                    // A tag is the library's version on a major line in use,
+                    // or where the list names a sister package (same groupId
+                    // or scope) at that version. A repository's next major can
+                    // ship under other coordinates: jackson-databind 3 is
+                    // tools.jackson.core's, not com.fasterxml.jackson.core's
+                    $lines   = array_column(array_filter($inUse, static fn (array $u): bool => self::sameLibrary($u[0], $lib) || self::sameLibrary($lib, $u[0])), 1);
+                    $sisters = array_filter($named, static fn (array $n): bool => $n['version'] === $fix['version']
+                        && self::family($n['package']) !== '' && self::family($n['package']) === self::family($lib));
+                    if ($lines === [] || in_array(Version::majorLine($fix['version']), $lines, true) || $sisters !== []) {
+                        $out[] = ['package' => $lib, 'version' => $fix['version']];
+                    }
+                }
+            }
+        }
+        if ($out === []) {
+            $out = array_merge($named, $affected === []
+                ? array_map(static fn (array $f): array => ['package' => $f['package'], 'version' => $f['version']], $repos)
+                : []);
+        }
+        foreach ($versions as $version) {
+            foreach ($affected as $lib) {
+                $out[] = ['package' => $lib, 'version' => $version];
+            }
+        }
+        $unique = [];
+        foreach ($out as $fix) {
+            $unique[$fix['package'] . '@' . $fix['version']] = $fix;
+        }
+        return array_values($unique);
+    }
+
+    /**
+     * Full names of the vulnerable libraries, from where Mend found them: a
+     * Maven, Gradle or Ivy cache path carries the groupId, a node_modules path
+     * the npm scope, the Go module cache the module path. npm's registry URL
+     * on the "Library home page" line keeps the scope too.
+     *
+     * @return list<string>
+     */
+    private static function affected(string $body): array
+    {
+        $found = [];
+        preg_match_all('/Path to vulnerable library: ([^<\n]+)/iu', $body, $mm);
+        foreach ($mm[1] as $list) {
+            foreach (explode(',', self::printable($list)) as $path) {
+                $name = self::libraryAt(self::trim($path))[0];
+                if ($name !== '') {
+                    $found[] = $name;
+                }
+            }
+        }
+        preg_match_all('#registry\.npmjs\.org/((?:@[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+)/-/#', self::printable($body), $mm);
+        foreach ($mm[1] as $name) {
+            $found[] = $name;
+        }
+        return self::uniqueSorted($found);
+    }
+
+    /**
+     * The versions of the vulnerable libraries in use, per manifest. Each
+     * library has a section headed by its file name
+     * ("<b>netty-codec-http2-4.1.76.Final.jar</b></summary>") that names the
+     * dependency file it came in through and the paths it was found at.
+     *
+     * @return array<string, list<array{0: string, 1: string}>> manifest => [name, version] pairs
+     */
+    private static function installed(string $body): array
+    {
+        $parts = preg_split('#<b>([^<]+)</b>\s*</summary>#u', $body, -1, PREG_SPLIT_DELIM_CAPTURE) ?: [];
+        $out   = [];
+        for ($i = 1; $i + 1 < count($parts); $i += 2) {
+            $file    = self::trim(self::printable($parts[$i]));
+            $name    = self::libname($file);
+            $version = $name === null ? '' : self::fileVersion($file, $name);
+            $found   = $name !== null && $version !== '' ? [[$name, $version]] : [];
+            preg_match_all('/Path to vulnerable library: ([^<\n]+)/iu', $parts[$i + 1], $mm);
+            foreach ($mm[1] as $list) {
+                foreach (explode(',', self::printable($list)) as $path) {
+                    // One library per section, so the file name's version is a
+                    // node_modules path's too
+                    [$lib, $at] = self::libraryAt(self::trim($path));
+                    if ($lib !== '' && ($at !== '' || $version !== '')) {
+                        $found[] = [$lib, $at !== '' ? $at : $version];
+                    }
+                }
+            }
+            preg_match_all('/Path to dependency file: ([^<\n]+)/iu', $parts[$i + 1], $mm);
+            foreach ($mm[1] as $manifest) {
+                $manifest = self::manifestPath($manifest);
+                foreach ($manifest !== '' ? $found : [] as $pair) {
+                    $out[$manifest][] = $pair;
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * "netty-codec-http2-4.1.76.Final.jar" -> "4.1.76.Final",
+     * "urllib3-2.6.3-py3-none-any.whl" -> "2.6.3".
+     */
+    private static function fileVersion(string $file, string $name): string
+    {
+        $base = (string)preg_replace('/\.(tgz|jar|whl|gem|nupkg|zip|egg|tar\.gz|tar|min\.js)$/u', '', $file, 1);
+        if (!str_starts_with($base, $name . '-')) {
+            return '';
+        }
+        $version = substr($base, strlen($name) + 1);
+        return self::cleanVer(str_ends_with($file, '.whl') ? explode('-', $version)[0] : $version);
+    }
+
+    /**
+     * The package a vulnerable-library path belongs to and the version found
+     * there, each '' when the path does not say.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private static function libraryAt(string $path): array
+    {
+        [$name, $version] = match (true) {
+            // ~/.m2/repository/io/netty/netty-codec-http2/4.1.76.Final/netty-codec-http2-4.1.76.Final.jar,
+            // or a coursier cache's .../maven2/<same layout>
+            preg_match('#(?:/\.m2/repository|/maven2)/(?<g>[^/].*?)/(?<a>[^/]+)/(?<v>[^/]+)/[^/]+\.(?:jar|pom|aar|war)$#', $path, $m) === 1
+                => [str_replace('/', '.', $m['g']) . ':' . $m['a'], $m['v']],
+            // .gradle/caches/modules-2/files-2.1/io.netty/netty-codec-http2/4.1.76.Final/<sha1>/<file>.jar
+            preg_match('#/files-2\.1/(?<g>[^/]+)/(?<a>[^/]+)/(?<v>[^/]+)/#', $path, $m) === 1
+                => [$m['g'] . ':' . $m['a'], $m['v']],
+            // .ivy2/cache/com.fasterxml.jackson.core/jackson-databind/jars/jackson-databind-2.9.2.jar
+            preg_match('#/\.ivy2/cache/(?<g>[^/]+)/(?<a>[^/]+)/[^/]+/(?<f>[^/]+)$#', $path, $m) === 1
+                => [$m['g'] . ':' . $m['a'], self::fileVersion($m['f'], $m['a'])],
+            // .../node_modules/@babel/core/package.json: the innermost one
+            preg_match('#^(?:.*/)?node_modules/(?<n>(?:@[^/]+/)?[^/]+)/package\.json$#', $path, $m) === 1
+                => [$m['n'], ''],
+            // go/pkg/mod/cache/download/golang.org/x/net/@v/v0.47.0.mod; capitals are stored as "!x"
+            preg_match('#/pkg/mod/cache/download/(?<m>.+)/@v/(?<v>[^/]+)\.(?:mod|zip|info)$#', $path, $m) === 1
+                => [(string)preg_replace_callback('/!([a-z])/', static fn ($c) => strtoupper($c[1]), $m['m']), $m['v']],
+            // site-packages/python_multipart-0.0.20.dist-info, under its normalised name
+            preg_match('#/site-packages/(?<p>[^/]+?)-(?<v>[0-9][^/]*)\.(?:dist|egg)-info$#', $path, $m) === 1
+                => [strtolower((string)preg_replace('/[-_.]+/', '-', $m['p'])), $m['v']],
+            // .nuget/packages/newtonsoft.json/11.0.2/...
+            preg_match('#/\.nuget/packages/(?<n>[^/]+)/(?<v>[0-9][^/]*)/#', $path, $m) === 1
+                => [$m['n'], $m['v']],
+            default => ['', ''],
+        };
+        // Written into manifests later, so only plain names and versions
+        return preg_match('#^[A-Za-z0-9@_][A-Za-z0-9@/._:+~-]*$#', $name) === 1 ? [$name, self::cleanVer($version)] : ['', ''];
+    }
+
+    /**
+     * The full name in $affected that a short name stands for, or the name
+     * itself.
+     *
+     * @param list<string> $affected
+     */
+    private static function qualify(string $name, array $affected): string
+    {
+        if ($name === '' || self::isQualified($name)) {
+            return $name;
+        }
+        foreach ($affected as $lib) {
+            if (self::isQualified($lib) && self::sameLibrary($name, $lib)) {
+                return $lib;
+            }
+        }
+        return $name;
+    }
+
+    /**
+     * Whether a name from a fix list is $lib: the same name, or the bare
+     * artifact or unscoped name of it.
+     */
+    private static function sameLibrary(string $name, string $lib): bool
+    {
+        $n = self::normal($name);
+        return $n === self::normal($lib) || (!self::isQualified($name) && $n === self::normal(self::shortName($lib)));
+    }
+
+    /**
+     * A name carrying its groupId, npm scope or module path.
+     */
+    private static function isQualified(string $name): bool
+    {
+        return str_contains($name, ':') || str_contains($name, '/');
+    }
+
+    /**
+     * The groupId of a Maven coordinate or the scope of an npm name: the
+     * packages released together. '' for anything else.
+     */
+    private static function family(string $name): string
+    {
+        return match (true) {
+            str_contains($name, ':')                              => explode(':', $name, 2)[0],
+            str_starts_with($name, '@') && str_contains($name, '/') => explode('/', $name, 2)[0],
+            default                                               => '',
+        };
+    }
+
+    /**
+     * "io.netty:netty-codec-http2" -> "netty-codec-http2", "@babel/core" -> "core",
+     * "golang.org/x/net" -> "net".
+     */
+    private static function shortName(string $name): string
+    {
+        $parts = preg_split('#[:/]#', $name) ?: [$name];
+        return (string)end($parts);
+    }
+
+    /**
+     * For comparing names only: PyPI treats case and - _ . as equivalent.
+     */
+    private static function normal(string $name): string
+    {
+        return strtolower((string)preg_replace('/[-_.]+/', '-', $name));
+    }
+
+    /**
      * @param list<array{package: string, version: string, direct: bool}> $fixes
      * @param list<string> $manifests
+     * @param array<string, list<array{0: string, 1: string}>> $installed from installed()
      * @return list<array<string, mixed>>
      */
     private static function records(
@@ -195,7 +499,8 @@ final class IssueParser
         mixed $number,
         string $title,
         string $url,
-        array $manifests
+        array $manifests,
+        array $installed = []
     ): array {
         $records = [];
         foreach ($fixes as $fix) {
@@ -204,6 +509,12 @@ final class IssueParser
                 continue;
             }
             foreach ($manifests as $manifest) {
+                $inUse = [];
+                foreach ($installed[$manifest] ?? [] as [$name, $version]) {
+                    if (self::sameLibrary($name, $fix['package']) || self::sameLibrary($fix['package'], $name)) {
+                        $inUse[] = $version;
+                    }
+                }
                 $records[] = [
                     // Keyed on identity, not issue number, so a refiled issue for
                     // the same CVE/package/manifest updates the existing record
@@ -226,6 +537,9 @@ final class IssueParser
                     'cvss'             => is_numeric($cvss) ? $cvss + 0 : 0,
                     'vulnerable_range' => '',
                     'fixed_version'    => $fix['version'],
+                    // What the issue found in use, which a dependency the
+                    // manifest does not declare has nowhere else to come from
+                    'installed'        => self::uniqueSorted($inUse),
                     'direct'           => $fix['direct'],
                     'summary'          => $title,
                     'url'              => $url,
@@ -250,34 +564,6 @@ final class IssueParser
     }
 
     /**
-     * One entry of a bare "Fix Resolution: a, b, c" list.
-     *
-     * @param list<string> $libs
-     * @return list<array{package: string, version: string}>
-     */
-    private static function bareEntry(string $entry, array $libs): array
-    {
-        $gav = self::gav($entry);
-        if ($gav !== null) {
-            return [$gav];
-        }
-        $dashed = self::dashed($entry);
-        if ($dashed !== null) {
-            return [$dashed];
-        }
-        // Bare "Fix Resolution: 3.15.0" names no package; pair the version with
-        // each affected library instead of dropping it.
-        if (preg_match('/^[0-9]/u', $entry) === 1) {
-            $out = [];
-            foreach ($libs as $lib) {
-                $out[] = ['package' => $lib, 'version' => self::cleanVer($entry)];
-            }
-            return $out;
-        }
-        return [];
-    }
-
-    /**
      * "io.netty:netty-all:4.1.42.Final" -> io.netty:netty-all @ 4.1.42.Final
      *
      * @return array{package: string, version: string}|null
@@ -292,10 +578,11 @@ final class IssueParser
 
     /**
      * "golang.org/x/net - v0.55.0" and
-     * "https://github.com/x/y.git - jackson-databind-2.18.8"; the artifact-name
-     * prefix some git tags carry is stripped from the version.
+     * "https://github.com/x/y.git - jackson-databind-2.18.8"; a repository
+     * URL gives its name, flagged as a repository rather than a package, and
+     * the name prefix some of its tags carry is stripped from the version.
      *
-     * @return array{package: string, version: string}|null
+     * @return array{package: string, version: string, repo: bool}|null
      */
     private static function dashed(string $s): ?array
     {
@@ -303,7 +590,8 @@ final class IssueParser
             return null;
         }
         $name = $m['n'];
-        if (preg_match('#^https?://|\.git$#u', $name) === 1) {
+        $repo = preg_match('#^https?://|\.git$#u', $name) === 1;
+        if ($repo) {
             $parts = explode('/', (string)preg_replace('/\.git$/u', '', $name, 1));
             $name  = (string)end($parts);
         }
@@ -311,7 +599,7 @@ final class IssueParser
         if (str_starts_with($version, $name . '-')) {
             $version = substr($version, strlen($name) + 1);
         }
-        return ['package' => self::cleanPkg($name), 'version' => self::cleanVer($version)];
+        return ['package' => self::cleanPkg($name), 'version' => self::cleanVer($version), 'repo' => $repo];
     }
 
     /**

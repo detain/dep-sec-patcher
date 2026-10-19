@@ -20,13 +20,17 @@ final class FixPlanner
      * known) plus every contributing record key, so all of them can be marked.
      *
      * @param array<string, mixed> $db
-     * @return list<array{manifest: string, ecosystem: string, package: string, spec: array<string, list<string>>, keys: list<string>, pkg_max: string}>
+     * A row's installed lists the versions its issues found in use, for a
+     * package the manifest does not declare.
+     *
+     * @return list<array{manifest: string, ecosystem: string, package: string, spec: array<string, list<string>>, keys: list<string>, pkg_max: string, installed: list<string>}>
      */
     public static function plan(array $db): array
     {
         $meta   = [];   // group => [manifest, ecosystem, package]
         $specs  = [];   // group => advisory id => candidate versions
         $keys   = [];   // group => contributing record keys
+        $inUse  = [];   // group => versions found in use
         $maxima = [];
         foreach ($db['vulns'] as $v) {
             if (($v['state'] ?? null) !== 'pending') {
@@ -50,6 +54,11 @@ final class FixPlanner
                 $specs[$gk][$id][] = $c;
             }
             $keys[$gk][] = (string)$v['key'];
+            foreach (is_array($v['installed'] ?? null) ? $v['installed'] : [] as $installed) {
+                if (is_string($installed) && $installed !== '') {
+                    $inUse[$gk][$installed] = true;
+                }
+            }
 
             // Highest suggested version per package across the whole repo, used
             // when a fix has to be an override rather than a declared bump.
@@ -75,6 +84,7 @@ final class FixPlanner
                 'spec'      => $spec,
                 'keys'      => array_values(array_unique($keys[$gk] ?? [])),
                 'pkg_max'   => Version::maxRelease($maxima[$eco . "\0" . $pkg] ?? []),
+                'installed' => Version::sortAscending(array_map('strval', array_keys($inUse[$gk] ?? []))),
             ];
         }
         return $plan;

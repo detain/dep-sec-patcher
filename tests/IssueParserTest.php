@@ -6,9 +6,11 @@ use Detain\DepSecPatcher\IssueParser;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Mend Bolt issue bodies -> remediation records. The parser is a port of the
- * original shell script's jq program; on a public repository's 6530 open issues the two
- * produced identical output (14828 records). These cases pin each body shape.
+ * Mend Bolt issue bodies -> remediation records. The parser began as a port of
+ * the original shell script's jq program, and on a public repository's 6530
+ * open issues the two produced identical output (14828 records); it now
+ * departs from it where a bare fix list named the wrong package. These cases
+ * pin each body shape.
  */
 class IssueParserTest extends TestCase
 {
@@ -73,6 +75,147 @@ class IssueParserTest extends TestCase
         $this->assertCount(1, $records);
         $this->assertSame('js-yaml', $records[0]['package']);
         $this->assertSame('3.15.0', $records[0]['fixed_version']);
+    }
+
+    /**
+     * @param list<array<string, mixed>> $records
+     * @return list<array{0: mixed, 1: mixed}>
+     */
+    private static function pairs(array $records): array
+    {
+        return array_map(static fn ($r) => [$r['package'], $r['fixed_version']], $records);
+    }
+
+    public function testARepositoryUrlGivesWayToThePackageThePathNames(): void
+    {
+        // The tarball name drops the scope; the unscoped json-schema-ref-parser
+        // is another package, which never reached 15.x
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-15195 (Medium) detected in json-schema-ref-parser-9.0.9.tgz',
+            "<p>Library home page: <a href=\"https://registry.npmjs.org/@\u{2060}apidevtools/json-schema-ref-parser/-/json-schema-ref-parser-9.0.9.tgz\">x</a></p>\n"
+            . "<p>Sample Path to Dependency File: /srv/package.json</p>\n"
+            . "<p>Path to vulnerable library: /srv/node_modules/@\u{2060}apidevtools/json-schema-ref-parser/package.json</p>\n"
+            . "<p>Fix Resolution: https://github.com/APIDevTools/json-schema-ref-parser.git - v15.3.6,@\u{2060}apidevtools/json-schema-ref-parser - 15.3.6</p>"
+        ));
+        $this->assertSame([['@apidevtools/json-schema-ref-parser', '15.3.6']], self::pairs($records));
+    }
+
+    public function testABareListIsNarrowedToTheLibrariesTheIssueReports(): void
+    {
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-12816 (High) detected in bcprov-jdk18on-1.80.jar',
+            "<p>Path to dependency file: /kotlin/build.gradle</p>\n"
+            . "<p>Path to vulnerable library: /tmp/cache/.gradle/caches/modules-2/files-2.1/org.bouncycastle/bcprov-jdk18on/1.80/e22100b4/bcprov-jdk18on-1.80.jar</p>\n"
+            . '<p>Fix Resolution: org.bouncycastle:bcprov-lts8on:2.73.12,org.bouncycastle:bcprov-jdk15to18:1.85,'
+            . 'org.bouncycastle:bcprov-jdk18on:1.85,https://github.com/bcgit/bc-java.git - r1rv85</p>'
+        ));
+        $this->assertSame([['org.bouncycastle:bcprov-jdk18on', '1.85']], self::pairs($records), 'alternatives and the repository tag dropped');
+
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-83557 (Medium) detected in multiple libraries',
+            "<p>Path to dependency file: /pom.xml</p>\n"
+            . "<p>Path to vulnerable library: /home/u/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.12.4/jackson-databind-2.12.4.jar,"
+            . "/home/u/.ivy2/cache/com.fasterxml.jackson.core/jackson-databind/bundles/jackson-databind-2.12.7.jar</p>\n"
+            . '<p>Fix Resolution: tools.jackson.core:jackson-databind:3.2.2,com.fasterxml.jackson.core:jackson-databind:2.18.10</p>'
+        ));
+        $this->assertSame([['com.fasterxml.jackson.core:jackson-databind', '2.18.10']], self::pairs($records), 'same artifact, other group');
+    }
+
+    public function testARepositoryTagIsTheVersionOfTheLibrariesTheIssueReports(): void
+    {
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-48043 (Medium) detected in netty-codec-http2-4.1.76.Final.jar, netty-codec-http2-4.1.67.Final.jar',
+            "<p>Path to dependency file: /pom.xml</p>\n"
+            . "<p>Path to vulnerable library: /home/u/.m2/repository/io/netty/netty-codec-http2/4.1.76.Final/netty-codec-http2-4.1.76.Final.jar</p>\n"
+            . "<p>Fix Resolution: https://github.com/netty/netty.git - netty-4.1.135.Final</p>"
+        ));
+        $this->assertSame([['io.netty:netty-codec-http2', '4.1.135.Final']], self::pairs($records));
+
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-49356 (Low) detected in core-7.29.0.tgz',
+            "<p>Path to dependency file: /js/package.json</p>\n"
+            . "<p>Path to vulnerable library: /js/node_modules/@babel/core/package.json,/ts/node_modules/@babel/core/package.json</p>\n"
+            . "<p>Fix Resolution: https://github.com/babel/babel.git - 7.29.6,https://github.com/babel/babel.git - 8.0.0-rc.6</p>"
+        ));
+        $this->assertSame([['@babel/core', '7.29.6'], ['@babel/core', '8.0.0-rc.6']], self::pairs($records), 'not the npm packages "babel" or "core"');
+
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-84304 (High) detected in google.golang.org/grpc-v1.75.1',
+            "<p>Path to dependency file: /tf/go.mod</p>\n"
+            . "<p>Path to vulnerable library: /home/u/go/pkg/mod/cache/download/google.golang.org/grpc/@v/v1.75.1.mod,"
+            . "/home/u/go/pkg/mod/cache/download/github.com/!azure/go-autorest/@v/v14.2.0.mod</p>\n"
+            . "<p>Fix Resolution: https://github.com/grpc/grpc-go.git - v1.83.1</p>"
+        ));
+        $this->assertSame([
+            ['github.com/Azure/go-autorest', '1.83.1'],
+            ['google.golang.org/grpc', '1.83.1'],
+        ], self::pairs($records), 'every library reported when the repository is named after none');
+    }
+
+    public function testARepositoryTagOnAnotherMajorLineThanTheOneInUseIsNotTrusted(): void
+    {
+        // jackson-databind's 3.x tags are tools.jackson.core releases; no
+        // com.fasterxml.jackson.core:jackson-databind 3.1.4 exists
+        $section = static fn (string $v): string => "<details><summary><b>jackson-databind-{$v}.jar</b></summary>\n"
+            . "<p>Sample Path to Dependency File: /java/pom.xml</p>\n"
+            . "<p>Path to vulnerable library: /home/u/.m2/repository/com/fasterxml/jackson/core/jackson-databind/{$v}/jackson-databind-{$v}.jar</p>\n</details>\n";
+        $body = $section('2.21.0') . $section('2.21.2');
+        $this->assertSame([], IssueParser::parseIssue(self::issue(
+            'CVE-2026-54518 (Medium) detected in jackson-databind-2.21.0.jar, jackson-databind-2.21.2.jar',
+            $body . '<p>Fix Resolution: https://github.com/FasterXML/jackson-databind.git - jackson-databind-3.1.4</p>'
+        )));
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-54519 (Medium) detected in jackson-databind-2.21.0.jar, jackson-databind-2.21.2.jar',
+            $body . '<p>Fix Resolution: https://github.com/FasterXML/jackson-databind.git - jackson-databind-2.21.3</p>'
+        ));
+        $this->assertSame([['com.fasterxml.jackson.core:jackson-databind', '2.21.3']], self::pairs($records));
+        $this->assertSame(['2.21.0', '2.21.2'], $records[0]['installed'], 'what the issue found in use');
+
+        // A sister artifact listed at the tag's version vouches for it
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-41853 (Medium) detected in spring-webmvc-5.1.17.RELEASE.jar',
+            "<details><summary><b>spring-webmvc-5.1.17.RELEASE.jar</b></summary>\n<p>Path to dependency file: /spring/pom.xml</p>\n"
+            . "<p>Path to vulnerable library: /home/u/.m2/repository/org/springframework/spring-webmvc/5.1.17.RELEASE/spring-webmvc-5.1.17.RELEASE.jar</p>\n</details>\n"
+            . '<p>Fix Resolution: org.springframework:spring-web:6.2.19,https://github.com/spring-projects/spring-framework.git - v6.2.19</p>'
+        ));
+        $this->assertSame([['org.springframework:spring-webmvc', '6.2.19']], self::pairs($records));
+    }
+
+    public function testOwnRepositoryTagsAddReleaseBranchesOnTheMajorLinesListed(): void
+    {
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-40973 (High) detected in spring-boot-2.1.16.RELEASE.jar',
+            "<p>Path to dependency file: /pom.xml</p>\n"
+            . "<p>Path to vulnerable library: /home/u/.m2/repository/org/springframework/boot/spring-boot/2.1.16.RELEASE/spring-boot-2.1.16.RELEASE.jar</p>\n"
+            . '<p>Fix Resolution: https://github.com/spring-projects/spring-boot.git - v4.0.6,org.springframework.boot:spring-boot:4.0.6,'
+            . 'https://github.com/spring-projects/spring-boot.git - v3.3.14,org.springframework.boot:spring-boot:3.5.14,'
+            . 'https://github.com/spring-projects/spring-boot.git - v5.0.0</p>'
+        ));
+        $this->assertSame([
+            ['org.springframework.boot:spring-boot', '4.0.6'],
+            ['org.springframework.boot:spring-boot', '3.5.14'],
+            ['org.springframework.boot:spring-boot', '3.3.14'],
+        ], self::pairs($records), 'v5.0.0 is on no line the list names');
+    }
+
+    public function testBareVersionIsPairedWithTheFullNamesOfTheReportedLibraries(): void
+    {
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-59647 (Medium) detected in bcprov-jdk18on-1.80.jar, bcpkix-jdk18on-1.80.jar',
+            "<p>Path to dependency file: /build.gradle</p>\n"
+            . "<p>Path to vulnerable library: /c/.gradle/caches/modules-2/files-2.1/org.bouncycastle/bcprov-jdk18on/1.80/e221/bcprov-jdk18on-1.80.jar</p>\n"
+            . "<p>Path to vulnerable library: /c/.gradle/caches/modules-2/files-2.1/org.bouncycastle/bcpkix-jdk18on/1.80/5277/bcpkix-jdk18on-1.80.jar</p>\n"
+            . '<p>Fix Resolution: 1.85</p>'
+        ));
+        $this->assertSame([['org.bouncycastle:bcpkix-jdk18on', '1.85'], ['org.bouncycastle:bcprov-jdk18on', '1.85']], self::pairs($records));
+
+        $records = IssueParser::parseIssue(self::issue(
+            'CVE-2026-53537 (Low) detected in python_multipart-0.0.20-py3-none-any.whl',
+            "<p>Path to dependency file: /requirements.txt</p>\n"
+            . "<p>Path to vulnerable library: /tmp/env/lib/python3.9/site-packages/python_multipart-0.0.20.dist-info</p>\n"
+            . '<p>Fix Resolution: 0.0.30</p>'
+        ));
+        $this->assertSame([['python-multipart', '0.0.30']], self::pairs($records), 'one name for the dist-info and the wheel');
     }
 
     public function testInvisibleCharactersAndVersionPrefixesAreStripped(): void

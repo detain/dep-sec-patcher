@@ -19,6 +19,10 @@ use Detain\DepSecPatcher\TargetResult;
  *
  * sbt 2's runner defaults to its native client, which starts a server in the
  * background that outlives the command, so sbt always runs in the foreground.
+ *
+ * A build without project/build.properties predates sbt 2, which cannot load
+ * an sbt 1 build definition ("value in is not a member of ..."), so it runs
+ * on sbt 1 even when the runner is sbt 2's.
  */
 final class SbtAuditor extends Auditor
 {
@@ -28,6 +32,8 @@ final class SbtAuditor extends Auditor
     public const INJECT_SINCE = '1.4.0';
     /** sbt-updates 0.7 supports sbt 1 and 2; 0.6.4 is the last release for sbt 0.13. */
     private const PLUGIN = 'addSbtPlugin("com.timushev.sbt" %% "sbt-updates" %% "%s")';
+    /** The sbt a build that names no version runs on under sbt 2's runner. */
+    public const SBT1 = '1.10.11';
 
     public function name(): string
     {
@@ -57,12 +63,25 @@ final class SbtAuditor extends Auditor
 
     public function audit(Context $ctx, string $dir): TargetResult
     {
-        $version = $this->sbtVersion($ctx, $dir);
-        $global  = self::globalPluginDir($version);
+        $version = $this->declaredVersion($ctx, $dir);
+        $runner  = $ctx->toolVersion('sbt', ['sbt', '--script-version']);
         $argv    = ['sbt'];
+        $notes   = [];
+        if ($version === '' && (int)$runner >= 2) {
+            // The runner still takes it for an sbt 2 build, which it would
+            // hand to a background server: --server keeps it in the foreground
+            $version = self::SBT1;
+            $argv    = ['sbt', '--server', '-Dsbt.version=' . self::SBT1];
+            $notes[] = 'no project/build.properties: ran sbt ' . self::SBT1 . " rather than the runner's sbt {$runner}";
+        } elseif ($version === '') {
+            $version = $runner;
+        }
         if ((int)$version >= 2) {
             $argv[] = '--server';
         }
+        // sbt would otherwise write a project/build.properties into a build without one
+        $argv[] = '-Dsbt.skip.version.write=true';
+        $global = self::globalPluginDir($version);
         if (!$this->hasUpdatesPlugin($ctx, $dir, $global)) {
             if ($version !== '' && version_compare($version, self::INJECT_SINCE, '<')) {
                 $home = getenv('HOME') ?: '~';
@@ -88,21 +107,18 @@ final class SbtAuditor extends Auditor
         // SBT_NATIVE_CLIENT=true in the environment would turn the client on for sbt 1.4+ too
         $r = $this->run($ctx, $dir, $argv, null, ['SBT_NATIVE_CLIENT' => 'false']);
         $t = new TargetResult($r->ok() ? TargetResult::PASS : TargetResult::WARN, 'dependencyUpdates ' . ($r->ok() ? 'ok' : $r->failureReason()));
-        $t->tail = $r->tail(20);
+        $t->tail  = $r->tail(20);
+        $t->notes = $notes;
         return $t;
     }
 
     /**
-     * The sbt version the project builds with: project/build.properties, or
-     * else the runner's own default; '' when neither says.
+     * The sbt version project/build.properties names, or ''.
      */
-    private function sbtVersion(Context $ctx, string $dir): string
+    private function declaredVersion(Context $ctx, string $dir): string
     {
         $props = (string)@file_get_contents($this->abs($ctx, $dir) . '/project/build.properties');
-        if (preg_match('/^\s*sbt\.version\s*=\s*([0-9][^\s]*)/m', $props, $m) === 1) {
-            return $m[1];
-        }
-        return $ctx->toolVersion('sbt', ['sbt', '--script-version']);
+        return preg_match('/^\s*sbt\.version\s*=\s*([0-9][^\s]*)/m', $props, $m) === 1 ? $m[1] : '';
     }
 
     /**

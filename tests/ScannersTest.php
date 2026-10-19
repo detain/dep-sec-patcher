@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Detain\DepSecPatcher\Tests;
 
 use Detain\DepSecPatcher\Auditor\ComposerAuditor;
+use Detain\DepSecPatcher\Auditor\GradleAuditor;
 use Detain\DepSecPatcher\Auditor\MavenAuditor;
 use Detain\DepSecPatcher\Auditor\NodeAuditor;
 use Detain\DepSecPatcher\Auditor\SbtAuditor;
 use Detain\DepSecPatcher\Auditor\SimpleAuditor;
+use Detain\DepSecPatcher\CommandResult;
 use Detain\DepSecPatcher\Context;
 use Detain\DepSecPatcher\ManifestIndex;
 use Detain\DepSecPatcher\Options;
@@ -138,6 +140,68 @@ class ScannersTest extends TestCase
         $this->assertStringContainsString('versions:update-properties', $goals[1], 'versions declared through ${...} properties');
         foreach ($goals as $goal) {
             $this->assertSame($capped, str_contains($goal, '-DallowMajorUpdates=false'));
+            $this->assertStringContainsString('-Dmaven.version.ignore=' . MavenAuditor::PRERELEASES, $goal);
+        }
+    }
+
+    public function testAnOldGradleWrapperRunsOnAJdkItSupports(): void
+    {
+        $bin = $this->scratchDir('bin');
+        file_put_contents($bin . '/java', "#!/bin/sh\necho 'openjdk version \"21.0.12\" 2026-08-18' >&2\n");
+        chmod($bin . '/java', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $this->setEnv('JAVA_HOME', null);
+        $jvm = $this->scratchDir('jvm');
+        foreach (['jdk-8' => '1.8.0_392', 'jdk-11' => '11.0.2', 'jdk-17' => '17.0.1'] as $name => $version) {
+            mkdir("{$jvm}/{$name}/bin", 0775, true);
+            file_put_contents("{$jvm}/{$name}/bin/java", "#!/bin/sh\n");
+            chmod("{$jvm}/{$name}/bin/java", 0755);
+            file_put_contents("{$jvm}/{$name}/release", "IMPLEMENTOR=\"x\"\nJAVA_VERSION=\"{$version}\"\n");
+        }
+        $root = $this->scratchDir('gradle');
+        $log  = $root . '/calls.log';
+        file_put_contents($root . '/gradlew', "#!/bin/sh\necho \"JAVA_HOME=\$JAVA_HOME \$*\" >> '{$log}'\n");
+        mkdir($root . '/gradle/wrapper', 0775, true);
+        file_put_contents($root . '/gradle/wrapper/gradle-wrapper.properties', "distributionUrl=https\\://services.gradle.org/distributions/gradle-7.0-bin.zip\n");
+
+        $t = (new GradleAuditor([$jvm]))->audit($this->context($root, ['--update']), '');
+        $this->assertSame(TargetResult::PASS, $t->status, $t->detail);
+        $this->assertSame(["Gradle 7.0 does not run on Java 21; ran on {$jvm}/jdk-11"], $t->notes, 'the newest JDK it runs on');
+        $this->assertSame(["JAVA_HOME={$jvm}/jdk-11 dependencies --no-daemon -q --console=plain"], file($log, FILE_IGNORE_NEW_LINES));
+
+        $t = (new GradleAuditor([$this->scratchDir('nojvm')]))->audit($this->context($root, ['--update']), '');
+        $this->assertSame(TargetResult::SKIP, $t->status);
+        $this->assertStringContainsString('Gradle 7.0 runs on Java 16 at most, and this host has Java 21', $t->detail);
+        $this->assertCount(1, file($log) ?: [], 'not run where it cannot start');
+    }
+
+    public function testAGradleFailureShowsWhatWentWrong(): void
+    {
+        $out = "FAILURE: Build failed with an exception.\n\n* Where:\nSettings file '/p/settings.gradle'\n\n* What went wrong:\n"
+            . "Could not compile settings file '/p/settings.gradle'.\n> startup failed:\n  General error during conversion: Unsupported class file major version 65\n\n"
+            . "* Try:\n> Run with --stacktrace option to get the stack trace.\n\nBUILD FAILED in 2s\n";
+        $this->assertSame([
+            '* Where:',
+            "Settings file '/p/settings.gradle'",
+            '* What went wrong:',
+            "Could not compile settings file '/p/settings.gradle'.",
+            '> startup failed:',
+            '  General error during conversion: Unsupported class file major version 65',
+        ], GradleAuditor::failure(new CommandResult('gradle', 1, false, '', $out, 2.0)));
+        $this->assertSame(['boom'], GradleAuditor::failure(new CommandResult('gradle', 1, false, '', "boom\n", 1.0)), 'otherwise the last lines');
+        $this->assertSame(16, GradleAuditor::maxJava('7.0.2'));
+        $this->assertSame(0, GradleAuditor::maxJava('99.0'), 'newer than the table: not second-guessed');
+    }
+
+    public function testTheMavenUpdaterPassesOverPrereleasesOnly(): void
+    {
+        // The plugin takes the pattern as a Java regex; this one reads the same in PCRE
+        $rx = '/' . str_replace('/', '\/', MavenAuditor::PRERELEASES) . '/';
+        foreach (['7.1.0-M2', '4.0.0.Beta8', '3.0-rc5', '1.0.0-alpha.1', '9.0.0-ea+13', '2.0.0.CR1', '1.0-SNAPSHOT', '5.0.0-preview.2'] as $v) {
+            $this->assertSame(1, preg_match($rx, $v), "{$v} is a prerelease");
+        }
+        foreach (['4.1.42.Final', '28.2-android', '33.7.2-jre', '5.1.17.RELEASE', '2.9.10.4', '1.2.3', '1.0.0-GA', '2.12.7.1'] as $v) {
+            $this->assertSame(0, preg_match($rx, $v), "{$v} is a release");
         }
     }
 
@@ -173,6 +237,18 @@ class ScannersTest extends TestCase
         }
         $fix = (string)current(array_filter($calls, static fn (string $c): bool => str_starts_with($c, 'audit fix')));
         $this->assertSame(!$capped, str_contains($fix, '--force'), 'npm audit fix --force makes major upgrades');
+    }
+
+    public function testNpmAuditFixSaysWhatItLeft(): void
+    {
+        $report = "# npm audit report\n\nminimist  <=0.2.3\nSeverity: critical\nfix available via `npm audit fix --force`\n"
+            . "Will install minimist@1.2.8, which is a breaking change\n\nnode-fetch  <2.6.7\nfix available via `npm audit fix --force`\n\n"
+            . "request  *\nNo fix available\n\n3 vulnerabilities (1 high, 2 critical)\n";
+        $this->assertSame(
+            'npm audit fix left 2 need a major upgrade (--allow-major), 1 has no fix available',
+            NodeAuditor::auditFixNote(new CommandResult('npm audit fix', 1, false, $report, $report, 1.0))
+        );
+        $this->assertSame('npm audit fix exit 1', NodeAuditor::auditFixNote(new CommandResult('npm audit fix', 1, false, '', 'npm error code E403', 1.0)));
     }
 
     /**
@@ -273,7 +349,8 @@ class ScannersTest extends TestCase
         return [
             'sbt 2, no plugin'                   => ['2.0.10', '', true, true],
             'sbt 2 ignores global plugins'       => ['2.0.10', '.sbt/1.0/plugins/p.sbt', true, true],
-            'sbt 2 by the runner default'        => ['', '', true, true],
+            'no build.properties: sbt 1, under the sbt 2 runner' => ['', '', true, true],
+            'no build.properties: sbt 1 global plugins'          => ['', '.sbt/1.0/plugins/p.sbt', true, false],
             'sbt 1, no plugin'                   => ['1.10.11', '', false, true],
             'sbt 1, global plugin'               => ['1.10.11', '.sbt/1.0/plugins/p.sbt', false, false],
             'sbt 1, plugin in the project'       => ['1.13.0', 'project/plugins.sbt', false, false],
@@ -298,6 +375,8 @@ class ScannersTest extends TestCase
         $this->assertStringStartsWith('SBT_NATIVE_CLIENT=false ', $call, 'never the native client');
         $this->assertSame($server, str_contains($call, ' --server '));
         $this->assertSame($injected, str_contains($call, '--addPluginSbtFile='));
+        $this->assertSame($version === '', str_contains($call, ' -Dsbt.version=' . SbtAuditor::SBT1 . ' '), 'a build that names no version predates sbt 2');
+        $this->assertStringContainsString(' -Dsbt.skip.version.write=true ', $call, 'no build.properties written into the tree');
         $this->assertStringEndsWith(" -batch dependencyUpdates\n", $call);
         if ($injected) {
             $file = $ctx->reportPath('sbt', '', 'sbt-updates.sbt');

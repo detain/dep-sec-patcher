@@ -432,6 +432,34 @@ class ApplicationTest extends TestCase
         $this->assertStringContainsString('neither declared in package.json nor in its lockfile', $vulns['yarn.lock|babel|GHSA-babel']['note']);
     }
 
+    public function testWithoutALockfileATransitivePinFollowsTheVersionTheIssueFoundInUse(): void
+    {
+        $dir = $this->scratchDir('inuse');
+        file_put_contents($dir . '/pom.xml', "<project>\n  <dependencies>\n  </dependencies>\n</project>\n");
+        $record = static fn (string $pkg, array $fixes, array $installed): array => [
+            'key' => "pom.xml|{$pkg}|CVE-1", 'source' => 'issue', 'id' => 'CVE-1', 'ecosystem' => 'maven', 'package' => $pkg,
+            'manifest' => 'pom.xml', 'fixed_version' => $fixes[0], 'fix_versions' => $fixes, 'installed' => $installed,
+        ];
+        $db = $this->storedDb([
+            $record('org.springframework:spring-webmvc', ['6.2.19', '7.0.8'], ['5.1.17.RELEASE']),
+            $record('io.netty:netty-codec-http2', ['4.1.135.Final', '4.2.15.Final'], ['4.1.67.Final', '4.1.76.Final']),
+            $record('ch.qos.logback:logback-core', ['1.5.34'], ['1.2.3', '2.0.1']),
+        ]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $pom = (string)file_get_contents($dir . '/pom.xml');
+        $this->assertStringContainsString('<artifactId>netty-codec-http2</artifactId>', $pom);
+        $this->assertStringContainsString('<version>4.1.135.Final</version>', $pom, 'the fix on the line in use, not the newest');
+        $this->assertStringNotContainsString('spring-webmvc', $pom);
+        $this->assertStringContainsString('spring-webmvc needs a major upgrade (5.1.17.RELEASE -> 6.2.19)', $out);
+        $vulns = VulnDb::load($db)['vulns'];
+        $this->assertStringContainsString('found in use at 1.2.3, 2.0.1 in several major versions', $vulns['pom.xml|ch.qos.logback:logback-core|CVE-1']['note']);
+
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--allow-major', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('<version>6.2.19</version>', (string)file_get_contents($dir . '/pom.xml'), 'the lowest major that fixes it');
+    }
+
     public function testCheckModeSuggestsTheCommandThatAppliesTheFixes(): void
     {
         $dir = $this->scratchDir('suggest');

@@ -82,9 +82,10 @@ you already have installed, and skips the ones you don't.
 - **Fixes written into the manifests.** For each package it writes the smallest
   bump that clears every advisory, staying on your current release line where a
   fix exists there. Transitive dependencies are pinned with npm `overrides` /
-  `resolutions` (on the line the lockfile already holds) or Maven
-  `<dependencyManagement>`. A declared version is never moved backwards, and
-  never to a new major version unless you pass `--allow-major`.
+  `resolutions` or Maven `<dependencyManagement>`, on the line the lockfile
+  holds or, without one, the line the issue found in use. A version is never
+  moved backwards, and never to a new major version unless you pass
+  `--allow-major`.
 - **Dependency-bot PRs handled.** Dependabot, Renovate, Mend and Snyk PRs are
   merged, set to auto-merge, or asked to rebase. Only PRs from those GitHub App
   bots are touched, never a human's.
@@ -278,6 +279,12 @@ Notes:
   tool adds it for the one command (sbt 1.4 and later, sbt 2 included), and
   only an older sbt is SKIPped, with the line to add. See
   [Ecosystem tools](#ecosystem-tools).
+- **Gradle** runs on Java only up to the release its version predates (Gradle
+  7.0 up to Java 16, 8.5 up to 21; on a newer JVM a wrapper fails with
+  "Unsupported class file major version"). Such a wrapper runs on the newest
+  JDK under `/usr/lib/jvm` it supports, with a note, or is SKIPped naming the
+  Java it needs. A failed Gradle build shows its "What went wrong" section
+  rather than the end of a stack trace.
 - Trivy and the GitHub collection run whatever the per-ecosystem audits find
   or skip.
 
@@ -297,10 +304,10 @@ failing the project.
 
 | Name | Tools | Check mode runs | Update mode changes | Concurrent runs |
 | --- | --- | --- | --- | --- |
-| `maven` | `mvn`, OWASP `dependency-check-maven` (`--enable-native-access=ALL-UNNAMED` is added to `MAVEN_OPTS` when mvn runs on Java 17+) | `dependency-check:check` against the database refreshed once per run (`autoUpdate=false`) | `versions:use-latest-releases` (falling back to `use-latest-versions` only if that fails), then `versions:update-properties` for versions taken from `<properties>`, rewrite `pom.xml`; both with `-DallowMajorUpdates=false` unless `--allow-major` | Maven >= 3.9.0, with resolver file locks; serial below |
+| `maven` | `mvn`, OWASP `dependency-check-maven` (`--enable-native-access=ALL-UNNAMED` is added to `MAVEN_OPTS` when mvn runs on Java 17+) | `dependency-check:check` against the database refreshed once per run (`autoUpdate=false`) | `versions:use-latest-releases` (falling back to `use-latest-versions` only if that fails), then `versions:update-properties` for versions taken from `<properties>`, rewrite `pom.xml`; both with `-DallowMajorUpdates=false` unless `--allow-major`, and both pass over milestones, release candidates, alphas, betas and other prereleases (`-Dmaven.version.ignore`), which the plugin otherwise counts as releases | Maven >= 3.9.0, with resolver file locks; serial below |
 | `gradle` | the project's `gradlew`, run with `sh` (or `bash` when its first line names bash) | `dependencyUpdates` if the ben-manes versions plugin is applied, else SKIP | `dependencies` (resolves; informational) | yes |
-| `sbt` | `sbt` + `sbt-updates` plugin, always in the foreground (`--server` on sbt 2, `SBT_NATIVE_CLIENT=false`), so no sbt server is left running | `dependencyUpdates`; without the plugin in `project/*.sbt` or the global plugins, it is added with `--addPluginSbtFile` (sbt 1.4+), else SKIP. sbt before 1.6 on Java 18 to 23 gets `-Djava.security.manager=allow`, without which it cannot start | `dependencyUpdates` (informational) | sbt >= 1.3.0 (Coursier); serial below |
-| `node` | `npm`, or `yarn` / `pnpm` when their lockfile is present | npm: `npm install --package-lock-only`, then `npm audit --omit=dev`; Yarn 1: `yarn audit`; Yarn 2+: `yarn npm audit --all`; pnpm: `pnpm audit` | `npm update` and `npm audit fix` (lockfile only, scripts disabled; `--force`, which makes major upgrades, only with `--allow-major`), Yarn 1: `yarn install` then `yarn upgrade` (scripts disabled), `pnpm up` (scripts disabled; `--latest` only with `--allow-major`). When `package.json` itself has conflicting peer dependencies (npm `ERESOLVE`), every npm step is retried with `--legacy-peer-deps` and a note says so | npm, pnpm: yes; yarn >= 2.0.0, serial for Yarn 1 |
+| `sbt` | `sbt` + `sbt-updates` plugin, always in the foreground (`--server` on sbt 2, `SBT_NATIVE_CLIENT=false`), so no sbt server is left running | `dependencyUpdates`; without the plugin in `project/*.sbt` or the global plugins, it is added with `--addPluginSbtFile` (sbt 1.4+), else SKIP. sbt before 1.6 on Java 18 to 23 gets `-Djava.security.manager=allow`, without which it cannot start. A build without `project/build.properties` runs on sbt 1.10.11 under sbt 2's runner, since sbt 2 cannot load an sbt 1 build definition, and `-Dsbt.skip.version.write=true` keeps sbt from writing a `build.properties` into it | `dependencyUpdates` (informational) | sbt >= 1.3.0 (Coursier); serial below |
+| `node` | `npm`, or `yarn` / `pnpm` when their lockfile is present | npm: `npm install --package-lock-only`, then `npm audit --omit=dev`; Yarn 1: `yarn audit`; Yarn 2+: `yarn npm audit --all`; pnpm: `pnpm audit` | `npm update` and `npm audit fix` (lockfile only, scripts disabled; `--force`, which makes major upgrades, only with `--allow-major`; when vulnerabilities remain, a note says how many need a major upgrade and how many have no fix), Yarn 1: `yarn install` then `yarn upgrade` (scripts disabled), `pnpm up` (scripts disabled; `--latest` only with `--allow-major`). When `package.json` itself has conflicting peer dependencies (npm `ERESOLVE`), every npm step is retried with `--legacy-peer-deps` and a note says so | npm, pnpm: yes; yarn >= 2.0.0, serial for Yarn 1 |
 | `php` | `composer` | `composer update -W --no-install` if there is no lockfile, then `composer audit --locked`; a lockfile created for the audit is deleted afterwards | `composer update -W --no-install` rewrites `composer.lock`, or creates one for the audit and deletes it afterwards when the project had none (so `--push` never commits it). If Composer refuses because only versions with security advisories meet a requirement, the update is retried with its advisory blocking off, and a note says so | always serial |
 | `python` | `python3`, plus `pip-audit` or `safety` | `pip-audit -r requirements.txt` (or `safety check -r requirements.txt`) | `pip-audit --fix` rewrites `requirements.txt` (`safety` changes nothing) | yes |
 | `ruby` | `bundle`, `bundle-audit` (installed with `gem` if missing) | advisory database refreshed once, `bundle lock` if there is no lockfile, then `bundle-audit check` | `bundle lock --update` rewrites `Gemfile.lock` (no gems installed) | Bundler >= 2.6.0; serial below |
@@ -351,20 +358,24 @@ lie inside the tree before it is edited. A fix the editor cannot make is
 reported as "cannot edit" and stays `pending`.
 
 **Major versions.** By default auto-fix does not move a declared dependency, or
-a transitive one the lockfile holds, to a new major version. Below 1.0 a new
-minor version counts as major, the way npm's caret treats it (`0.8.x` to
-`0.9.0`). Such a fix prints a `[WARN]`, stays `pending` with a note, and is
+a transitive one whose version in use is known, to a new major version. Below
+1.0 a new minor version counts as major, the way npm's caret treats it (`0.8.x`
+to `0.9.0`). Such a fix prints a `[WARN]`, stays `pending` with a note, and is
 applied by a later run with `--allow-major` (or `"allow-major": true` in the
 config file).
 
-**Transitive npm dependencies.** The lockfile is read first: `yarn.lock` (v1
-and Berry), `package-lock.json` / `npm-shrinkwrap.json` (v1 to v3) or
-`pnpm-lock.yaml`. When every locked copy already clears the advisories, the
-record is marked applied without a pin. When the locked copies span several
-major lines, nothing is pinned and the record stays `pending` ("pin it by
-hand"). Otherwise the pin is chosen on the line the lockfile holds. Without a
-lockfile entry, the pin is the highest fix any advisory suggested for that
-package.
+**Transitive dependencies.** For npm the lockfile is read first: `yarn.lock`
+(v1 and Berry), `package-lock.json` / `npm-shrinkwrap.json` (v1 to v3) or
+`pnpm-lock.yaml`. An npm package the lockfile holds no copy of is not pinned
+(nothing installs it). Without a lockfile, for npm and Maven, the versions the
+security issue found in use stand in for it (Mend names the path of each copy,
+such as `~/.m2/repository/io/netty/netty-codec-http2/4.1.76.Final/`). When
+every copy already clears the advisories, the record is marked applied without
+a pin. When the copies span several major lines, nothing is pinned and the
+record stays `pending` ("pin it by hand"). Otherwise the pin is chosen on the
+line in use, from the newest copy, so it moves none of them back: netty 4.1.76
+gets 4.1.135.Final, not 4.2.15.Final. With no version in use known, the pin is
+the highest fix any advisory suggested for that package.
 
 ## Tools it uses
 
@@ -793,7 +804,21 @@ so that a renamed repository resolves to its current name.
   Two Mend Bolt / WhiteSource formats are parsed:
   - the per-CVE format ("Path to dependency file", "Fix Resolution",
     "Direct dependency fix Resolution", and the bare coordinate lists): one
-    remediation record per package, fix version and manifest;
+    remediation record per package, fix version and manifest. A bare list
+    names packages loosely, so it is narrowed to the libraries the issue
+    reports, taken in full from the paths Mend found them at (a Maven, Gradle or
+    Ivy cache path gives the groupId, a `node_modules` path the npm scope, the
+    Go module cache the module path). Alternatives that no manifest uses are
+    dropped (`bcprov-lts8on` beside `bcprov-jdk18on`, `tools.jackson.core`
+    beside `com.fasterxml.jackson.core`); a bare version or a tarball name gets
+    its full name (`core-7.29.0.tgz` is `@babel/core`, not the npm package
+    `core`); and a repository URL (`https://github.com/netty/netty.git - 4.1.135.Final`)
+    becomes the version of the libraries built there, never a package named
+    after the repository. A repository tag is only taken on a major line in
+    use, or where the list names a sister package with the same groupId or
+    scope at that version: jackson-databind's 3.x tags are
+    `tools.jackson.core` releases. Each record also keeps the versions the
+    issue found in use in that manifest;
   - the grouped format, one issue per library (such as
     "axios-1.3.5.tgz: 40 vulnerabilities (highest severity is: 9.3)") with a
     "Sample Path to Dependency File", a summary table and a `<details>` section
@@ -855,9 +880,10 @@ group:
 - a fix that needs a new major version is held back unless `--allow-major` is
   given;
 - a transitive dependency is pinned instead: npm `overrides` / `resolutions`,
-  or Maven `<dependencyManagement>`. An npm package that the lockfile holds no
-  copy of is not pinned at all (nothing installs it), and a pin never goes to
-  a prerelease when a release fixes the same advisories;
+  or Maven `<dependencyManagement>`, on the line its lockfile or, without one,
+  its issue says is in use. An npm package that the lockfile holds no copy of
+  is not pinned at all (nothing installs it), and a pin never goes to a
+  prerelease when a release fixes the same advisories;
 - Maven `${property}` versions are bumped at the property definition.
 
 The files it can edit, how each writes the version, and the rules for major
@@ -1005,6 +1031,11 @@ repository's manifest paths and issue numbers, and what was applied there.
   with its own state, such as a Mend CVE with no known fix (`skipped`).
   Re-collecting a record keeps `first_seen`, `state`, `applied_at` and `note`,
   and unions `refs` and `fix_versions`.
+- An issue read again replaces what it reported before: a record it no longer
+  yields (the bot edited the issue, or an older version of this tool named the
+  wrong package, such as `babel` for `@babel/core`) drops that issue from its
+  `refs`, and is deleted when no issue is left. Records of issues not read in
+  the run are untouched.
 - After a complete listing, a `pending` Dependabot record whose alert is no
   longer open, and a `pending` issue record none of whose issues is still open,
   become `resolved` with a note. Issue records are only retired when fewer than
@@ -1168,8 +1199,11 @@ in-process.
   dependency directories that already existed are not snapshotted, so a tool
   may refresh caches inside them. In update mode only new build and
   dependency directories are removed (`node_modules`, `vendor`, `target`,
-  `obj`, `bin`, `build`, ...). Entries that existed before are never deleted.
-  Read-only directories left by Go and Cargo are made writable before removal.
+  `obj`, `bin`, `build`, ...), and a `project/` that sbt created for nothing
+  but its own output goes with them, so `--push` cannot commit it. Entries that
+  existed before are never deleted, and a `project` that is a symlink is never
+  looked into. Read-only directories left by Go and Cargo are made writable
+  before removal.
 - **Third-party code.** npm runs with `--ignore-scripts` and lockfile-only;
   Composer with `--no-scripts --no-plugins --no-install`; Bundler resolves
   without installing gems.
@@ -1204,6 +1238,9 @@ in-process.
 - **Secrets.** `-D...key/token/password/secret=` arguments and URL credentials
   are masked in printed commands; the NVD key is passed through the
   environment.
+- **Terminal output.** A tool's output is printed without its colour codes and
+  other escape sequences, so a build in a cloned repository cannot set the
+  terminal's title, hyperlinks or cursor through this tool.
 
 ## Troubleshooting
 
@@ -1219,8 +1256,14 @@ Trivy, govulncheck and bundler-audit advisory databases. Later runs reuse them.
 **A fix stays `pending`.** The auto-fix line and the record's `note` say why:
 it needs a major upgrade (rerun with `--allow-major`), the declared spec is one
 it cannot edit (a union, a git or file spec, a dist-tag, a `--hash` file), or
-the lockfile holds the package in several major lines and it needs a pin by
-hand. The "Next steps" section at the end of the run suggests the command.
+the lockfile (or the issue) has the package in use on several major lines and
+it needs a pin by hand. The "Next steps" section at the end of the run suggests
+the command.
+
+**`Gradle X runs on Java N at most`.** The project's wrapper predates the
+host's Java and no JDK under `/usr/lib/jvm` is old enough for it. Install one
+(`apt install openjdk-17-jdk-headless`, for instance, covers Gradle 7.3 to
+8.4), or update the wrapper.
 
 **A project is SKIPped.** The reason is on the line: tool not installed, no
 lockfile to audit, or a Gradle/sbt plugin that is not applied. Install the tool

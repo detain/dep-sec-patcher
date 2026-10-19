@@ -28,17 +28,33 @@ final class CommandResult
     }
 
     /**
-     * Last $lines non-empty lines of the combined output.
+     * Last $lines non-empty lines of the combined output, as plain text.
      *
      * @return list<string>
      */
     public function tail(int $lines = 20): array
     {
         $all = array_values(array_filter(
-            preg_split('/\r?\n|\r/', $this->output) ?: [],
+            preg_split('/\r?\n|\r/', self::plain($this->output)) ?: [],
             static fn ($l) => trim($l) !== ''
         ));
         return array_slice($all, -$lines);
+    }
+
+    /**
+     * Command output without colour codes and other terminal control
+     * sequences, before it is echoed: sbt colours its errors even under
+     * -batch, and a cloned repository's build decides what it prints.
+     * Newlines, carriage returns and tabs stay.
+     */
+    public static function plain(string $text): string
+    {
+        return (string)preg_replace([
+            '/\e\][^\a\e]*(?:\a|\e\\\\)?/',     // OSC: window titles, hyperlinks
+            '/\e\[[0-?]*[ -\/]*[@-~]/',         // CSI: colours, cursor movement
+            '/\e[@-_]?/',                       // any other escape
+            '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/',
+        ], '', $text);
     }
 
     /**

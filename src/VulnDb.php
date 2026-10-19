@@ -68,7 +68,7 @@ final class VulnDb
         $data['vulns'] = $db['vulns'] === [] ? new \stdClass() : $db['vulns'];
 
         $dir = dirname($path);
-        if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
+        if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
             throw new RuntimeException("cannot create {$dir}");
         }
         $tmp = tempnam($dir, '.vulndb.');
@@ -141,6 +141,49 @@ final class VulnDb
             }
             $db['vulns'][$key]['state'] = 'resolved';
             $db['vulns'][$key]['note']  = "no longer open on GitHub as of {$now}";
+        }
+        return $db;
+    }
+
+    /**
+     * Make the issues just read the only word on what they report. A record
+     * an issue no longer yields (its bot edited the body, or an older parser
+     * named the wrong package) drops that issue from its refs, and goes when
+     * no issue is left. Records of issues not read this time are untouched.
+     *
+     * @param array<string, mixed>       $db
+     * @param list<array<string, mixed>> $records the records parsed from those issues
+     * @param array<int, true>           $readRefs the numbers of the issues read
+     * @return array<string, mixed>
+     */
+    public static function supersede(array $db, array $records, array $readRefs): array
+    {
+        $yielded = [];
+        foreach ($records as $r) {
+            foreach (self::listOf($r['refs'] ?? null) as $ref) {
+                if (is_int($ref)) {
+                    $yielded[(string)$r['key']][$ref] = true;
+                }
+            }
+        }
+        foreach ($db['vulns'] as $key => $v) {
+            if (($v['source'] ?? null) !== 'issue') {
+                continue;
+            }
+            $refs = self::listOf($v['refs'] ?? null);
+            $keep = array_values(array_filter(
+                $refs,
+                static fn (mixed $ref): bool => !is_int($ref) || !isset($readRefs[$ref]) || isset($yielded[$key][$ref])
+            ));
+            if ($keep === $refs) {
+                continue;
+            }
+            if ($keep === []) {
+                unset($db['vulns'][$key]);
+                continue;
+            }
+            $db['vulns'][$key]['refs'] = $keep;
+            $db['vulns'][$key]['ref']  = $keep[0];
         }
         return $db;
     }

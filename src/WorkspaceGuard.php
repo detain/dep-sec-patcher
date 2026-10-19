@@ -76,10 +76,17 @@ final class WorkspaceGuard
     {
         unset(self::$active[spl_object_id($this)]);
         $undone = [];
-        foreach (['', 'project/'] as $prefix) {
-            if ($prefix !== '' && !isset($this->before['project'])) {
-                // project/ itself is new; it is handled as a top-level entry
+        // project/ first: sbt creates it, holding only project/target, for a
+        // build that had none, and once that is gone so is project/
+        $project = $this->dir . '/project';
+        foreach (['project/', ''] as $prefix) {
+            if ($prefix !== '' && (is_link($project) || !is_dir($project))) {
+                // Never reached through a link: it is handled as a top-level entry
                 continue;
+            }
+            if ($prefix === '' && !isset($this->before['project']) && !is_link($project) && is_dir($project)
+                && (scandir($project) ?: []) === ['.', '..']) {
+                @rmdir($project);
             }
             $entries = @scandir($this->dir . '/' . $prefix);
             if ($entries === false) {

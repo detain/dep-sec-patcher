@@ -508,7 +508,7 @@ final class SecurityRun
 
         $limit  = $this->opt->maxIssues === 0 ? 100000 : $this->opt->maxIssues;
         $issues = $this->gh()->openIssues($repo, $limit, 'number,title,body,author,url');
-        $issueRecords = [];
+        $issueRecords = $botIssues = [];
         if ($issues === null) {
             $c->warn("Could not list issues for {$repo}");
             $this->record('sec-issues', 'SKIP');
@@ -518,7 +518,8 @@ final class SecurityRun
                 $c->warn("Security issues: only the first {$limit} open issues were read (--max-issues; 0 reads them all)");
             }
             // Issue bodies become manifest edits, so only a security bot's count
-            $issueRecords = IssueParser::parse(array_values(array_filter($issues, static fn ($i) => self::isBot($i['author'] ?? null))));
+            $botIssues    = array_values(array_filter($issues, static fn ($i) => self::isBot($i['author'] ?? null)));
+            $issueRecords = IssueParser::parse($botIssues);
             if ($issueRecords !== []) {
                 $refs = count(array_unique(array_map(static fn ($r) => $r['ref'], $issueRecords)));
                 $c->info("Security issues: {$refs} issues -> " . count($issueRecords) . ' remediation records');
@@ -536,6 +537,10 @@ final class SecurityRun
             return;
         }
         $db = VulnDb::upsert($db, $merged, $this->now, $this->gh()->slug);
+        if ($issues !== null) {
+            // What an issue reported when last read gives way to what it reports now
+            $db = VulnDb::supersede($db, $issueRecords, array_fill_keys(array_map('intval', array_column($botIssues, 'number')), true));
+        }
         // Alerts fixed or dismissed and issues closed since they were recorded
         // are retired, but only from a complete listing
         if ($alerts !== null) {
@@ -896,17 +901,24 @@ final class SecurityRun
                 $pin      = $row['pkg_max'];
                 $current  = $declared;
                 $locked   = $declared === '' && $eco === 'npm' ? Lockfile::versions(dirname($abs), 'npm', $pkg) : null;
-                if ($locked !== null && $locked !== []) {
-                    // Transitive: what matters is what the lockfile resolved
-                    $lines = array_values(array_unique(array_map([Version::class, 'majorLine'], $locked)));
-                    if (array_filter($locked, static fn (string $v): bool => !Version::clearsAll($v, $row['spec'])) === []) {
+                // Transitive: what matters is what the lockfile resolved. With
+                // no lockfile, the versions the issues found in use stand in,
+                // so an override or <dependencyManagement> pin stays on the
+                // line in use and --allow-major governs it like any bump
+                $inUse = $locked !== null && $locked !== [] ? $locked
+                    : ($declared === '' && $locked === null && in_array($eco, ['npm', 'maven'], true) && $row['installed'] !== [] ? $row['installed'] : null);
+                $where = $locked !== null && $locked !== [] ? 'locked at' : 'found in use at';
+                if ($inUse !== null) {
+                    $lines = array_values(array_unique(array_map([Version::class, 'majorLine'], $inUse)));
+                    if (array_filter($inUse, static fn (string $v): bool => !Version::clearsAll($v, $row['spec'])) === []) {
                         $ver = '';
                     } elseif (count($lines) > 1) {
                         // A package-wide pin would force every copy onto one line
                         $ver = null;
                     } else {
-                        $current = $locked[0];
-                        $ver     = $pin = Version::chooseTarget($locked[0], $row['spec']);
+                        // From the newest copy, so the pin moves none of them back
+                        $current = Version::max($inUse);
+                        $ver     = $pin = Version::chooseTarget($current, $row['spec']) ?: $current;
                     }
                 } else {
                     $ver = Version::chooseTarget($declared, $row['spec'], $pin);
@@ -919,14 +931,16 @@ final class SecurityRun
                     [$state, $note] = ['skipped', "{$pkg} is neither declared in {$target} nor in its lockfile"];
                 } elseif ($ver === null) {
                     $unsupported++;
-                    $note = "{$pkg} is locked at " . implode(', ', $locked) . " in several major versions; pin it by hand";
+                    $note = "{$pkg} is {$where} " . implode(', ', $inUse) . " in several major versions; pin it by hand";
                 } elseif ($ver === '') {
                     // Every advisory for this package is already cleared
                     $satisfied++;
                     $state = 'applied';
-                    $note  = $locked !== null
-                        ? "already satisfied: the lockfile resolves {$pkg} to " . implode(', ', $locked)
-                        : "already satisfied: {$target} declares {$declared}";
+                    $note  = match (true) {
+                        $locked !== null => "already satisfied: the lockfile resolves {$pkg} to " . implode(', ', $locked),
+                        $inUse !== null  => "already satisfied: {$pkg} was found in use at " . implode(', ', $inUse),
+                        default          => "already satisfied: {$target} declares {$declared}",
+                    };
                 } elseif (!$this->opt->allowMajor && Version::floor($current) !== '' && Version::majorLine($current) !== Version::majorLine($ver)) {
                     // Left pending: --allow-major on a later run applies it
                     $major++;

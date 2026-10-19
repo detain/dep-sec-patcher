@@ -104,7 +104,7 @@ final class NodeAuditor extends Auditor
             $fix = array_merge(['npm', 'audit', 'fix'], $ctx->opt->allowMajor ? ['--force'] : [], ['--package-lock-only', '--ignore-scripts', '--no-fund'], $peers);
             $r   = $this->run($ctx, $dir, $fix);
             if (!$r->ok()) {
-                $notes[] = 'npm audit fix ' . $r->failureReason();
+                $notes[] = self::auditFixNote($r);
             }
         }
         $argv = ['npm', 'audit', '--json'];
@@ -180,6 +180,28 @@ final class NodeAuditor extends Auditor
         }
         $result->notes = array_merge($notes, $result->notes);
         return $result;
+    }
+
+    /**
+     * Why `npm audit fix` failed. It exits 1 whenever anything is left
+     * vulnerable, which the audit after it counts, so say what was left
+     * rather than just "exit 1".
+     */
+    public static function auditFixNote(CommandResult $r): string
+    {
+        $major = substr_count($r->output, 'fix available via `npm audit fix --force`');
+        $none  = substr_count($r->output, 'No fix available');
+        if ($r->timedOut || $r->exitCode !== 1 || $major + $none === 0) {
+            return 'npm audit fix ' . $r->failureReason();
+        }
+        $left = [];
+        if ($major > 0) {
+            $left[] = "{$major} need" . ($major === 1 ? 's' : '') . ' a major upgrade (--allow-major)';
+        }
+        if ($none > 0) {
+            $left[] = "{$none} ha" . ($none === 1 ? 's' : 've') . ' no fix available';
+        }
+        return 'npm audit fix left ' . implode(', ', $left);
     }
 
     /**
