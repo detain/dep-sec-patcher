@@ -259,7 +259,7 @@ followed, and `--exclude-dir` adds more. The **Name** column is what
 | Ruby | `ruby` | `Gemfile` | `bundle-audit` (bundler-audit) | `bundle lock --update` rewrites `Gemfile.lock` |
 | Go | `go` | `go.mod` | `govulncheck` (plus a `gosec` source scan) | `go get -u ./...` and `go mod tidy` |
 | Rust | `rust` | `Cargo.toml` | `cargo audit` | `cargo update` rewrites `Cargo.lock` |
-| C#, F# (.NET) | `dotnet` | `*.sln`, `*.csproj`, `*.fsproj` | `dotnet list package --vulnerable --include-transitive` | `dotnet-outdated -u:Auto` rewrites project files |
+| C#, F# (.NET) | `dotnet` | `*.sln`, `*.csproj`, `*.fsproj` | `dotnet list package --vulnerable --include-transitive` | `dotnet-outdated -u:Auto` rewrites project files, then each package still vulnerable goes to the newest release on its major line (any line with `--allow-major`) via `dotnet add package`, a transitive one pinned by a direct reference |
 | Dart | `dart` | `pubspec.yaml` | none: outdated report only (`dart pub outdated`) | `dart pub upgrade` (`--major-versions` with `--allow-major`) |
 | Elixir | `elixir` | `mix.exs` | `mix hex.audit` (retired packages) | `mix deps.update --all` |
 | Swift | `swift` | `Package.swift` | none: dependency listing only | `swift package update` |
@@ -313,7 +313,7 @@ failing the project.
 | `ruby` | `bundle`, `bundle-audit` (installed with `gem` if missing) | advisory database refreshed once, `bundle lock` if there is no lockfile, then `bundle-audit check` | `bundle lock --update` rewrites `Gemfile.lock` (no gems installed) | Bundler >= 2.6.0; serial below |
 | `go` | `go`, `govulncheck`, optional `gosec` | `go list -m -u all` (outdated count), `govulncheck` (reachable code, falling back to `-scan module` when the package does not build) | `go get -u ./...` and `go mod tidy` | yes |
 | `rust` | `cargo`, `cargo-audit` | `cargo generate-lockfile` if needed, then `cargo audit` | `cargo update` rewrites `Cargo.lock` | yes |
-| `dotnet` | `dotnet`, `dotnet-outdated` | `dotnet restore`, `dotnet list package --vulnerable --include-transitive` (a solution owns the projects it references, so they are audited once) | `dotnet-outdated -u:Auto` rewrites project files | always serial |
+| `dotnet` | `dotnet`, `dotnet-outdated` | `dotnet restore`, `dotnet list package --vulnerable --include-transitive` (a solution owns the projects it references, so they are audited once) | `dotnet-outdated -u:Auto` rewrites project files; packages still listed as vulnerable are moved with `dotnet add package --version` (newest release, major line kept unless `--allow-major`; transitive ones get a direct PackageReference) and the audit reruns | always serial |
 | `dart` | `dart` | `dart pub outdated` (informational, no advisory database) | `dart pub upgrade`, with `--major-versions` only under `--allow-major` | always serial |
 | `elixir` | `mix` (Hex set up once with `mix local.hex --force`) | `mix deps.get`, then `mix hex.audit` (retired packages) | `mix deps.update --all`, then `mix hex.audit` | always serial |
 | `swift` | `swift` | `swift package show-dependencies` (informational) | `swift package update` | always serial |
@@ -661,7 +661,7 @@ config file turned it off.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--max-issues N` | 300 | Maximum open issues to read (`0` = unlimited) |
+| `--max-issues N` | 0 | Maximum open issues to read, newest first (`0` = all; read 100 per GraphQL page, about a minute for 6,000 issues) |
 | `--no-github` | | Skip every GitHub step |
 | `--no-merge-prs` | | Skip dependency-bot PR triage: no merges, auto-merges or rebase requests |
 | `--no-auto-fix` | | Record vulnerabilities but never edit manifests |
@@ -796,8 +796,10 @@ so that a renamed repository resolves to its current name.
   `security_events` scope).
 - *Repository security advisories*: published, draft and triage advisories. A
   404 counts as none.
-- *Security issues*: up to `--max-issues` open issues (a WARN says when the
-  listing stopped there; the rest are read as earlier ones close). Their bodies become
+- *Security issues*: every open issue by default, newest first, read 100 at a
+  time through GraphQL (a failed page is retried on its own with a smaller page,
+  and a rate limit waits for the reset). `--max-issues N` stops after N (a WARN
+  says so; the rest are read as earlier ones close). Their bodies become
   manifest edits, so only issues opened by a GitHub App bot whose login starts
   with `mend`, `whitesource`, `snyk`, `renovate` or `dependabot` (optionally
   prefixed `app/`) are read; anything a person could have written is ignored.
@@ -1060,8 +1062,8 @@ repository's manifest paths and issue numbers, and what was applied there.
   the run are untouched.
 - After a complete listing, a `pending` Dependabot record whose alert is no
   longer open, and a `pending` issue record none of whose issues is still open,
-  become `resolved` with a note. Issue records are only retired when fewer than
-  `--max-issues` issues were listed, so a truncated listing retires nothing.
+  become `resolved` with a note. Issue records are only retired when every open
+  issue was listed, so a listing cut short by `--max-issues` retires nothing.
 - Writes are atomic (a temp file in the same directory, renamed over the
   original) and the file is mode 0600. A corrupt file is reported and treated
   as an empty database, which the next save replaces.
@@ -1254,9 +1256,11 @@ in-process.
 - **State stays outside the tree**, a symlinked TARGET is refused, `--subdir`
   cannot escape the target, and only clones the tool made itself are ever reset.
 - **Publishing is opt-in and contained.** Nothing is committed or pushed
-  without `--push`, `--pr` or `--push-direct` on the command line, only a tree
-  that was clean at the start is committed, and the config file cannot enable
-  any of it.
+  without `--push`, `--pr` or `--push-direct` on the command line, only the
+  paths the run changed that were clean before it are committed (whatever was
+  already uncommitted stays out of the commit and in the tree, and a file that
+  was dirty and that the run changed too is left out with a warning), and the
+  config file cannot enable any of it.
 - **Secrets.** `-D...key/token/password/secret=` arguments and URL credentials
   are masked in printed commands; the NVD key is passed through the
   environment.
@@ -1293,8 +1297,9 @@ lockfile to audit, or a Gradle/sbt plugin that is not applied. Install the tool
 the config file.
 
 **Nothing was pushed.** The publishing options only act in update mode, on a
-TARGET that is the top of a git work tree, when that tree was clean before the
-run and the run changed something; the run prints which of these stopped it.
+TARGET that is the top of a git work tree, when the run changed something in
+a path that was clean before it; the run prints which of these stopped it, and
+names the paths it left out because they were already uncommitted.
 `--push-direct` also needs a checked-out branch rather than a detached HEAD.
 
 **Directories that cannot be deleted** after a run was killed with SIGKILL:

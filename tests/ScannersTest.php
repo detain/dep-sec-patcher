@@ -134,10 +134,10 @@ class ScannersTest extends TestCase
 
         $t = (new MavenAuditor())->audit($this->context($root, $args), '');
         $this->assertSame(TargetResult::PASS, $t->status, $t->detail);
-        $goals = array_values(array_filter(file($log, FILE_IGNORE_NEW_LINES) ?: [], static fn (string $c): bool => str_contains($c, 'versions:')));
+        $goals = array_values(array_filter(file($log, FILE_IGNORE_NEW_LINES) ?: [], static fn (string $c): bool => str_contains($c, 'versions-maven-plugin:')));
         $this->assertCount(2, $goals);
-        $this->assertStringContainsString('versions:use-latest-releases', $goals[0]);
-        $this->assertStringContainsString('versions:update-properties', $goals[1], 'versions declared through ${...} properties');
+        $this->assertStringContainsString(MavenAuditor::VERSIONS_PLUGIN . ':use-latest-releases', $goals[0], 'a plugin version that honours the ignore rule');
+        $this->assertStringContainsString(MavenAuditor::VERSIONS_PLUGIN . ':update-properties', $goals[1], 'versions declared through ${...} properties');
         foreach ($goals as $goal) {
             $this->assertSame($capped, str_contains($goal, '-DallowMajorUpdates=false'));
             $this->assertStringContainsString('-Dmaven.version.ignore=' . MavenAuditor::PRERELEASES, $goal);
@@ -195,14 +195,116 @@ class ScannersTest extends TestCase
 
     public function testTheMavenUpdaterPassesOverPrereleasesOnly(): void
     {
-        // The plugin takes the pattern as a Java regex; this one reads the same in PCRE
+        // The plugin takes the pattern as a Java regex and matches the whole
+        // version; this one reads the same in PCRE
         $rx = '/' . str_replace('/', '\/', MavenAuditor::PRERELEASES) . '/';
-        foreach (['7.1.0-M2', '4.0.0.Beta8', '3.0-rc5', '1.0.0-alpha.1', '9.0.0-ea+13', '2.0.0.CR1', '1.0-SNAPSHOT', '5.0.0-preview.2'] as $v) {
+        foreach (['7.1.0-M2', '5.0.0.Alpha2', '4.0.0.Beta8', '3.0-rc5', '1.0.0-alpha.1', '9.0.0-ea+13', '2.0.0.CR1', '1.0-SNAPSHOT', '5.0.0-preview.2'] as $v) {
             $this->assertSame(1, preg_match($rx, $v), "{$v} is a prerelease");
         }
-        foreach (['4.1.42.Final', '28.2-android', '33.7.2-jre', '5.1.17.RELEASE', '2.9.10.4', '1.2.3', '1.0.0-GA', '2.12.7.1'] as $v) {
+        foreach (['4.1.42.Final', '28.2-android', '33.7.2-jre', '5.1.17.RELEASE', '2.9.10.4', '1.2.3', '1.0.0-GA', '2.12.7.1', '2.22'] as $v) {
             $this->assertSame(0, preg_match($rx, $v), "{$v} is a release");
         }
+        // ...and agrees with the auto-fix's own prerelease test
+        foreach (VersionTest::prereleaseProvider() as $name => [$v, $pre]) {
+            $this->assertSame($pre, preg_match($rx, $v) === 1, "{$name}: {$v}");
+        }
+    }
+
+    /**
+     * A stand-in mvn: versions:update-properties sets ${jackson-version} to
+     * 2.22, and dependency:resolve fails while the pom holds it (and, when
+     * $broken, before it too), first with a failure Maven cached.
+     */
+    private function fakeMaven(bool $broken = false): string
+    {
+        $bin = $this->scratchDir('bin');
+        $log = $bin . '/calls.log';
+        $old = $broken ? 'true' : 'false';
+        file_put_contents($bin . '/mvn', <<<SH
+            #!/bin/sh
+            echo "\$*" >> '{$log}'
+            for a in "\$@"; do
+              case "\$a" in -Dodc.outputDirectory=*) echo '{"dependencies": []}' > "\${a#*=}/dependency-check-report.json" ;; esac
+            done
+            case " \$* " in
+              *":update-properties "*) sed -i 's#<jackson-version>2.9.5<#<jackson-version>2.22<#; s#<module-version>1<#<module-version>2<#' pom.xml mod/pom.xml 2>/dev/null; true ;;
+              *" dependency:resolve "*)
+                if {$old}; then echo '[ERROR] dependency: com.android.volley:volley:jar:1.2.1 (compile)'; fail=1; fi
+                if grep -q '2.22<' pom.xml; then
+                  echo '[ERROR] Failed to execute goal on project p: Could not resolve dependencies for project g:p:jar:1.0.0'
+                  echo '[ERROR] dependency: com.fasterxml.jackson.jaxrs:jackson-jaxrs-json-provider:jar:2.22 (compile)'
+                  case " \$* " in
+                    *" -U "*) echo '[ERROR]   Could not find artifact com.fasterxml.jackson.jaxrs:jackson-jaxrs-json-provider:jar:2.22 in central (https://repo.maven.apache.org/maven2)' ;;
+                    *) echo '[ERROR]   com.fasterxml.jackson.jaxrs:jackson-jaxrs-json-provider:jar:2.22 was not found in https://repo.maven.apache.org/maven2 during a previous attempt. This failure was cached in the local repository' ;;
+                  esac
+                  fail=1
+                fi
+                exit \${fail:-0} ;;
+            esac
+            SH);
+        chmod($bin . '/mvn', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        return $log;
+    }
+
+    private const JACKSON_POM = "<project>\n  <modules><module>mod</module></modules>\n  <properties>\n    <jackson-version>2.9.5</jackson-version>\n  </properties>\n</project>\n";
+
+    public function testAMavenUpdateThatNoLongerResolvesIsRevertedWithAWarning(): void
+    {
+        $log  = $this->fakeMaven();
+        $root = $this->scratchDir('java');
+        file_put_contents($root . '/pom.xml', self::JACKSON_POM);
+        mkdir($root . '/mod');
+        file_put_contents($root . '/mod/pom.xml', '<project><properties><module-version>1</module-version></properties></project>');
+
+        $t = (new MavenAuditor())->audit($this->context($root, ['--update']), '');
+        $this->assertSame(self::JACKSON_POM, file_get_contents($root . '/pom.xml'), 'back to the pre-update content');
+        $this->assertStringContainsString('<module-version>1<', (string)file_get_contents($root . '/mod/pom.xml'), 'module poms too');
+        $this->assertSame(TargetResult::WARN, $t->status, $t->detail);
+        $this->assertSame([
+            'WARN: the version update left pom.xml unresolvable (com.fasterxml.jackson.jaxrs:jackson-jaxrs-json-provider:jar:2.22);'
+                . ' reverted 2 poms to the pre-update content, leaving the per-artifact fixes to auto-fix',
+        ], $t->notes);
+        $resolves = array_values(array_filter(file($log, FILE_IGNORE_NEW_LINES) ?: [], static fn (string $c): bool => str_contains($c, 'dependency:resolve')));
+        $this->assertCount(3, $resolves, 'after the update, once more with -U for the cached failure, then the restored pom');
+        $this->assertStringContainsString(' -U dependency:resolve', $resolves[1]);
+        $this->assertStringNotContainsString(' -U ', $resolves[2], 'the restored pom resolved at once');
+    }
+
+    public function testAnUpdateToAPomThatAlreadyFailedToResolveIsKeptWhenItAddsNoFailure(): void
+    {
+        $this->fakeMaven(true);
+        $root = $this->scratchDir('java');
+        $pom = "<project>\n  <properties>\n    <module-version>1</module-version>\n  </properties>\n</project>\n";
+        file_put_contents($root . '/pom.xml', $pom);
+        $t = (new MavenAuditor())->audit($this->context($root, ['--update']), '');
+        $this->assertSame(str_replace('>1<', '>2<', $pom), file_get_contents($root . '/pom.xml'), 'the volley failure was there before');
+        $this->assertSame(['pom.xml did not resolve before the version update either (com.android.volley:volley:jar:1.2.1);'
+            . ' kept the update, which adds no unresolved artifact'], $t->notes);
+        $this->assertSame(TargetResult::PASS, $t->status);
+
+        // An update that does break it on top of the volley failure is reverted
+        file_put_contents($root . '/pom.xml', self::JACKSON_POM);
+        $t = (new MavenAuditor())->audit($this->context($root, ['--update']), '');
+        $this->assertSame(self::JACKSON_POM, file_get_contents($root . '/pom.xml'));
+        $this->assertStringContainsString('unresolvable (com.fasterxml.jackson.jaxrs:jackson-jaxrs-json-provider:jar:2.22)', $t->notes[0]);
+    }
+
+    public function testMissingArtifactsAreReadFromMavenOutput(): void
+    {
+        $out = "[ERROR] Failed to execute goal on project swagger-jaxrs-server: Could not resolve dependencies for project io.swagger:swagger-jaxrs-server:jar:1.0.0\n"
+            . "[ERROR] dependency: com.fasterxml.jackson.datatype:jackson-datatype-joda:jar:2.22 (compile)\n"
+            . "[ERROR] \tcom.fasterxml.jackson.datatype:jackson-datatype-joda:jar:2.22 was not found in https://repo.maven.apache.org/maven2 during a previous attempt.\n"
+            . "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-dependency-plugin:3.7.0:resolve (default-cli) on project x\n"
+            . "[ERROR]     Non-resolvable parent POM for org.openapitools:openapi-micronaut-client:1.0.0: The following artifacts could not be resolved:"
+            . " io.micronaut:micronaut-parent:pom:4.4.0 (absent): Could not find artifact io.micronaut:micronaut-parent:pom:4.4.0 in central\n"
+            . "[INFO] Downloaded com.example:other:jar:1.0\n";
+        $this->assertSame(
+            ['com.fasterxml.jackson.datatype:jackson-datatype-joda:jar:2.22', 'io.micronaut:micronaut-parent:pom:4.4.0'],
+            MavenAuditor::missingArtifacts($out)
+        );
+        $this->assertTrue(MavenAuditor::cachedFailure($out));
+        $this->assertFalse(MavenAuditor::cachedFailure('[ERROR] Could not find artifact a:b:jar:1 in central'));
     }
 
     /**
@@ -249,6 +351,65 @@ class ScannersTest extends TestCase
             NodeAuditor::auditFixNote(new CommandResult('npm audit fix', 1, false, $report, $report, 1.0))
         );
         $this->assertSame('npm audit fix exit 1', NodeAuditor::auditFixNote(new CommandResult('npm audit fix', 1, false, '', 'npm error code E403', 1.0)));
+
+        // With --allow-major, --force was passed already; and "braces  *"
+        // has no fix whatever older parent npm suggests
+        $forced = "# npm audit report\n\nbraces  *\nSeverity: high\nfix available via `npm audit fix --force`\n"
+            . "Will install flow-copy-source@2.0.9, which is a breaking change\nnode_modules/braces\n\n"
+            . "form-data  4.0.0 - 4.0.5\nSeverity: high\nfix available via `npm audit fix --force`\nWill install zapier-platform-core@10.2.0, which is a breaking change\n"
+            . "node_modules/zapier-platform-core/node_modules/form-data\n  zapier-platform-core  9.6.0 - 9.7.3 || >=11.0.0\n  Depends on vulnerable versions of form-data\n\n"
+            . "diff  5.0.0 - 5.2.1\njsdiff has a Denial of Service vulnerability\nfix available via `npm audit fix`\nnode_modules/diff\n\n"
+            . "3 vulnerabilities (3 high)\n";
+        $this->assertSame(
+            'npm audit fix left 1 not fixed even with --force, 1 it could not resolve, 1 has no fix available',
+            NodeAuditor::auditFixNote(new CommandResult('npm audit fix', 1, false, $forced, $forced, 1.0), true)
+        );
+    }
+
+    /**
+     * An override naming a version npm never published (an unscoped
+     * json-schema-ref-parser given @apidevtools' 15.3.6) is dropped so the
+     * install runs, and what audit fix leaves is pinned with overrides.
+     */
+    public function testNpmDropsAnUnpublishedOverrideAndPinsWhatAuditFixLeft(): void
+    {
+        $bin = $this->scratchDir('bin');
+        $log = $bin . '/calls.log';
+        file_put_contents($bin . '/npm', <<<SH
+            #!/bin/sh
+            echo "\$*" >> '{$log}'
+            case " \$* " in
+              *" install "*)
+                if grep -q '"json-schema-ref-parser"' package.json; then
+                  echo 'npm error code ETARGET' >&2
+                  echo 'npm error notarget No matching version found for json-schema-ref-parser@^15.3.6.' >&2
+                  exit 1
+                fi
+                if grep -q '"form-data@4"' package.json; then
+                  echo '{"packages": {"": {}, "node_modules/form-data": {"version": "4.0.6"}, "node_modules/zapier-platform-core/node_modules/form-data": {"version": "4.0.6"}}}' > package-lock.json
+                fi ;;
+              *" audit fix "*) exit 1 ;;
+              *" audit --json "*)
+                if grep -q '"form-data@4"' package.json; then echo '{"metadata": {"vulnerabilities": {"high": 0}}}'; exit 0; fi
+                echo '{"vulnerabilities": {"form-data": {"via": [{"range": "4.0.0 - 4.0.5"}]}}, "metadata": {"vulnerabilities": {"high": 1}}}'
+                exit 1 ;;
+              *" view form-data versions "*) echo '["4.0.5", "4.0.6"]' ;;
+            esac
+            SH);
+        chmod($bin . '/npm', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $root = $this->scratchDir('js');
+        file_put_contents($root . '/package.json', "{\n  \"dependencies\": {\n    \"form-data\": \"^4.0.6\"\n  },\n  \"overrides\": {\n"
+            . "    \"@apidevtools/json-schema-ref-parser\": \"^15.3.6\",\n    \"json-schema-ref-parser\": \"^15.3.6\"\n  }\n}\n");
+        file_put_contents($root . '/package-lock.json', '{"packages": {"": {}, "node_modules/form-data": {"version": "4.0.6"},'
+            . ' "node_modules/zapier-platform-core/node_modules/form-data": {"version": "4.0.5"}}}');
+
+        $t = (new NodeAuditor())->audit($this->context($root, ['--update', '--allow-major']), '');
+        $this->assertSame(TargetResult::PASS, $t->status, $t->detail . implode("\n", $t->notes));
+        $this->assertContains('removed overrides.json-schema-ref-parser ^15.3.6 from package.json: npm has no matching version of json-schema-ref-parser', $t->notes);
+        $this->assertContains('npm overrides for what npm audit fix left: form-data@4 ^4.0.6', $t->notes);
+        $doc = json_decode((string)file_get_contents($root . '/package.json'), true);
+        $this->assertSame(['@apidevtools/json-schema-ref-parser' => '^15.3.6', 'form-data@4' => '^4.0.6'], $doc['overrides'], 'the scoped package is a different one');
     }
 
     /**

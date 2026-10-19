@@ -19,11 +19,24 @@ class ApplicationTest extends TestCase
     use Fixtures;
 
     private string $xdg;
+    /** Versions the stub npm's `npm view` answers with, one <name>.json per package. */
+    private string $registry;
+    private string $bin;
 
     protected function setUp(): void
     {
         $this->hermeticGit();
-        $this->xdg = $this->scratchDir('xdg');
+        $this->xdg      = $this->scratchDir('xdg');
+        $this->registry = $this->scratchDir('registry');
+        // `npm view` asks the registry; answer from fixtures instead, and
+        // say nothing (unknown) for a package without one
+        $this->bin = $this->scratchDir('npm-bin');
+        $real      = trim((string)shell_exec('command -v npm 2>/dev/null'));
+        file_put_contents($this->bin . '/npm', "#!/bin/sh\nif [ \"\$1\" = view ]; then\n"
+            . "  f=\"\$DSP_TEST_REGISTRY/\$(printf %s \"\$2\" | tr / _).json\"\n"
+            . "  if [ -f \"\$f\" ]; then cat \"\$f\"; exit 0; fi\n  exit 1\nfi\n"
+            . ($real !== '' ? 'exec ' . escapeshellarg($real) . " \"\$@\"\n" : "exit 127\n"));
+        chmod($this->bin . '/npm', 0755);
     }
 
     protected function tearDown(): void
@@ -38,7 +51,8 @@ class ApplicationTest extends TestCase
      */
     private function cli(array $args, string $cwd, array $env = []): array
     {
-        $env  = array_merge(getenv(), ['XDG_STATE_HOME' => $this->xdg, 'NVD_API_KEY' => '', 'GH_TOKEN' => ''], $env);
+        $env  = array_merge(getenv(), ['XDG_STATE_HOME' => $this->xdg, 'NVD_API_KEY' => '', 'GH_TOKEN' => '',
+            'DSP_TEST_REGISTRY' => $this->registry, 'PATH' => $this->bin . ':' . getenv('PATH')], $env);
         // sh merges stderr into stdout, so errors and output arrive in order
         $cmd  = array_merge(['sh', '-c', 'exec "$0" "$@" 2>&1', PHP_BINARY, dirname(__DIR__) . '/bin/dep-sec-patcher'], $args);
         $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w']], $pipes, $cwd, $env);
@@ -324,15 +338,22 @@ class ApplicationTest extends TestCase
         $this->assertSame('applied', VulnDb::load($db)['vulns']['web/package.json|qs|CVE-1']['state']);
     }
 
-    public function testPushRefusesATreeThatWasDirty(): void
+    public function testPushLeavesWhatWasUncommittedBeforeTheRunOutOfTheCommit(): void
     {
-        $remote = $this->makeRemote(['web/package.json' => "{\"dependencies\": {\"qs\": \"^6.11.0\"}}\n"]);
+        $remote = $this->makeRemote(['web/package.json' => "{\n  \"dependencies\": {\n    \"qs\": \"^6.11.0\"\n  }\n}\n"]);
         file_put_contents($remote['work'] . '/notes.txt', 'uncommitted work');
         $db = $this->scratchDir('db') . '/vulns.json';
-        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--push', '--vuln-db', $db, $remote['work']], '/');
+        VulnDb::save($db, VulnDb::upsert(VulnDb::empty(), [[
+            'key' => 'web/package.json|qs|CVE-1', 'source' => 'dependabot', 'id' => 'CVE-1', 'ref' => 1, 'refs' => [1],
+            'ecosystem' => 'npm', 'package' => 'qs', 'manifest' => 'web/package.json',
+            'fixed_version' => '6.15.2', 'fix_versions' => ['6.15.2'],
+        ]], '2026-01-01T00:00:00Z', ''));
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--push-direct', '--vuln-db', $db, $remote['work']], '/');
         $this->assertSame(0, $rc, $out);
-        $this->assertStringContainsString('push: the working tree had uncommitted changes before the run', $out);
-        $this->assertSame('', $this->git($remote['bare'], ['branch', '--list', 'dep-sec-patcher/*']));
+        $this->assertStringContainsString('leaving 1 path(s) that were already uncommitted before the run alone, uncommitted: notes.txt', $out);
+        $this->assertStringContainsString('pushed the changes straight to main on origin', $out);
+        $this->assertSame('web/package.json', $this->git($remote['bare'], ['show', '--name-only', '--format=', 'main']));
+        $this->assertSame('?? notes.txt', $this->git($remote['work'], ['status', '--porcelain']));
     }
 
     public function testPushDirectCommitsOntoTheDefaultBranch(): void
@@ -460,7 +481,7 @@ class ApplicationTest extends TestCase
         $this->assertStringContainsString('<version>6.2.19</version>', (string)file_get_contents($dir . '/pom.xml'), 'the lowest major that fixes it');
     }
 
-    public function testAPrereleaseAboveEveryFixIsLeftForAPerson(): void
+    public function testAMavenPrereleaseAboveEveryFixMovesToTheNewestReleaseWithTheFix(): void
     {
         $dir = $this->scratchDir('prerelease');
         $pom = "<project>\n  <dependencies>\n    <dependency>\n      <groupId>io.netty</groupId>\n      <artifactId>netty-codec-http</artifactId>\n"
@@ -474,18 +495,43 @@ class ApplicationTest extends TestCase
             $record('io.netty:netty-codec-http', ['4.1.137.Final', '4.2.17.Final'], []),
             $record('org.springframework:spring-webmvc', ['6.2.19', '7.0.8'], ['7.1.0-M2']),
         ]);
+        // No --allow-major: leaving a prerelease for a release is no major upgrade
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $written = (string)file_get_contents($dir . '/pom.xml');
+        $this->assertStringContainsString('<version>4.2.17.Final</version>', $written, 'no 5.x release exists: the newest fix');
+        $this->assertStringNotContainsString('5.0.0.Alpha2', $written);
+        $this->assertMatchesRegularExpression('#<artifactId>spring-webmvc</artifactId>\s*<version>7\.0\.8</version>#', $written, 'the fix on its own 7.x line');
+        $this->assertStringContainsString('netty-codec-http is on prerelease 5.0.0.Alpha2 in pom.xml, above every fix; moving it to release 4.2.17.Final', $out);
+        $this->assertStringNotContainsString('by hand', $out);
+        $this->assertStringNotContainsString('needs a major upgrade', $out);
+        $vulns = VulnDb::load($db)['vulns'];
+        $this->assertSame('applied', $vulns['pom.xml|io.netty:netty-codec-http|CVE-1']['state']);
+        $this->assertSame('applied', $vulns['pom.xml|org.springframework:spring-webmvc|CVE-1']['state']);
+    }
+
+    public function testAnNpmVersionTheRegistryDoesNotPublishIsNeverWritten(): void
+    {
+        // Mend reported @apidevtools/json-schema-ref-parser by its tarball
+        // name; the unscoped package stops at 9.0.9, so an override of it to
+        // ^15.3.6 broke every npm install of the project
+        $dir = $this->scratchDir('unpublished');
+        file_put_contents($dir . '/package.json', "{\n  \"dependencies\": {\n    \"oas3-tools\": \"^2.2.3\"\n  }\n}\n");
+        file_put_contents($this->registry . '/json-schema-ref-parser.json', '["9.0.8", "9.0.9"]');
+        file_put_contents($this->registry . '/@apidevtools_json-schema-ref-parser.json', '["9.0.9", "15.3.5", "15.3.6"]');
+        $record = static fn (string $pkg): array => [
+            'key' => "package.json|{$pkg}|CVE-2026-15195", 'source' => 'issue', 'id' => 'CVE-2026-15195', 'ecosystem' => 'npm',
+            'package' => $pkg, 'manifest' => 'package.json', 'fixed_version' => '15.3.6', 'fix_versions' => ['15.3.6'], 'installed' => ['9.0.9'],
+        ];
+        $db = $this->storedDb([$record('json-schema-ref-parser'), $record('@apidevtools/json-schema-ref-parser')]);
         [$rc, $out] = $this->cli(['--update', '--apply-stored', '--allow-major', '--vuln-db', $db, $dir], '/');
         $this->assertSame(0, $rc, $out);
-        $this->assertSame($pom, (string)file_get_contents($dir . '/pom.xml'), 'not moved back to a release, nor pinned at the prerelease');
-        $this->assertStringContainsString('maven io.netty:netty-codec-http is on prerelease 5.0.0.Alpha2 in pom.xml, above every fix', $out);
-        $this->assertStringNotContainsString('already-ok=1', $out);
+        $this->assertStringContainsString('json-schema-ref-parser@15.3.6 is not published on the npm registry', $out);
+        $doc = json_decode((string)file_get_contents($dir . '/package.json'), true);
+        $this->assertSame(['@apidevtools/json-schema-ref-parser' => '^15.3.6'], $doc['overrides'], 'names compared exactly, scope included');
         $vulns = VulnDb::load($db)['vulns'];
-        $netty = $vulns['pom.xml|io.netty:netty-codec-http|CVE-1'];
-        $this->assertSame('pending', $netty['state']);
-        $this->assertStringContainsString('declared as prerelease 5.0.0.Alpha2 in pom.xml, which sorts above every fix (4.1.137.Final, 4.2.17.Final)', $netty['note']);
-        $spring = $vulns['pom.xml|org.springframework:spring-webmvc|CVE-1'];
-        $this->assertSame('pending', $spring['state']);
-        $this->assertStringContainsString('found in use at prerelease 7.1.0-M2', $spring['note']);
+        $this->assertSame('skipped', $vulns['package.json|json-schema-ref-parser|CVE-2026-15195']['state']);
+        $this->assertSame('applied', $vulns['package.json|@apidevtools/json-schema-ref-parser|CVE-2026-15195']['state']);
     }
 
     public function testCheckModeSuggestsTheCommandThatAppliesTheFixes(): void

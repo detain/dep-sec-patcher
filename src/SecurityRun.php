@@ -30,7 +30,7 @@ final class SecurityRun
 {
     private const STATUS_RANK = ['SKIP' => 0, 'PASS' => 1, 'WARN' => 2, 'FAIL' => 3];
 
-    /** @var array<string, array{status: string, vulns: int, outdated: int}> */
+    /** @var array<string, array{status: string, vulns: int, outdated: int, note: string}> */
     private array $summary = [];
     private string $now;
     private ?GitHub $gh = null;
@@ -38,6 +38,8 @@ final class SecurityRun
     private string $root;
     /** @var list<string> manifest edits made by auto-fix, for the commit message */
     private array $appliedFixes = [];
+    /** @var array<string, list<string>|null> npm registry versions per package, asked once per run */
+    private array $npmVersions = [];
     /** Whether this run's changes reached the base branch on origin; null when not pushing. */
     private ?bool $landed = null;
     /** Whether the git tree was clean before the run; null outside a work tree. */
@@ -47,6 +49,8 @@ final class SecurityRun
     private int $needsMajor = 0;
     private int $mergeablePrs = 0;
     private int $wouldClose = 0;
+    /** @var list<int>|null every open issue's number, when the collection read them all */
+    private ?array $openIssueNumbers = null;
     private int $openIssueRecords = 0;
 
     public function __construct(
@@ -58,6 +62,8 @@ final class SecurityRun
         private string $configFile = '',
         /** @var list<string> the command line, program first, for suggesting the next one */
         private array $argv = [],
+        /** Where OSV answers are cached between runs; '' keeps them for this run only */
+        private string $advisoryCache = '',
     ) {
         $this->now  = gmdate('Y-m-d\TH:i:s\Z');
         $this->root = $target->root;
@@ -99,12 +105,18 @@ final class SecurityRun
         $cleanAtStart = null;
         $startBranch  = '';
         if ($this->opt->mode === 'update') {
-            $this->cleanAtStart = (new BranchPublisher($runner, $c, $this->root))->isClean();
-        }
-        if ($this->opt->push && $this->opt->mode === 'update') {
-            $publisher    = new BranchPublisher($runner, $c, $this->root, $this->opt->timeout > 0 ? $this->opt->timeout : 600);
-            $cleanAtStart = $this->cleanAtStart;
-            $startBranch  = $cleanAtStart === null ? '' : $publisher->currentBranch();
+            // What is uncommitted now stays out of the commit --push makes
+            $snapshotter = new BranchPublisher($runner, $c, $this->root, $this->opt->timeout > 0 ? $this->opt->timeout : 600);
+            $before      = $snapshotter->snapshot();
+            $this->cleanAtStart = $before === null ? null : $before === [];
+            if ($this->opt->push) {
+                $publisher    = $snapshotter;
+                $cleanAtStart = $this->cleanAtStart;
+                $startBranch  = $cleanAtStart === null ? '' : $publisher->currentBranch();
+                if ($before !== null && $before !== []) {
+                    $c->info('push: ' . count($before) . ' path(s) were already uncommitted before the run; they are left out of the commit');
+                }
+            }
         }
 
         // Authenticate gh once up front so every GitHub step shares the result
@@ -117,7 +129,7 @@ final class SecurityRun
         // so this run's updates are made on top of them instead of
         // conflicting with them at push time
         $triaged = false;
-        if ($publisher !== null && $cleanAtStart === true && !$this->opt->applyStored) {
+        if ($publisher !== null && $cleanAtStart !== null && !$this->opt->applyStored) {
             $this->triagePullRequests();
             $triaged = true;
             if ($startBranch !== '') {
@@ -506,20 +518,36 @@ final class SecurityRun
             $this->record('advisories', 'PASS');
         }
 
-        $limit  = $this->opt->maxIssues === 0 ? 100000 : $this->opt->maxIssues;
-        $issues = $this->gh()->openIssues($repo, $limit, 'number,title,body,author,url');
+        $limit    = $this->opt->maxIssues;
+        $complete = false;
+        $issues   = $this->gh()->openIssues($repo, $limit, true, $complete);
         $issueRecords = $botIssues = [];
         if ($issues === null) {
             $c->warn("Could not list issues for {$repo}");
             $this->record('sec-issues', 'SKIP');
         } else {
-            if (count($issues) >= $limit) {
+            if (!$complete) {
                 // Records for the rest arrive as earlier issues are closed
-                $c->warn("Security issues: only the first {$limit} open issues were read (--max-issues; 0 reads them all)");
+                $c->warn("Security issues: only the newest {$limit} open issues were read (--max-issues; 0 reads them all)");
+            } else {
+                // close-fixed needs the same list; a complete one saves reading it twice
+                $this->openIssueNumbers = array_map(static fn (array $i): int => (int)$i['number'], $issues);
             }
             // Issue bodies become manifest edits, so only a security bot's count
             $botIssues    = array_values(array_filter($issues, static fn ($i) => self::isBot($i['author'] ?? null)));
-            $issueRecords = IssueParser::parse($botIssues);
+            // An issue whose fixes are all on another major line, or that lists
+            // none, is completed from OSV; one that names no dependency file
+            // (an sbt scan) is placed by the build.sbt declaring its library
+            $osv          = new AdvisoryLookup($this->advisoryCache, null, $c);
+            $sbt          = new SbtLocator($this->ctx->files->files(), function (string $rel): ?string {
+                $abs = $this->insideRoot($rel);
+                return $abs === null ? null : (string)@file_get_contents($abs);
+            });
+            $issueRecords = IssueParser::parse($botIssues, $osv->asCallable(), $sbt);
+            $fromOsv = count(array_filter($issueRecords, static fn (array $r): bool => ($r['fix_source'] ?? '') === 'osv'));
+            if ($fromOsv > 0) {
+                $c->info("Security issues: {$fromOsv} records took their fix from OSV");
+            }
             if ($issueRecords !== []) {
                 $refs = count(array_unique(array_map(static fn ($r) => $r['ref'], $issueRecords)));
                 $c->info("Security issues: {$refs} issues -> " . count($issueRecords) . ' remediation records');
@@ -546,7 +574,7 @@ final class SecurityRun
         if ($alerts !== null) {
             $db = VulnDb::retire($db, 'dependabot', array_fill_keys(array_column($alertRecords, 'key'), true), $this->now);
         }
-        if ($issues !== null && count($issues) < $limit) {
+        if ($issues !== null && $complete) {
             $open = array_fill_keys(array_map('intval', array_column($issues, 'number')), true);
             $db   = VulnDb::retire($db, 'issue', array_fill_keys(array_column($issueRecords, 'key'), true), $this->now, $open);
         }
@@ -877,13 +905,22 @@ final class SecurityRun
         // say what update mode would do
         $write = $this->opt->mode === 'update';
         $c->info($write
-            ? "auto-fix: applying {$pending} pending fix(es) from {$this->vulnDb}{$scopeNote}"
-            : "auto-fix: {$pending} pending fix(es); check mode only works out what update mode would change{$scopeNote}");
+            ? "auto-fix: applying {$pending} pending record(s) as " . count($plan) . " manifest/package fix(es) from {$this->vulnDb}{$scopeNote}"
+            : "auto-fix: {$pending} pending record(s) as " . count($plan) . " manifest/package fix(es); check mode only works out what update mode would change{$scopeNote}");
 
         $lister  = $this->dirLister();
         $updates = [];
-        $applied = $missing = $notDeclared = $satisfied = $unsupported = $major = 0;
+        $applied = $missing = $notDeclared = $satisfied = $unsupported = $major = $edits = $majorRows = 0;
+        $unplanned = FixPlanner::unplanned($db);
+        $outside   = array_sum(array_map(static fn (array $row): int => count($row['keys']), $plan)) - array_sum(array_map(static fn (array $row): int => count($row['keys']), $inScope));
+        // Pending but not fixable here: no fix released yet, nothing to edit,
+        // or (with --subdir) a manifest elsewhere
+        $rest = ' no-fix-yet=' . $unplanned['no-fix']
+            . ($unplanned['unplaceable'] > 0 ? " unplaceable={$unplanned['unplaceable']}" : '')
+            . ($this->target->subdir !== '' ? " outside-subdir={$outside}" : '');
         foreach ($inScope as $row) {
+            // Tallied in records, so the buckets add up to what is pending
+            $n      = count($row['keys']);
             $target = ManifestPaths::sourceManifestFor($row['manifest'], $lister);
             $via    = $target !== $row['manifest'] ? ' (via ' . basename($row['manifest']) . ')' : '';
             $abs    = $this->insideRoot($target);
@@ -893,7 +930,7 @@ final class SecurityRun
             $state  = 'pending';
 
             if ($abs === null) {
-                $missing++;
+                $missing += $n;
                 [$state, $note] = ['skipped', "manifest not found: {$target}"];
             } else {
                 $content  = (string)file_get_contents($abs);
@@ -923,37 +960,53 @@ final class SecurityRun
                 } else {
                     $ver = Version::chooseTarget($declared, $row['spec'], $pin);
                 }
+                // A Maven prerelease above every fix (netty 5.0.0.Alpha2,
+                // spring 7.1.0-M2, both put there by versions:use-latest-*)
+                // goes back to the newest release with the fix: off a
+                // prerelease, a lower release is no downgrade that matters
+                $release = $ver !== null && $eco === 'maven' ? Version::releaseForPrerelease($current, $row['spec']) : '';
+                if ($release !== '') {
+                    $ver = $pin = $release;
+                    $c->info("  {$eco} {$pkg} is on prerelease {$current} in {$target}, above every fix; moving it to release {$release}");
+                }
 
                 if ($locked === []) {
                     // The lockfile is what gets installed, and it holds no
                     // copy: an override would add a pin that fixes nothing
-                    $notDeclared++;
+                    $notDeclared += $n;
                     [$state, $note] = ['skipped', "{$pkg} is neither declared in {$target} nor in its lockfile"];
                 } elseif ($ver === null) {
-                    $unsupported++;
+                    $unsupported += $n;
                     $note = "{$pkg} is {$where} " . implode(', ', $inUse) . " in several major versions; pin it by hand";
-                } elseif (Version::prereleaseAboveFixes($current, $row['spec'])) {
-                    // No fix is above it, and going back to a release is not
-                    // a bump to make unasked
-                    $unsupported++;
+                } elseif ($release === '' && Version::prereleaseAboveFixes($current, $row['spec'])) {
+                    // No fix is above it, and no single release clears every
+                    // advisory to go back to
+                    $unsupported += $n;
                     $fixes = Version::sortAscending(array_values(array_unique(array_merge(...array_values($row['spec'])))));
                     $note  = "{$pkg} is " . ($inUse !== null ? $where : 'declared as') . " prerelease {$current} in {$target}, which sorts above"
                         . ' every fix (' . implode(', ', $fixes) . ') without being known to include one; move it to a release by hand';
                     $c->warn("  {$eco} {$pkg} is on prerelease {$current} in {$target}, above every fix; move it to a release by hand");
                 } elseif ($ver === '') {
                     // Every advisory for this package is already cleared
-                    $satisfied++;
+                    $satisfied += $n;
                     $state = 'applied';
                     $note  = match (true) {
                         $locked !== null => "already satisfied: the lockfile resolves {$pkg} to " . implode(', ', $locked),
                         $inUse !== null  => "already satisfied: {$pkg} was found in use at " . implode(', ', $inUse),
                         default          => "already satisfied: {$target} declares {$declared}",
                     };
-                } elseif (!$this->opt->allowMajor && Version::floor($current) !== '' && Version::majorLine($current) !== Version::majorLine($ver)) {
+                } elseif ($release === '' && !$this->opt->allowMajor && Version::floor($current) !== '' && Version::majorLine($current) !== Version::majorLine($ver)) {
                     // Left pending: --allow-major on a later run applies it
-                    $major++;
+                    $major += $n;
+                    $majorRows++;
                     $note = "needs a major upgrade: {$pkg} {$current} -> {$ver} in {$target} (rerun with --allow-major)";
                     $c->warn("  {$eco} {$pkg} needs a major upgrade ({$current} -> {$ver}) in {$target}; not applied without --allow-major");
+                } elseif ($eco === 'npm' && ($missingVer = $this->npmUnpublished($pkg, [$ver, $pin], dirname($abs))) !== null) {
+                    // A record naming the wrong package (an unscoped name for
+                    // a scoped one) would break every later npm install
+                    $unsupported += $n;
+                    [$state, $note] = ['skipped', "{$pkg}@{$missingVer} is not published on the npm registry; nothing written to {$target}"];
+                    $c->warn("  {$eco} {$pkg}@{$missingVer} is not published on the npm registry; not written to {$target}");
                 } else {
                     $res = ManifestEditor::apply(
                         $eco,
@@ -966,22 +1019,24 @@ final class SecurityRun
                         is_file(dirname($abs) . '/package-lock.json') || is_file(dirname($abs) . '/npm-shrinkwrap.json')
                     );
                     if ($res['status'] === ManifestEditor::REFUSED) {
-                        $notDeclared++;
+                        $notDeclared += $n;
                         [$state, $note] = ['skipped', "refused: {$ver} would downgrade the version declared in {$target}"];
                     } elseif ($res['status'] === ManifestEditor::UNSUPPORTED) {
-                        $unsupported++;
+                        $unsupported += $n;
                         $note = "cannot edit {$pkg}" . ($declared !== '' ? " (declared as {$declared})" : '') . " in {$target}";
                     } elseif ($res['content'] !== $content && !$write) {
-                        $applied++;
+                        $applied += $n;
+                        $edits++;
                         $note = "would set {$ver} in {$target}";
                         $c->info("  would set {$eco} {$pkg} -> {$ver} in {$target}{$via}");
                     } elseif ($res['content'] !== $content && file_put_contents($abs, $res['content']) !== false) {
-                        $applied++;
+                        $applied += $n;
+                        $edits++;
                         [$state, $note] = ['applied', "set to {$ver} in {$target}"];
                         $c->ok("  {$eco} {$pkg} -> {$ver} in {$target}{$via}");
                         $this->appliedFixes[] = "{$eco} {$pkg} -> {$ver} in {$target}";
                     } else {
-                        $notDeclared++;
+                        $notDeclared += $n;
                         [$state, $note] = ['skipped', "package not declared in {$target}"];
                     }
                 }
@@ -990,25 +1045,50 @@ final class SecurityRun
                 $updates[] = ['key' => $key, 'state' => $state, 'note' => $note];
             }
         }
-        $this->needsMajor = $major;
+        $this->needsMajor = $majorRows;
         if (!$write) {
-            $this->readyFixes = $applied;
-            $c->info("auto-fix (check mode): would-apply={$applied} already-ok={$satisfied} not-declared={$notDeclared}"
-                . " missing-manifest={$missing} cannot-edit={$unsupported} needs-major={$major}. Use --update to apply.");
+            $this->readyFixes = $edits;
+            $c->info("auto-fix (check mode, in records): would-apply={$applied} already-ok={$satisfied} not-declared={$notDeclared}"
+                . " missing-manifest={$missing} cannot-edit={$unsupported} needs-major={$major}{$rest}"
+                . ". {$edits} manifest edit(s); use --update to apply.");
             return;
         }
         $this->saveDb(VulnDb::applyStates($db, $updates, $this->now));
 
-        $c->info("auto-fix: applied={$applied} already-ok={$satisfied} not-declared={$notDeclared} missing-manifest={$missing}"
-            . " cannot-edit={$unsupported} needs-major={$major}");
-        if ($applied > 0) {
-            $this->record('auto-fix', 'PASS', 0, $applied);
+        $c->info("auto-fix (in records): applied={$applied} already-ok={$satisfied} not-declared={$notDeclared} missing-manifest={$missing}"
+            . " cannot-edit={$unsupported} needs-major={$major}{$rest}; {$edits} manifest edit(s)");
+        if ($edits > 0) {
+            $this->record('auto-fix', 'PASS', 0, 0, "{$edits} edit(s)");
             if (!$this->opt->push) {
                 $c->warn("Manifests were modified in {$this->root} — review 'git diff' before committing");
             }
         } else {
             $this->record('auto-fix', 'SKIP');
         }
+    }
+
+    /**
+     * The first of $versions npm does not publish for $pkg, or null when all
+     * are published or the registry cannot be asked (no npm, offline): an
+     * unanswered check never blocks a fix.
+     *
+     * @param list<string> $versions
+     */
+    private function npmUnpublished(string $pkg, array $versions, string $cwd): ?string
+    {
+        if (!ProcessRunner::has('npm')) {
+            return null;
+        }
+        if (!array_key_exists($pkg, $this->npmVersions)) {
+            $this->npmVersions[$pkg] = NodeAuditor::registryVersions($this->ctx->runner, $cwd, $pkg);
+        }
+        $published = $this->npmVersions[$pkg];
+        foreach (array_unique(array_filter($versions, static fn (string $v): bool => $v !== '')) as $v) {
+            if ($published !== null && !in_array($v, $published, true)) {
+                return $v;
+            }
+        }
+        return null;
     }
 
     // ── close-fixed ──────────────────────────────────────────────────────────
@@ -1072,15 +1152,19 @@ final class SecurityRun
         // The database keeps refs forever and most are long closed; only
         // consider issues that are actually open, so a run does not burn the
         // content-creation quota on failures
-        $open = $this->gh()->json(['issue', 'list', '--repo', $repo, '--state', 'open', '--limit', '100000', '--json', 'number'], 900);
-        if (!is_array($open)) {
+        $open = $this->openIssueNumbers;
+        if ($open === null) {
+            $rows = $this->gh()->openIssues($repo, 0, false, $complete);
+            $open = $rows !== null && $complete ? array_map(static fn (array $i): int => (int)$i['number'], $rows) : null;
+        }
+        if ($open === null) {
             // Working through every ref ever recorded would re-close closed
             // issues and spend the content-creation quota doing it
             $c->warn('close-fixed: could not list open issues; skipped');
             $this->record('close-fixed', 'SKIP');
             return;
         }
-        $openSet = array_flip(array_map('intval', array_column($open, 'number')));
+        $openSet = array_flip($open);
         $c->info('close-fixed: ' . count($openSet) . ' issues open, ' . count($byIssue) . ' in the database');
         $byIssue = array_intersect_key($byIssue, $openSet);
         $c->info('close-fixed: checking ' . count($byIssue) . ' issue(s) against the current manifests');
@@ -1091,68 +1175,32 @@ final class SecurityRun
             $branch = trim($r->stdout);
         }
 
-        $lister   = $this->dirLister();
-        $contents = [];
+        $verifier = new IssueVerifier(
+            $this->root,
+            $this->dirLister(),
+            fn (string $m): bool => $this->target->inScope($m),
+            $this->target->subdir,
+            $this->removedIn(...)
+        );
         $closed = $unresolved = $unverifiable = $rateLimited = $outOfScope = 0;
+        $whyUnverifiable = [];
         foreach ($byIssue as $ref => $needs) {
-            $ok       = true;
-            $reason   = '';
-            $detail   = '';
-            $evidence = '';
-            foreach ($needs as $need) {
-                if ($need['package'] === '') {
-                    continue;
-                }
-                // With --subdir, an issue is only judged when every manifest
-                // it names is inside the scanned part
-                if (!$this->target->inScope($need['manifest'])) {
-                    [$ok, $reason, $detail] = [false, 'out-of-scope', "{$need['manifest']} is outside {$this->target->subdir}"];
-                    break;
-                }
-                if ($need['fixed_version'] === '') {
-                    [$ok, $reason, $detail] = [false, 'unverifiable', "no fixed version is known for one of the {$need['package']} vulnerabilities"];
-                    break;
-                }
-                $target = ManifestPaths::sourceManifestFor($need['manifest'], $lister);
-                $abs    = $this->insideRoot($target);
-                if ($abs === null) {
-                    [$ok, $reason, $detail] = [false, 'unverifiable', "manifest missing: {$target}"];
-                    break;
-                }
-                // One fix per release line, any of which will do on its own line
-                $required = implode(' or ', FixPlanner::fixes($need));
-                // Where a lockfile exists, what it resolved is what gets installed
-                $eco    = ManifestPaths::ecosystemFor($target);
-                $locked = in_array($eco, ['npm', 'composer'], true) ? Lockfile::versions(dirname($abs), $eco, $need['package']) : null;
-                if ($locked !== null && $locked !== []) {
-                    $behind = array_values(array_filter($locked, static fn (string $v): bool => !FixPlanner::requirementMet($v, $need)));
-                    if ($behind !== []) {
-                        [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is locked at " . implode(', ', $behind) . ', ' . FixPlanner::shortfall($behind, $need)];
-                        break;
-                    }
-                    $evidence .= "| `{$need['package']}` | {$required} | **" . implode(', ', $locked) . " (locked)** | `{$target}` |\n";
-                    continue;
-                }
-                $contents[$abs] ??= (string)file_get_contents($abs);
-                $cur = ManifestEditor::declared($need['ecosystem'], $target, $contents[$abs], $need['package']);
-                if ($cur === '') {
-                    [$ok, $reason, $detail] = [false, 'unverifiable', "{$need['package']} not declared in {$target}"];
-                    break;
-                }
-                if (!FixPlanner::requirementMet($cur, $need)) {
-                    [$ok, $reason, $detail] = [false, 'unresolved', "{$need['package']} is {$cur}, " . FixPlanner::shortfall([$cur], $need)];
-                    break;
-                }
-                // Record the evidence so the closing comment shows its working
-                $evidence .= "| `{$need['package']}` | {$required} | **{$cur}** | `{$target}` |\n";
-            }
-
+            ['ok' => $ok, 'reason' => $reason, 'detail' => $detail, 'evidence' => $evidence] = $verifier->verify($needs);
             if (!$ok) {
                 match ($reason) {
                     'unresolved'   => $unresolved++,
                     'out-of-scope' => $outOfScope++,
                     default        => $unverifiable++,
                 };
+                if ($reason === 'unverifiable') {
+                    $why = match (true) {
+                        str_contains($detail, 'no fixed version') => 'no fix known',
+                        str_contains($detail, 'manifest missing') => 'manifest missing',
+                        str_contains($detail, 'nor in its lockfile') => 'not declared or locked',
+                        default => 'transitive, no lockfile',
+                    };
+                    $whyUnverifiable[$why] = ($whyUnverifiable[$why] ?? 0) + 1;
+                }
                 if ($this->opt->debug) {
                     $c->info("  #{$ref} " . ($reason === 'unresolved' ? 'still open' : $reason) . ": {$detail}");
                 }
@@ -1160,7 +1208,6 @@ final class SecurityRun
             }
             if (!$update) {
                 $c->info("  would close #{$ref} (all fixes verified)");
-                $closed++;
                 $this->wouldClose++;
                 continue;
             }
@@ -1175,7 +1222,8 @@ final class SecurityRun
                 sleep($this->opt->closeDelay);
             }
             $body = "### Resolved — verified against the current manifests\n\n"
-                . "Every package this issue reports now declares a version at or above the required fix on `{$branch}`:\n\n"
+                . "Every package this issue reports now declares a version at or above the required fix on `{$branch}`"
+                . (str_contains($evidence, '**manifest removed**') ? ', or the project that used it has been removed' : '') . ":\n\n"
                 . "| Package | Required | Declared | Manifest |\n| --- | --- | --- | --- |\n{$evidence}\n"
                 . 'Checked by [dep-sec-patcher](https://github.com/detain/dep-sec-patcher) `--close-fixed`, which reads the version each manifest'
                 . " declares rather than assuming an earlier fix succeeded. Reopen if this is wrong.\n\n"
@@ -1207,9 +1255,13 @@ final class SecurityRun
                 break;
             }
         }
-        $c->info("close-fixed: closed={$closed} still-vulnerable={$unresolved} unverifiable={$unverifiable} rate-limited={$rateLimited}"
-            . ($this->target->subdir !== '' ? " outside-subdir={$outOfScope}" : ''));
-        $this->record('close-fixed', 'PASS', 0, $closed);
+        // A listing run closed nothing, and must not say it did
+        $tally = $update ? "closed={$closed}" : "would-close={$this->wouldClose}";
+        arsort($whyUnverifiable);
+        $c->info("close-fixed: {$tally} still-vulnerable={$unresolved} unverifiable={$unverifiable} rate-limited={$rateLimited}"
+            . ($this->target->subdir !== '' ? " outside-subdir={$outOfScope}" : '')
+            . ($whyUnverifiable !== [] ? ' (unverifiable: ' . implode(', ', array_map(static fn ($k, $n) => "{$n} {$k}", array_keys($whyUnverifiable), $whyUnverifiable)) . ')' : ''));
+        $this->record('close-fixed', 'PASS', 0, 0, $update ? "closed {$closed}" : "would close {$this->wouldClose} (not closed)");
     }
 
     // ── --push / --pr / --push-direct ────────────────────────────────────────
@@ -1231,25 +1283,25 @@ final class SecurityRun
             $c->skip("push ({$this->root} is not the top of a git work tree)");
             return;
         }
-        if ($cleanAtStart === false) {
-            $c->warn('push: the working tree had uncommitted changes before the run; not committing, so they cannot be mixed in');
-            return;
-        }
+        // Paths that were dirty before the run and that it changed too are
+        // left uncommitted, so the base branch does not have all the fixes
+        $plan     = $publisher->plan();
+        $complete = $plan !== null && $plan['conflicted'] === [];
         if (!$publisher->hasChanges()) {
             // The base branch already is what the manifests say
-            $this->landed = true;
-            $this->record('push', 'SKIP');
+            $this->landed = $complete;
+            $this->record('push', $complete ? 'SKIP' : 'WARN');
             return;
         }
 
-        $files   = $publisher->changedFiles();
+        $files   = $plan['commit'] ?? $publisher->changedFiles();
         $title   = 'Dependency security updates';
         $message = $title . "\n\n" . $this->changeSummary($files, false);
         $branch  = $this->opt->branch !== '' ? $this->opt->branch : BranchPublisher::defaultBranch($this->now);
 
         if ($this->opt->pushMode === 'direct') {
             $result = $publisher->publishDirect($message, $branch);
-            $this->landed = $result === 'pushed';
+            $this->landed = $result === 'pushed' && $complete;
             $this->record('push', $result === 'pushed' ? 'PASS' : 'FAIL');
             return;
         }
@@ -1271,6 +1323,9 @@ final class SecurityRun
             return;
         }
         $this->record('push', $this->openPullRequest($publisher, $branch, $base, $title, $files) ? 'PASS' : 'FAIL');
+        if (!$complete) {
+            $this->landed = false;
+        }
     }
 
     /**
@@ -1446,12 +1501,19 @@ final class SecurityRun
         }
     }
 
-    private function record(string $key, string $status, int $vulns = 0, int $outdated = 0): void
+    /**
+     * $note is for what is neither a vulnerability nor an outdated package
+     * (issues closed, fixes applied), so it is not counted as either.
+     */
+    private function record(string $key, string $status, int $vulns = 0, int $outdated = 0, string $note = ''): void
     {
         $prev = $this->summary[$key] ?? null;
         if ($prev === null) {
-            $this->summary[$key] = ['status' => $status, 'vulns' => $vulns, 'outdated' => $outdated];
+            $this->summary[$key] = ['status' => $status, 'vulns' => $vulns, 'outdated' => $outdated, 'note' => $note];
             return;
+        }
+        if ($note !== '') {
+            $prev['note'] = $note;
         }
         // Several targets per ecosystem: worst status wins, counts add up.
         // (The original shell script overwrote, so the table showed the last pom only.)
@@ -1470,12 +1532,20 @@ final class SecurityRun
         $c->heading('Summary');
         $c->line("  PASS={$c->pass}  FAIL={$c->fail}  WARN={$c->warn}  SKIP={$c->skip}  INFO={$c->info}");
         $c->line();
-        $c->line($c->blue() . sprintf('%-17s %-8s %-16s %-10s', 'Ecosystem', 'Status', 'Vulnerabilities', 'Outdated') . $c->reset());
-        $c->line($c->blue() . str_repeat('─', 53) . $c->reset());
+        $c->line($c->blue() . rtrim(sprintf('%-17s %-8s %-16s %-10s %s', 'Ecosystem', 'Status', 'Vulnerabilities', 'Outdated', 'Notes')) . $c->reset());
+        $c->line($c->blue() . str_repeat('─', 60) . $c->reset());
         foreach ($this->summary as $key => $row) {
-            $c->line($c->colorFor($row['status']) . sprintf('%-17s %-8s %-16d %-10d', $key, $row['status'], $row['vulns'], $row['outdated']) . $c->reset());
+            $c->line($c->colorFor($row['status']) . self::summaryLine($key, $row) . $c->reset());
         }
         $c->line('done');
+    }
+
+    /**
+     * @param array{status: string, vulns: int, outdated: int, note: string} $row
+     */
+    private static function summaryLine(string $key, array $row): string
+    {
+        return rtrim(sprintf('%-17s %-8s %-16d %-10d %s', $key, $row['status'], $row['vulns'], $row['outdated'], $row['note']));
     }
 
     private function writeReport(): void
@@ -1487,7 +1557,7 @@ final class SecurityRun
                 'vulnerabilities'   => $row['vulns'],
                 'outdated_packages' => $row['outdated'],
                 'last_scan'         => $this->now,
-            ];
+            ] + ($row['note'] !== '' ? ['note' => $row['note']] : []);
         }
         $report = [
             'tool'           => 'dep-sec-patcher ' . Application::VERSION,
@@ -1563,6 +1633,22 @@ final class SecurityRun
             return null;
         }
         return $real;
+    }
+
+    /**
+     * The commit on HEAD's history that deleted a manifest HEAD no longer
+     * has, or null. Without that history (a shallow clone) the answer is
+     * null, which leaves the issue unverifiable rather than closed.
+     */
+    private function removedIn(string $rel): ?string
+    {
+        $opt = ['timeout' => 60, 'label' => 'git'];
+        if ($this->ctx->runner->run(['git', '-C', $this->root, 'cat-file', '-e', "HEAD:{$rel}"], $this->root, $opt)->ok()) {
+            return null;
+        }
+        $r   = $this->ctx->runner->run(['git', '-C', $this->root, 'log', '-1', '--diff-filter=D', '--format=%H', 'HEAD', '--', $rel], $this->root, $opt);
+        $sha = trim($r->stdout);
+        return $r->ok() && preg_match('/^[0-9a-f]{40,64}$/', $sha) === 1 ? $sha : null;
     }
 
     private function dirLister(): callable

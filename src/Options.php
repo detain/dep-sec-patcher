@@ -42,7 +42,7 @@ final class Options
     /** Keep a remote TARGET's clone after the run instead of deleting it. */
     public bool $keepClone = false;
     public string $configFile = '';
-    public int $maxIssues = 300;
+    public int $maxIssues = 0;
     public string $github = 'auto';
     public string $mergePrs = 'auto';
     public string $autoFix = 'auto';
@@ -434,7 +434,7 @@ Ecosystem options (default: auto = run if the tool is installed):
   --no-go     --no-rust    --no-dotnet --no-dart  --no-elixir --no-swift   --no-r
 
 GitHub integration (requires the gh CLI):
-  --max-issues N        Max security issues to scan (default: 300, 0 = unlimited)
+  --max-issues N        Max open issues to read, newest first (default: 0 = all)
   --no-github           Skip all GitHub API work
   --no-merge-prs        Do not merge Dependabot PRs or request rebases
   --no-auto-fix         Record vulnerabilities but never edit manifests
@@ -460,7 +460,7 @@ Mode options:
   --check               Audit only: no dependency updates, PR merges or manifest
                         edits; anything a tool writes into the tree is undone
   --push                Update mode: commit the changes to a new branch and push
-                        it to origin (needs a git TARGET that was clean at start)
+                        it to origin (only paths that were clean before the run)
   --pr                  Like --push, then open a pull request from the branch
                         into the branch the tree started on, merge it and
                         delete the branch (implies --push)

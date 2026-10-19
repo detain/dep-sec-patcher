@@ -188,7 +188,8 @@ final class Scanners
         foreach ($dirs as $dir) {
             $cwd = $dir === '' ? $ctx->root : $ctx->root . '/' . $dir;
             $tag = 'dep-sec-patcher-scan-' . getmypid() . '-' . count($out);
-            $b   = $ctx->runner->run(['docker', 'build', '-q', '-t', $tag, '.'], $cwd, ['label' => 'grype:build']);
+            // Host networking: RUN steps still reach the network on a daemon with no default bridge ("bridge": "none").
+            $b   = $ctx->runner->run(['docker', 'build', '--network=host', '-q', '-t', $tag, '.'], $cwd, ['label' => 'grype:build']);
             if (!$b->ok()) {
                 $out[] = [$dir, TargetResult::fromFailure($b, 'docker build')];
                 continue;

@@ -105,6 +105,117 @@ class BranchPublisherTest extends TestCase
         $this->assertSame('', $this->git($remote['work'], ['status', '--porcelain']));
     }
 
+    public function testCleanTreeCommitsEverythingTheRunChanged(): void
+    {
+        $remote = $this->makeRemote(['a/pom.xml' => "1\n", 'b/package.json' => "{}\n"]);
+        [$console, $runner, $out] = $this->quietRunner();
+        $publisher = new BranchPublisher($runner, $console, $remote['work']);
+        $this->assertSame([], $publisher->snapshot());
+
+        file_put_contents($remote['work'] . '/a/pom.xml', "2\n");
+        file_put_contents($remote['work'] . '/b/package.json', "{\"x\": 1}\n");
+        file_put_contents($remote['work'] . '/b/package-lock.json', "{}\n");
+
+        $this->assertSame('pushed', $publisher->publishDirect('run', 'fallback'));
+        $this->assertSame("a/pom.xml\nb/package-lock.json\nb/package.json", $this->git($remote['bare'], ['show', '--name-only', '--format=', 'main']));
+        $this->assertSame('', $this->git($remote['work'], ['status', '--porcelain']));
+        $this->assertStringNotContainsString('uncommitted', self::readStream($out));
+    }
+
+    public function testChangesFromBeforeTheRunStayOutOfTheCommit(): void
+    {
+        $remote = $this->makeRemote(['pom.xml' => "1\n", 'notes.txt' => "n\n", 'staged.txt' => "s\n"]);
+        $work   = $remote['work'];
+        // The user's own work in progress: an edit, a staged edit, a new file
+        file_put_contents($work . '/notes.txt', "my edit\n");
+        file_put_contents($work . '/staged.txt', "staged edit\n");
+        $this->git($work, ['add', 'staged.txt']);
+        file_put_contents($work . '/scratch.log', "mine\n");
+        [$console, $runner, $out] = $this->quietRunner();
+        $publisher = new BranchPublisher($runner, $console, $work);
+        $this->assertSame(['notes.txt', 'staged.txt', 'scratch.log'], array_keys($publisher->snapshot() ?? []));
+
+        file_put_contents($work . '/pom.xml', "2\n");
+        file_put_contents($work . '/package-lock.json', "{}\n");
+
+        $this->assertSame('pushed', $publisher->publishDirect('run', 'fallback'));
+        $this->assertSame("package-lock.json\npom.xml", $this->git($remote['bare'], ['show', '--name-only', '--format=', 'main']));
+        $log = self::readStream($out);
+        $this->assertStringContainsString('[INFO]', $log);
+        $this->assertStringContainsString('leaving 3 path(s) that were already uncommitted before the run alone, uncommitted: notes.txt, staged.txt, scratch.log', $log);
+        $this->assertStringNotContainsString('[WARN]', $log);
+        $this->assertSame("my edit\n", file_get_contents($work . '/notes.txt'));
+        $this->assertSame("mine\n", file_get_contents($work . '/scratch.log'));
+        $this->assertSame(" M notes.txt\nM  staged.txt\n?? scratch.log", $this->git($work, ['status', '--porcelain']), 'still uncommitted, and still staged');
+    }
+
+    public function testAPathDirtyBeforeAndChangedByTheRunIsLeftOut(): void
+    {
+        $remote = $this->makeRemote(['a/package.json' => "{}\n", 'b/pom.xml' => "1\n"]);
+        $work   = $remote['work'];
+        file_put_contents($work . '/a/package.json', "{\"mine\": 1}\n");
+        [$console, $runner, $out] = $this->quietRunner();
+        $publisher = new BranchPublisher($runner, $console, $work);
+        $publisher->snapshot();
+
+        file_put_contents($work . '/a/package.json', "{\"mine\": 1, \"fix\": 2}\n");
+        file_put_contents($work . '/b/pom.xml', "2\n");
+        $plan = $publisher->plan();
+        $this->assertSame(['commit' => ['b/pom.xml'], 'conflicted' => ['a/package.json'], 'untouched' => []], $plan);
+
+        $this->assertSame('pushed', $publisher->publishDirect('run', 'fallback'));
+        $this->assertSame('b/pom.xml', $this->git($remote['bare'], ['show', '--name-only', '--format=', 'main']));
+        $log = self::readStream($out);
+        $this->assertStringContainsString('[WARN]', $log);
+        $this->assertStringContainsString('not committing 1 path(s) that had uncommitted changes before the run and that the run changed too, so the two are not mixed: a/package.json', $log);
+        $this->assertSame(' M a/package.json', $this->git($work, ['status', '--porcelain']));
+        $this->assertSame("{\"mine\": 1, \"fix\": 2}\n", file_get_contents($work . '/a/package.json'));
+    }
+
+    public function testBranchModeKeepsEarlierChangesInTheTreeAndRebasesAroundThem(): void
+    {
+        $remote = $this->makeRemote(['a.txt' => "a\n", 'b.txt' => "b\n", 'notes.txt' => "n\n"]);
+        $other  = $this->cloneOf($remote);
+        $work   = $remote['work'];
+        file_put_contents($work . '/notes.txt', "my edit\n");
+        [$console, $runner, $out] = $this->quietRunner();
+        $publisher = new BranchPublisher($runner, $console, $work);
+        $publisher->snapshot();
+
+        file_put_contents($work . '/a.txt', "a2\n");
+        $this->commitAndPush($other, 'b.txt', "b2\n");
+
+        $this->assertTrue($publisher->publish('topic', 'm', 'main'));
+        $this->assertStringContainsString('rebasing the commit onto it', self::readStream($out));
+        $this->assertSame('a.txt', $this->git($remote['bare'], ['show', '--name-only', '--format=', 'topic']));
+        $this->assertSame('b2', $this->git($remote['bare'], ['show', 'topic:b.txt']), 'rebased onto origin');
+        $this->assertSame('n', $this->git($remote['bare'], ['show', 'topic:notes.txt']));
+        $this->assertSame('main', $this->git($work, ['rev-parse', '--abbrev-ref', 'HEAD']));
+        $this->assertSame(' M notes.txt', $this->git($work, ['status', '--porcelain']));
+        $this->assertSame("my edit\n", file_get_contents($work . '/notes.txt'));
+        $this->assertCount(1, explode("\n", $this->git($work, ['worktree', 'list'])), 'the temporary work tree is gone');
+    }
+
+    public function testDirectPushRebasesAroundEarlierChanges(): void
+    {
+        $remote = $this->makeRemote(['a.txt' => "a\n", 'b.txt' => "b\n", 'notes.txt' => "n\n"]);
+        $other  = $this->cloneOf($remote);
+        $work   = $remote['work'];
+        file_put_contents($work . '/notes.txt', "my edit\n");
+        [$console, $runner] = $this->quietRunner();
+        $publisher = new BranchPublisher($runner, $console, $work);
+        $publisher->snapshot();
+
+        file_put_contents($work . '/a.txt', "a2\n");
+        $this->commitAndPush($other, 'b.txt', "b2\n");
+
+        $this->assertSame('pushed', $publisher->publishDirect('direct', 'fallback'));
+        $this->assertSame('a2', $this->git($remote['bare'], ['show', 'main:a.txt']));
+        $this->assertSame('b2', $this->git($remote['bare'], ['show', 'main:b.txt']));
+        $this->assertSame($this->git($remote['bare'], ['rev-parse', 'main']), $this->git($work, ['rev-parse', 'main']), 'local main moved onto what was pushed');
+        $this->assertSame(' M notes.txt', $this->git($work, ['status', '--porcelain']));
+    }
+
     public function testDirectPushRefusesADetachedHead(): void
     {
         $remote = $this->makeRemote();

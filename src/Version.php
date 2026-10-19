@@ -17,6 +17,15 @@ namespace Detain\DepSecPatcher;
 final class Version
 {
     /**
+     * The start of a prerelease version, case-insensitive: a numeric release
+     * then an alpha/beta/milestone/rc/snapshot/... qualifier. Written in the
+     * subset PCRE and Java regexes share, because the Maven versions plugin
+     * is handed the same pattern (MavenAuditor::PRERELEASES), so what it
+     * passes over and what isPrerelease() reports cannot drift apart.
+     */
+    public const PRERELEASE = 'v?\\d+(?:\\.\\d+)*[-._]?(?:alpha|a|beta|b|c|milestone|m|rc|cr|pre|preview|ea|snapshot|dev|next|canary|nightly)(?![a-z])';
+
+    /**
      * Three-way comparison with GNU `sort -V` semantics, including sort's
      * last-resort byte comparison when two different strings tie.
      */
@@ -217,21 +226,46 @@ final class Version
      */
     public static function isPrerelease(string $version): bool
     {
-        return preg_match('/^v?\d+(?:\.\d+)*[-._]?(?:alpha|a|beta|b|c|milestone|m|rc|cr|pre|preview|ea|snapshot|dev|next|canary|nightly)(?![a-z])/i', $version) === 1;
+        return preg_match('/^' . self::PRERELEASE . '/i', $version) === 1;
     }
 
     /**
      * Whether a declared prerelease leaves an advisory with no fix to move up
      * to: it sorts above every fix without being known to include one (netty
      * 5.0.0.Alpha2 against 4.1.137.Final / 4.2.17.Final, spring 7.1.0-M2
-     * against 6.2.19 / 7.0.8). Going back to a release is for a person to
-     * decide.
+     * against 6.2.19 / 7.0.8). releaseForPrerelease() picks the release to
+     * go back to.
      *
      * @param array<string, list<string>> $spec
      */
     public static function prereleaseAboveFixes(string $declared, array $spec): bool
     {
         return self::isPrerelease(self::floor($declared)) && !self::clearsAll($declared, $spec) && self::chooseTarget($declared, $spec) === '';
+    }
+
+    /**
+     * The release to move a prerelease that sits above every fix down to:
+     * the newest known fix release on the prerelease's own major line that
+     * clears every advisory (spring 7.1.0-M2 -> 7.0.8), else the newest that
+     * does on any line (netty 5.0.0.Alpha2 -> 4.2.17.Final, as no 5.x was
+     * ever released). '' when it is no such prerelease, or no single release
+     * clears everything.
+     *
+     * @param array<string, list<string>> $spec
+     */
+    public static function releaseForPrerelease(string $declared, array $spec): string
+    {
+        if (!self::prereleaseAboveFixes($declared, $spec)) {
+            return '';
+        }
+        $fixes = $spec === [] ? [] : array_values(array_unique(array_merge(...array_values($spec))));
+        $ok    = array_values(array_filter(
+            $fixes,
+            static fn (string $f): bool => $f !== '' && !self::isPrerelease($f) && self::clearsAll($f, $spec)
+        ));
+        $line  = self::majorLine($declared);
+        $same  = array_values(array_filter($ok, static fn (string $f): bool => self::majorLine($f) === $line));
+        return self::max($same !== [] ? $same : $ok);
     }
 
     /**

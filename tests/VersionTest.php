@@ -176,6 +176,19 @@ class VersionTest extends TestCase
         $this->assertSame('1.0.0', Version::chooseTarget('1.0.0-beta', ['CVE' => ['1.0.0']]));
     }
 
+    public function testAPrereleaseAboveEveryFixGoesBackToTheNewestReleaseWithTheFix(): void
+    {
+        $netty = ['4.1.137.Final', '4.2.17.Final'];
+        $this->assertSame('4.2.17.Final', Version::releaseForPrerelease('5.0.0.Alpha2', ['CVE' => $netty]), 'no 5.x release: the newest fix');
+        $this->assertSame('7.0.8', Version::releaseForPrerelease('7.1.0-M2', ['CVE' => ['6.2.19', '7.0.8']]), 'its own major line first');
+        $this->assertSame('7.0.8', Version::releaseForPrerelease('7.1.0-M2', ['A' => ['6.2.19', '7.0.8'], 'B' => ['7.0.3']]), 'one release clearing both');
+        $this->assertSame('4.2.17.Final', Version::releaseForPrerelease('5.0.0.Alpha2', ['CVE' => [...$netty, '4.3.0-RC1']]), 'never another prerelease');
+        $this->assertSame('', Version::releaseForPrerelease('7.0.9-RC1', ['CVE' => ['6.2.19', '7.0.8']]), 'already clear');
+        $this->assertSame('', Version::releaseForPrerelease('1.0.0-beta', ['CVE' => ['1.0.0']]), 'a fix above it: an ordinary bump');
+        $this->assertSame('', Version::releaseForPrerelease('4.1.100.Final', ['CVE' => $netty]), 'not a prerelease');
+        $this->assertSame('', Version::releaseForPrerelease('5.0.0.Alpha2', []));
+    }
+
     public function testChooseTargetStaysOnReleaseLine(): void
     {
         $spec = ['CVE-2025-49124' => ['9.0.106', '10.1.42', '11.0.8']];

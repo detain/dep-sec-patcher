@@ -6,6 +6,8 @@ namespace Detain\DepSecPatcher\Auditor;
 
 use Detain\DepSecPatcher\CommandResult;
 use Detain\DepSecPatcher\Context;
+use Detain\DepSecPatcher\JsonFile;
+use Detain\DepSecPatcher\Lockfile;
 use Detain\DepSecPatcher\ProcessRunner;
 use Detain\DepSecPatcher\TargetResult;
 
@@ -83,13 +85,26 @@ final class NodeAuditor extends Auditor
         $peers = [];
         $notes = [];
         // npm audit needs a lockfile; in check mode the guard removes it again
-        $r = $this->run($ctx, $dir, array_merge(['npm', 'install', '--package-lock-only'], $quiet));
+        $install = function () use ($ctx, $dir, $quiet, &$peers): CommandResult {
+            return $this->run($ctx, $dir, array_merge(['npm', 'install', '--package-lock-only'], $quiet, $peers));
+        };
+        $r = $install();
         if (!$r->ok() && stripos($r->output, 'ERESOLVE') !== false) {
             // A peer dependency conflict in package.json itself: resolving
             // the way npm 6 did still gives the audit a lockfile to read
             $peers   = ['--legacy-peer-deps'];
             $notes[] = 'conflicting peer dependencies in package.json (npm ERESOLVE); resolved with --legacy-peer-deps';
-            $r       = $this->run($ctx, $dir, array_merge(['npm', 'install', '--package-lock-only'], $quiet, $peers));
+            $r       = $install();
+        }
+        // An override naming a version that was never published (an earlier
+        // run's, or a hand-written one) fails every install; drop it
+        for ($tries = 0; !$r->ok() && !$ctx->checkMode() && $tries < 10; $tries++) {
+            $dropped = $this->dropUnpublishedOverride($ctx, $dir, $r);
+            if ($dropped === null) {
+                break;
+            }
+            $notes[] = $dropped;
+            $r       = $install();
         }
         if (!$r->ok()) {
             return TargetResult::fromFailure($r, 'npm install --package-lock-only');
@@ -104,8 +119,9 @@ final class NodeAuditor extends Auditor
             $fix = array_merge(['npm', 'audit', 'fix'], $ctx->opt->allowMajor ? ['--force'] : [], ['--package-lock-only', '--ignore-scripts', '--no-fund'], $peers);
             $r   = $this->run($ctx, $dir, $fix);
             if (!$r->ok()) {
-                $notes[] = self::auditFixNote($r);
+                $notes[] = self::auditFixNote($r, $ctx->opt->allowMajor);
             }
+            $notes = array_merge($notes, $this->overrideLeftovers($ctx, $dir, $install));
         }
         $argv = ['npm', 'audit', '--json'];
         if ($ctx->checkMode()) {
@@ -187,21 +203,159 @@ final class NodeAuditor extends Auditor
      * vulnerable, which the audit after it counts, so say what was left
      * rather than just "exit 1".
      */
-    public static function auditFixNote(CommandResult $r): string
+    public static function auditFixNote(CommandResult $r, bool $forced = false): string
     {
-        $major = substr_count($r->output, 'fix available via `npm audit fix --force`');
-        $none  = substr_count($r->output, 'No fix available');
-        if ($r->timedOut || $r->exitCode !== 1 || $major + $none === 0) {
+        $major = $none = $other = 0;
+        // One block per vulnerable package: "name  range", then its details
+        foreach (preg_split('/\R\s*\R/', $r->output) ?: [] as $block) {
+            if (preg_match('/^((?:@[\w.-]+\/)?[\w.-]+)  (\S.*)$/', (string)strtok(trim($block), "\n"), $m) !== 1
+                || stripos($block, 'fix available') === false) {
+                continue;
+            }
+            match (true) {
+                // Every version is affected: whatever npm suggests is a
+                // different (often older) parent, not a fix
+                trim($m[2]) === '*', str_contains($block, 'No fix available') => $none++,
+                str_contains($block, 'fix available via `npm audit fix --force`') => $major++,
+                default => $other++,
+            };
+        }
+        if ($r->timedOut || $r->exitCode !== 1 || $major + $none + $other === 0) {
             return 'npm audit fix ' . $r->failureReason();
         }
         $left = [];
         if ($major > 0) {
-            $left[] = "{$major} need" . ($major === 1 ? 's' : '') . ' a major upgrade (--allow-major)';
+            // With --force already passed, suggesting --allow-major is no help
+            $left[] = $forced ? "{$major} not fixed even with --force" : "{$major} need" . ($major === 1 ? 's' : '') . ' a major upgrade (--allow-major)';
+        }
+        if ($other > 0) {
+            $left[] = "{$other} it could not resolve";
         }
         if ($none > 0) {
             $left[] = "{$none} ha" . ($none === 1 ? 's' : 've') . ' no fix available';
         }
         return 'npm audit fix left ' . implode(', ', $left);
+    }
+
+    /**
+     * Pin what `npm audit fix` left with "overrides", on the line in use,
+     * and re-resolve the lockfile. Undone if npm cannot resolve the result.
+     *
+     * @param callable(): CommandResult $install
+     * @return list<string> notes
+     */
+    private function overrideLeftovers(Context $ctx, string $dir, callable $install): array
+    {
+        $abs   = $this->abs($ctx, $dir);
+        $audit = self::json($this->run($ctx, $dir, ['npm', 'audit', '--json'])->stdout);
+        $file  = $abs . '/package.json';
+        $raw   = is_file($file) ? (string)file_get_contents($file) : '';
+        try {
+            $doc = JsonFile::decodeObject($raw);
+        } catch (\JsonException $e) {
+            return [];
+        }
+        if (!is_array($audit) || ($audit['vulnerabilities'] ?? []) === [] || !$doc instanceof \stdClass) {
+            return [];
+        }
+        $direct = [];
+        foreach (['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'] as $section) {
+            foreach (array_keys((array)($doc->{$section} ?? [])) as $name) {
+                $direct[(string)$name] = true;
+            }
+        }
+        $plan = NpmOverrides::plan(
+            $audit,
+            static fn (string $pkg): array => Lockfile::versions($abs, 'npm', $pkg) ?? [],
+            fn (string $pkg): ?array => self::registryVersions($ctx->runner, $abs, $pkg),
+            (array)($doc->overrides ?? []),
+            $direct,
+            $ctx->opt->allowMajor
+        );
+        $notes = $plan['notes'];
+        if ($plan['overrides'] === []) {
+            return $notes;
+        }
+        $lockFile = $abs . '/package-lock.json';
+        $lock     = is_file($lockFile) ? (string)file_get_contents($lockFile) : null;
+        $doc->overrides = (object)array_merge((array)($doc->overrides ?? []), $plan['overrides']);
+        file_put_contents($file, JsonFile::encode($doc, JsonFile::detectIndent($raw)));
+        $r    = $install();
+        $list = implode(', ', array_map(static fn (string $k, string $v): string => "{$k} {$v}", array_keys($plan['overrides']), $plan['overrides']));
+        if (!$r->ok()) {
+            file_put_contents($file, $raw);
+            if ($lock !== null) {
+                file_put_contents($lockFile, $lock);
+            }
+            $notes[] = "npm overrides not kept ({$list}): npm install " . $r->failureReason();
+            return $notes;
+        }
+        $notes[] = "npm overrides for what npm audit fix left: {$list}";
+        return $notes;
+    }
+
+    /**
+     * Remove the override behind npm's "No matching version found for
+     * name@spec" from package.json. Returns a note, or null when the failure
+     * is not an override's (a declared dependency is for a person to fix).
+     */
+    private function dropUnpublishedOverride(Context $ctx, string $dir, CommandResult $r): ?string
+    {
+        if (preg_match('/No matching version found for ((?:@[\w.-]+\/)?[\w.-]+)@(\S+?)\.?(?:\s|$)/', $r->output, $m) !== 1) {
+            return null;
+        }
+        [$name, $spec] = [$m[1], $m[2]];
+        $file = $this->abs($ctx, $dir) . '/package.json';
+        $raw  = is_file($file) ? (string)file_get_contents($file) : '';
+        try {
+            $doc = JsonFile::decodeObject($raw);
+        } catch (\JsonException $e) {
+            return null;
+        }
+        if (!$doc instanceof \stdClass) {
+            return null;
+        }
+        $dropped = [];
+        foreach (['overrides', 'resolutions'] as $section) {
+            if (!($doc->{$section} ?? null) instanceof \stdClass) {
+                continue;
+            }
+            foreach (get_object_vars($doc->{$section}) as $key => $value) {
+                // Exactly this package: "json-schema-ref-parser" is not
+                // "@apidevtools/json-schema-ref-parser"
+                if ($value === $spec && ($key === $name || str_starts_with((string)$key, $name . '@'))) {
+                    unset($doc->{$section}->{$key});
+                    $dropped[] = "{$section}.{$key}";
+                }
+            }
+            if (get_object_vars($doc->{$section}) === []) {
+                unset($doc->{$section});
+            }
+        }
+        if ($dropped === [] || file_put_contents($file, JsonFile::encode($doc, JsonFile::detectIndent($raw))) === false) {
+            return null;
+        }
+        return "removed " . implode(', ', $dropped) . " {$spec} from package.json: npm has no matching version of {$name}";
+    }
+
+    /**
+     * Every version the registry publishes for a package, or null when it
+     * cannot be asked (offline, private registry without access).
+     *
+     * @return list<string>|null
+     */
+    public static function registryVersions(ProcessRunner $runner, string $cwd, string $pkg): ?array
+    {
+        $r    = $runner->run(['npm', 'view', $pkg, 'versions', '--json'], $cwd, ['timeout' => 60, 'label' => 'npm view']);
+        $data = self::json($r->stdout);
+        if (!$r->ok()) {
+            return is_array($data) && in_array($data['error']['code'] ?? null, ['E404'], true) ? [] : null;
+        }
+        return match (true) {
+            is_string($data) => [$data],
+            is_array($data)  => array_values(array_map('strval', array_filter($data, 'is_string'))),
+            default          => null,
+        };
     }
 
     /**

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Detain\DepSecPatcher\Auditor;
 
+use Detain\DepSecPatcher\CommandResult;
 use Detain\DepSecPatcher\Context;
 use Detain\DepSecPatcher\TargetResult;
 
@@ -22,6 +23,7 @@ final class SimpleAuditor extends Auditor
      * @param list<string>      $versionArgv
      * @param list<string>      $prepareArgv one-off setup run in the parent
      * @param list<string>      $majorOnly  update-mode arguments dropped without --allow-major
+     * @param ?\Closure(string): ?string $explain names a known failure from the tool's output
      */
     public function __construct(
         private string $name,
@@ -35,6 +37,7 @@ final class SimpleAuditor extends Auditor
         private string $note = '',
         private string $versionPattern = '/(\d+\.\d+(?:\.\d+)?)/',
         private array $majorOnly = [],
+        private ?\Closure $explain = null,
     ) {
     }
 
@@ -49,7 +52,25 @@ final class SimpleAuditor extends Auditor
             'pub has no documented locking for concurrent runs against the shared pub cache (no fixed version known)',
             ['dart', '--version'],
             majorOnly: ['--major-versions'],
+            explain: self::dartFailure(...),
         );
+    }
+
+    /**
+     * Pub's refusal of a package that predates null safety: no `environment:
+     * sdk:` lower bound of 2.12 (none at all reads as "<2.0.0"). Dart 3 only
+     * runs null-safe code, so no upgrade can resolve it; the code has to be
+     * migrated, or for a generated client, regenerated.
+     */
+    public static function dartFailure(string $output): ?string
+    {
+        if (preg_match("/Because (\\S+) doesn't support null safety|only supports null safety|or higher to enable null safety/", $output, $m) !== 1) {
+            return null;
+        }
+        $pkg = $m[1] ?? 'the package';
+        $sdk = preg_match('/"sdk: \'([^\']+)\'"/', $output, $c) === 1 ? "sdk '{$c[1]}'" : 'its SDK constraint';
+        return "{$pkg} predates null safety ({$sdk}; Dart 3 needs >=2.12.0): not upgradable, "
+            . 'the code must be migrated or, for a generated client, regenerated';
     }
 
     public static function elixir(): self
@@ -144,7 +165,8 @@ final class SimpleAuditor extends Auditor
         foreach ($steps as $argv) {
             $r = $this->run($ctx, $dir, $argv);
             if (!$r->ok()) {
-                $t = new TargetResult(TargetResult::WARN, implode(' ', $argv) . ' ' . $r->failureReason());
+                $why = $this->explain !== null ? ($this->explain)(CommandResult::plain($r->output)) : null;
+                $t   = new TargetResult(TargetResult::WARN, implode(' ', $argv) . ($why !== null ? ': ' . $why : ' ' . $r->failureReason()));
                 $t->tail = $r->tail(15);
                 return $t;
             }

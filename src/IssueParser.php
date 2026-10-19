@@ -27,19 +27,30 @@ namespace Detain\DepSecPatcher;
  * libraries at say exactly which packages the issue is about, so a bare list
  * is narrowed to those.
  *
- * Pure: no I/O.
+ * An issue whose fix list gives nothing usable (none at all, or only a release
+ * on another major line, as jackson-databind 3.x is for 2.x) can be completed
+ * from an advisory database through the $lookup callable, and an issue that
+ * names no dependency file (Mend's sbt scans report only Ivy cache paths) can
+ * be placed through $locate.
+ *
+ * Pure: no I/O of its own; the callables do any.
  */
 final class IssueParser
 {
     /**
      * @param list<array<string, mixed>> $issues `gh issue list --json number,title,body,url` rows
+     * @param (callable(string, string, string): ?list<string>)|null $lookup OSV ecosystem, package,
+     *        advisory id => every version that fixes it ([] or null when none is known), see AdvisoryLookup
+     * @param (callable(list<array{0: string, 1: string}>): list<string>)|null $locate the libraries an
+     *        issue's dependency hierarchy names, as [file name stem, version] => the manifests declaring
+     *        one of them, for an issue that names no dependency file, see SbtLocator
      * @return list<array<string, mixed>> remediation records
      */
-    public static function parse(array $issues): array
+    public static function parse(array $issues, ?callable $lookup = null, ?callable $locate = null): array
     {
         $records = [];
         foreach ($issues as $issue) {
-            foreach (self::parseIssue($issue) as $record) {
+            foreach (self::parseIssue($issue, $lookup, $locate) as $record) {
                 $records[] = $record;
             }
         }
@@ -48,9 +59,11 @@ final class IssueParser
 
     /**
      * @param array<string, mixed> $issue
+     * @param (callable(string, string, string): ?list<string>)|null $lookup as for parse()
+     * @param (callable(list<array{0: string, 1: string}>): list<string>)|null $locate as for parse()
      * @return list<array<string, mixed>>
      */
-    public static function parseIssue(array $issue): array
+    public static function parseIssue(array $issue, ?callable $lookup = null, ?callable $locate = null): array
     {
         $title  = self::utf8((string)($issue['title'] ?? ''));
         $body   = self::utf8((string)($issue['body'] ?? ''));
@@ -67,6 +80,14 @@ final class IssueParser
                 $manifests[] = $path;
             }
         }
+        if ($manifests === [] && $locate !== null) {
+            foreach ($locate(self::hierarchy($body)) as $path) {
+                $path = self::manifestPath($path);
+                if ($path !== '') {
+                    $manifests[] = $path;
+                }
+            }
+        }
         $manifests = self::uniqueSorted($manifests);
         if ($manifests === []) {
             return [];
@@ -74,16 +95,102 @@ final class IssueParser
 
         $cve = preg_match('/^(?<c>(?:CVE|WS)-[0-9A-Za-z-]+)/u', $title, $m) === 1 ? $m['c'] : '';
         if ($cve === '' && preg_match('/^## Vulnerabilities/mu', $body) === 1) {
-            return self::grouped($title, $body, $number, $url, $manifests);
+            return self::grouped($title, $body, $number, $url, $manifests, $lookup);
         }
-        if (!str_contains($body, 'Fix Resolution')) {
+        $listed = str_contains($body, 'Fix Resolution');
+        if (!$listed && ($lookup === null || $cve === '')) {
             return [];
         }
         $sev  = preg_match('/\((?<s>Critical|High|Medium|Low)\)/u', $title, $m) === 1 ? $m['s'] : '';
         $cvss = preg_match('/CVSS 3 Score Details \(<b>(?<v>[0-9.]+)<\/b>\)/u', $body, $m) === 1 ? $m['v'] : '0';
         $id   = $cve === '' ? 'ISSUE-' . $number : $cve;
         $installed = self::installed($body);
-        return self::records(self::fixes($title, $body, self::affected($body), $installed), $id, $cve, $sev, $cvss, $number, $title, $url, $manifests, $installed);
+        $affected  = self::affected($body);
+        $fixes     = $listed ? self::fixes($title, $body, $affected, $installed) : [];
+        if ($lookup !== null && $cve !== '' && self::unfixed($fixes)) {
+            $found = self::lookedUp($lookup, $cve, $affected, $manifests, $installed);
+            if ($found !== []) {
+                $fixes = $found;
+            }
+        }
+        return self::records($fixes, $id, $cve, $sev, $cvss, $number, $title, $url, $manifests, $installed);
+    }
+
+    /**
+     * Whether a fix list gives no version to move to.
+     *
+     * @param list<array{package: string, version: string, direct: bool}> $fixes
+     */
+    private static function unfixed(array $fixes): bool
+    {
+        return array_filter($fixes, static fn (array $f): bool => $f['package'] !== '' && $f['version'] !== '') === [];
+    }
+
+    /**
+     * Fixes for $id from the advisory database, one per affected library,
+     * narrowed per manifest to the major lines found in use there: OSV lists
+     * jackson-databind's 3.x fixes under com.fasterxml's name too, and those
+     * fix nothing a 2.x manifest can move to. A manifest whose line has no
+     * fix gets none.
+     *
+     * @param callable(string, string, string): ?list<string> $lookup
+     * @param list<string> $affected
+     * @param list<string> $manifests
+     * @param array<string, list<array{0: string, 1: string}>> $installed
+     * @return list<array{package: string, version: string, direct: bool, versions: array<string, list<string>>}>
+     */
+    private static function lookedUp(callable $lookup, string $id, array $affected, array $manifests, array $installed): array
+    {
+        $out = [];
+        foreach ($affected as $lib) {
+            $perManifest = [];
+            foreach ($manifests as $manifest) {
+                $eco = AdvisoryLookup::osvEcosystem($manifest);
+                // A Maven package is only known by its groupId:artifactId
+                if ($eco === '' || ($eco === 'Maven' && !str_contains($lib, ':'))) {
+                    continue;
+                }
+                $versions = array_values(array_filter($lookup($eco, $lib, $id) ?? [], static fn (string $v): bool => $v !== '' && self::cleanVer($v) === $v));
+                $lines    = [];
+                foreach ($installed[$manifest] ?? [] as [$name, $version]) {
+                    if (self::sameLibrary($name, $lib) || self::sameLibrary($lib, $name)) {
+                        $lines[] = Version::majorLine($version);
+                    }
+                }
+                if ($lines !== []) {
+                    $versions = array_values(array_filter($versions, static fn (string $v): bool => in_array(Version::majorLine($v), $lines, true)));
+                }
+                if ($versions !== []) {
+                    $perManifest[$manifest] = Version::sortAscending(array_values(array_unique($versions)));
+                }
+            }
+            if ($perManifest !== []) {
+                $out[] = ['package' => $lib, 'version' => (string)current($perManifest)[0], 'direct' => false, 'versions' => $perManifest];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * The libraries an issue's dependency hierarchy names, root libraries
+     * first, as [file name stem, version]: "http4s-ember-client_3-0.23.26.jar"
+     * -> ["http4s-ember-client_3", "0.23.26"].
+     *
+     * @return list<array{0: string, 1: string}>
+     */
+    private static function hierarchy(string $body): array
+    {
+        preg_match_all('/^\s*-\s+(?::x:\s+\*\*)?(?<f>[^\s*]+\.(?:jar|tgz|whl|gem|nupkg|zip))(?:\*\*)?\s+\((?<k>Root|Vulnerable) Library\)/mu', (string)preg_replace('/[^\x20-\x7E\n]/u', '', $body), $mm, PREG_SET_ORDER);
+        usort($mm, static fn (array $a, array $b): int => ($a['k'] === 'Root' ? 0 : 1) <=> ($b['k'] === 'Root' ? 0 : 1));
+        $out = [];
+        foreach ($mm as $hit) {
+            $name    = self::libname($hit['f']);
+            $version = $name === null ? '' : self::fileVersion($hit['f'], $name);
+            if ($name !== null && $version !== '') {
+                $out[$name . '@' . $version] = [$name, $version];
+            }
+        }
+        return array_values($out);
     }
 
     /**
@@ -98,9 +205,10 @@ final class IssueParser
      * close-fixed can never call the issue resolved while it stands.
      *
      * @param list<string> $manifests
+     * @param (callable(string, string, string): ?list<string>)|null $lookup as for parse()
      * @return list<array<string, mixed>>
      */
-    private static function grouped(string $title, string $body, mixed $number, string $url, array $manifests): array
+    private static function grouped(string $title, string $body, mixed $number, string $url, array $manifests, ?callable $lookup = null): array
     {
         $affected = self::affected($body);
         $library  = preg_match('/Fixed in \((?<l>[^)]+?) version\)/u', $body, $m) === 1 ? self::cleanPkg($m['l']) : '';
@@ -117,7 +225,8 @@ final class IssueParser
             }
         }
 
-        $records = [];
+        $installed = $lookup !== null ? self::installed($body) : [];
+        $records   = [];
         preg_match_all('/^\|\s*\[(?<id>(?:CVE|WS)-[0-9A-Za-z-]+)\][^|]*\|[^|]*?(?<sev>Critical|High|Medium|Low)\s*\|\s*(?<cvss>[0-9.]*)\s*\|[^|]*\|[^|]*\|\s*(?<fix>[^|]*?)\s*\|/mu', $body, $rows, PREG_SET_ORDER);
         foreach ($rows as $row) {
             $id    = $row['id'];
@@ -128,13 +237,16 @@ final class IssueParser
                 $fixes = [['package' => $library, 'version' => self::cleanVer($m[1]), 'direct' => true]];
             }
             $fixes = array_values(array_filter($fixes, static fn ($f) => $f['package'] !== '' && $f['version'] !== ''));
+            if ($fixes === [] && $lookup !== null) {
+                $fixes = self::lookedUp($lookup, $id, $library !== '' ? [$library] : $affected, $manifests, $installed);
+            }
             if ($fixes === [] && $library !== '') {
                 // No fix known for this CVE: keep the issue from being closed
                 $fixes = [['package' => $library, 'version' => '', 'direct' => true]];
             }
             $records = array_merge(
                 $records,
-                self::records($fixes, $id, $id, $row['sev'], $row['cvss'] !== '' ? $row['cvss'] : '0', $number, $title, $url, $manifests)
+                self::records($fixes, $id, $id, $row['sev'], $row['cvss'] !== '' ? $row['cvss'] : '0', $number, $title, $url, $manifests, $installed)
             );
         }
         return $records;
@@ -496,7 +608,10 @@ final class IssueParser
     }
 
     /**
-     * @param list<array{package: string, version: string, direct: bool}> $fixes
+     * A fix carrying versions (from lookedUp()) has its own fix versions per
+     * manifest, and no record for a manifest it has none for.
+     *
+     * @param list<array{package: string, version: string, direct: bool, versions?: array<string, list<string>>}> $fixes
      * @param list<string> $manifests
      * @param array<string, list<array{0: string, 1: string}>> $installed from installed()
      * @return list<array<string, mixed>>
@@ -520,6 +635,10 @@ final class IssueParser
                 continue;
             }
             foreach ($manifests as $manifest) {
+                $versions = isset($fix['versions']) ? ($fix['versions'][$manifest] ?? []) : null;
+                if ($versions === []) {
+                    continue;
+                }
                 $inUse = [];
                 foreach ($installed[$manifest] ?? [] as [$name, $version]) {
                     if (self::sameLibrary($name, $fix['package']) || self::sameLibrary($fix['package'], $name)) {
@@ -538,7 +657,7 @@ final class IssueParser
                     // times; carry every issue number so closing retires them all
                     'refs'             => [$number],
                     // Advisories list a fix per release branch; keep them all
-                    'fix_versions'     => $unfixed ? [] : [$fix['version']],
+                    'fix_versions'     => $versions ?? ($unfixed ? [] : [$fix['version']]),
                     'ecosystem'        => '',
                     'package'          => $fix['package'],
                     'manifest'         => $manifest,
@@ -547,14 +666,16 @@ final class IssueParser
                     'severity'         => strtolower($sev),
                     'cvss'             => is_numeric($cvss) ? $cvss + 0 : 0,
                     'vulnerable_range' => '',
-                    'fixed_version'    => $fix['version'],
+                    // The lowest: what the oldest line in use needs
+                    'fixed_version'    => $versions !== null ? $versions[0] : $fix['version'],
                     // What the issue found in use, which a dependency the
                     // manifest does not declare has nowhere else to come from
                     'installed'        => self::uniqueSorted($inUse),
                     'direct'           => $fix['direct'],
                     'summary'          => $title,
                     'url'              => $url,
-                ] + ($unfixed ? ['state' => 'skipped', 'note' => 'no fixed version known'] : []);
+                ] + ($unfixed ? ['state' => 'skipped', 'note' => 'no fixed version known'] : [])
+                  + ($versions !== null ? ['fix_source' => 'osv'] : []);
             }
         }
         return $records;

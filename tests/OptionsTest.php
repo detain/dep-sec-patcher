@@ -18,7 +18,7 @@ class OptionsTest extends TestCase
         $this->assertSame(1, $o->threads);
         $this->assertSame('update', $o->mode);
         $this->assertSame('7.0', $o->cvssThreshold);
-        $this->assertSame(300, $o->maxIssues);
+        $this->assertSame(0, $o->maxIssues);
         $this->assertSame('security: verified fixed', $o->closeLabel);
         $this->assertSame(5, $o->closeDelay);
         $this->assertSame(400, $o->closeLimit);

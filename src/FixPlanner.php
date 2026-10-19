@@ -91,6 +91,32 @@ final class FixPlanner
     }
 
     /**
+     * Pending records plan() leaves out, by reason: no fixed version is known
+     * yet ("no-fix": an alert with no patched release), or the record names
+     * no manifest or no ecosystem to edit ("unplaceable"). They stay pending,
+     * so a fix published later is still picked up, but auto-fix has to count
+     * them or its tallies do not add up to what is pending.
+     *
+     * @param array<string, mixed> $db
+     * @return array{no-fix: int, unplaceable: int}
+     */
+    public static function unplanned(array $db): array
+    {
+        $out = ['no-fix' => 0, 'unplaceable' => 0];
+        foreach ($db['vulns'] as $v) {
+            if (($v['state'] ?? null) !== 'pending') {
+                continue;
+            }
+            if ((string)($v['manifest'] ?? '') === '' || (string)($v['ecosystem'] ?? 'unknown') === 'unknown') {
+                $out['unplaceable']++;
+            } elseif ((string)($v['fixed_version'] ?? '') === '') {
+                $out['no-fix']++;
+            }
+        }
+        return $out;
+    }
+
+    /**
      * Issue-sourced records grouped by issue number, for close-fixed.
      *
      * Expands over refs, not ref: several issues can share one deduped record
