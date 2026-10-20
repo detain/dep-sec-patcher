@@ -54,6 +54,7 @@ final class Options
     public bool $closeFixed = false;
     public string $closeLabel = 'security: verified fixed';
     public int $closeDelay = 5;
+    /** Max closes per run; 0 (and the >0 guard in close-fixed) means uncapped. */
     public int $closeLimit = 400;
     public string $mode = 'update';
     public int $timeout = 1800;
@@ -454,7 +455,11 @@ GitHub integration (requires the gh CLI):
                         no ecosystem audits)
   --close-fixed         Close security issues whose packages now meet the
                         required version in the manifests (verified per issue;
-                        anything unverifiable is left open). Needs --update to
+                        anything unverifiable is left open). Verdicts are
+                        remembered per repository: with untouched files a
+                        verdict stands for 7 days ("transitive, no lockfile"
+                        until a lockfile appears), and issues sharing one
+                        requirement list are verified once. Needs --update to
                         actually close; --check reports what it would close.
   --close-label NAME    Label applied before closing (default:
                         "security: verified fixed"; created if absent,

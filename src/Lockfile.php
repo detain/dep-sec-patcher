@@ -18,6 +18,23 @@ final class Lockfile
     private const NPM_LOCKS = ['yarn.lock', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml'];
 
     /**
+     * The lockfile names one ecosystem (as ManifestPaths::ecosystemFor names
+     * them) reads. The close-fixed memory watches for these appearing in a
+     * directory that had none — the one event that can turn "no lockfile"
+     * into a verifiable verdict.
+     *
+     * @return list<string>
+     */
+    public static function lockNamesFor(string $ecosystem): array
+    {
+        return match ($ecosystem) {
+            'npm'      => self::NPM_LOCKS,
+            'composer' => ['composer.lock'],
+            default    => [],
+        };
+    }
+
+    /**
      * Every version the lockfiles in $dir hold for $pkg, or null when $dir
      * has no lockfile for that ecosystem ("npm" or "composer", as
      * ManifestPaths::ecosystemFor names them). An empty list means the lockfile
@@ -27,11 +44,7 @@ final class Lockfile
      */
     public static function versions(string $dir, string $ecosystem, string $pkg): ?array
     {
-        $files = match ($ecosystem) {
-            'npm'      => self::NPM_LOCKS,
-            'composer' => ['composer.lock'],
-            default    => [],
-        };
+        $files = self::lockNamesFor($ecosystem);
         $found    = false;
         $versions = [];
         foreach ($files as $file) {

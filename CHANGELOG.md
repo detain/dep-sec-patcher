@@ -63,6 +63,26 @@ First release: a standalone, generic port of MyAdmin's
   fixes raised new alerts triages once more after publishing, so Dependabot
   PRs opened while the run was going are merged in the same pass;
   `--no-retriage` (config `retriage: false`) skips that second pass.
+- close-fixed remembers its verdicts between runs in `close-state.json` under
+  the repository's state directory, so a re-run pays per changed manifest
+  instead of per open issue: a verdict younger than seven days stands while
+  the files it read are untouched on the checked-out branch (any commit since
+  the check touching one, or any uncommitted edit to one, forces a fresh
+  look), and a "transitive, no lockfile" verdict — the one kind that can only
+  change when a lockfile appears — is reused until a lockfile shows up in an
+  affected directory. Issues sharing one requirement list (the Mend bot files
+  one issue per affected directory per CVE) are verified once per run, the
+  duplicates sharing the answer; a run logs how many same-title issues it saw
+  and the top titles, as a hint to collapse them on the tracker. An issue
+  that has been unverifiable for over a week earns one comment naming exactly
+  what the repository is missing (with `--push`; without it only logged),
+  never a second one while that phase lasts. Every close-fixed run ends with
+  a "not fixed and why" section, console and `security-scan-report.json`
+  (`not_fixed`): open Dependabot alerts bucketed by what the bot is or is not
+  doing about them (a fix is awaiting its PR, none is upstream, one needs a
+  major, an open PR already covers it) and pending database records bucketed
+  by the note that keeps them pending, each bounded to the largest ten per
+  bucket with the totals alongside.
 - A "Next steps" section at the end of a run that found fixes it did not
   apply or publish, with the exact command line that would.
 - Mend's grouped issue format (one issue per library, a summary table and

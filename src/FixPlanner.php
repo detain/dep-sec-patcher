@@ -9,6 +9,8 @@ namespace Detain\DepSecPatcher;
  * tested against fixtures.
  *
  * Pure: no I/O.
+ *
+ * @phpstan-import-type Need from IssueVerifier
  */
 final class FixPlanner
 {
@@ -363,6 +365,86 @@ final class FixPlanner
         }
         ksort($byIssue);
         return array_map('array_values', $byIssue);
+    }
+
+    /**
+     * What each issue is about, read off its database records: the issue
+     * title, a CVE when one is known, the first package it names. For
+     * close-fixed's memory (title hash) and its duplicate-title log.
+     *
+     * @param array<string, mixed> $db
+     * @return array<int, array{title: string, cve: string, package: string}>
+     */
+    public static function issueMeta(array $db): array
+    {
+        $meta = [];
+        foreach ($db['vulns'] as $v) {
+            if (($v['source'] ?? null) !== 'issue') {
+                continue;
+            }
+            $refs = is_array($v['refs'] ?? null) && $v['refs'] !== [] ? $v['refs'] : [$v['ref'] ?? null];
+            foreach ($refs as $ref) {
+                if (!is_int($ref) || $ref <= 0) {
+                    continue;
+                }
+                $m = $meta[$ref] ?? ['title' => '', 'cve' => '', 'package' => ''];
+                $m['title']   = $m['title'] !== '' ? $m['title'] : (string)($v['summary'] ?? '');
+                $m['cve']     = $m['cve'] !== '' ? $m['cve'] : (string)($v['cve'] ?? '');
+                $m['package'] = $m['package'] !== '' ? $m['package'] : (string)($v['package'] ?? '');
+                $meta[$ref]  = $m;
+            }
+        }
+        return $meta;
+    }
+
+    /**
+     * Same-title duplicates among the issues under consideration — the Mend
+     * bot files one issue per affected directory per CVE. Titles with more
+     * than $minTimes issues count; the list is largest-first, capped at $top.
+     *
+     * @param array<int, list<Need>>                                $byIssue
+     * @param array<int, array{title: string, cve: string, package: string}> $meta
+     * @return array{issues: int, titles: list<array{title: string, count: int}>}
+     */
+    public static function duplicateTitles(array $byIssue, array $meta, int $minTimes = 2, int $top = 5): array
+    {
+        $counts = [];
+        foreach (array_keys($byIssue) as $ref) {
+            $title = (string)($meta[$ref]['title'] ?? '');
+            if ($title === '') {
+                continue;
+            }
+            $counts[$title] = ($counts[$title] ?? 0) + 1;
+        }
+        $duplicates = array_filter($counts, static fn (int $n): bool => $n > $minTimes);
+        arsort($duplicates);
+        $issues = array_sum($duplicates);
+        $titles = [];
+        foreach (array_slice(array_keys($duplicates), 0, $top) as $title) {
+            $titles[] = ['title' => $title, 'count' => $duplicates[$title]];
+        }
+        return ['issues' => (int)$issues, 'titles' => $titles];
+    }
+
+    /**
+     * Whether an alert's fix sits on a higher major line than the vulnerable
+     * range starts at: ">= 4.0.0, < 5.0.0" patched only by 5.0.0 leaves
+     * everyone below 4 stuck on a major upgrade. The range's lowest version
+     * token is the line its consumers live on; a range without version
+     * tokens says nothing, so it never claims a major is needed.
+     */
+    public static function alertNeedsMajor(string $vulnerableRange, string $fixedVersion): bool
+    {
+        if ($vulnerableRange === '' || $fixedVersion === '') {
+            return false;
+        }
+        preg_match_all('/\d+(?:\.\d+)+/', $vulnerableRange, $m);
+        if ($m[0] === []) {
+            return false;
+        }
+        $floor = Version::sortAscending($m[0])[0];
+        return Version::majorLine($floor) !== '' && Version::majorLine($fixedVersion) !== ''
+            && (int)Version::majorLine($fixedVersion) > (int)Version::majorLine($floor);
     }
 
     /**

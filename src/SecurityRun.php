@@ -25,6 +25,14 @@ use RuntimeException;
  * One run: GitHub collection, auto-fix, ecosystem updates and audits,
  * scanners, PR triage, optional push (branch, pull request or direct),
  * close-fixed, summary and JSON report.
+ *
+ * @phpstan-import-type Need from IssueVerifier
+ * @phpstan-import-type Verdict from IssueVerifier
+ * @phpstan-import-type Item from NotFixedReport
+ * @phpstan-import-type Counted from NotFixedReport
+ * @phpstan-import-type Bucket from NotFixedReport
+ * @phpstan-import-type Section from NotFixedReport
+ * @phpstan-import-type Report from NotFixedReport
  */
 final class SecurityRun
 {
@@ -58,6 +66,21 @@ final class SecurityRun
     private ?PrTriageState $prTriageState = null;
     /** Whether saving that memory failed; say so once, not per PR. */
     private bool $prStateWarned = false;
+    /** The repo's close-fixed memory; null until that step needs it. */
+    private ?CloseState $closeState = null;
+    /** Whether saving that memory failed; say so once, not per issue. */
+    private bool $closeStateWarned = false;
+    /**
+     * The dependency-bot PRs this run's complete triage listing saw; null
+     * when it never saw one whole.
+     * @var list<array{title: string, body: string}>|null
+     */
+    private ?array $openBotPrs = null;
+    /**
+     * The run's "not fixed and why" section, shaped for the JSON report.
+     * @var Report|null
+     */
+    private ?array $notFixed = null;
     /**
      * Dependabot's open alerts, read once per pass; null when the read failed.
      * @var list<array<string, mixed>>|null
@@ -84,12 +107,15 @@ final class SecurityRun
         private string $advisoryCache = '',
         /** Per-repo PR triage memory; '' puts it beside the reports */
         private string $triageStateFile = '',
+        /** Per-repo close-fixed memory; '' puts it beside the reports */
+        private string $closeStateFile = '',
         ?RegistryProbe $registry = null,
     ) {
         $this->now             = gmdate('Y-m-d\TH:i:s\Z');
         $this->root            = $target->root;
         $this->registry        = $registry ?? new RegistryProbe();
         $this->triageStateFile = $triageStateFile !== '' ? $triageStateFile : dirname($reportDir) . '/triage-state.json';
+        $this->closeStateFile  = $closeStateFile !== '' ? $closeStateFile : dirname($reportDir) . '/close-state.json';
     }
 
     public function run(): int
@@ -722,6 +748,14 @@ final class SecurityRun
         }
         // Only touch PRs raised by dependency bots, never a human contributor's work
         $bots = array_values(array_filter($prs, static fn ($pr) => empty($pr['isDraft']) && self::isBot($pr['author'] ?? null)));
+        if ($complete) {
+            // The report may call an alert covered by an open PR only when
+            // the listing saw every PR; a cut-short one proves nothing
+            $this->openBotPrs = array_map(static fn (array $pr): array => [
+                'title' => (string)($pr['title'] ?? ''),
+                'body'  => (string)($pr['body'] ?? ''),
+            ], $bots);
+        }
         if ($bots === []) {
             $c->ok($prs === [] ? 'No open PRs' : 'No dependency-bot PRs open');
             if (!$recheck) {
@@ -1805,7 +1839,8 @@ final class SecurityRun
             }
         }
 
-        $byIssue = FixPlanner::issueRequirements($this->loadDb());
+        $db      = $this->loadDb();
+        $byIssue = FixPlanner::issueRequirements($db);
         // The database keeps refs forever and most are long closed; only
         // consider issues that are actually open, so a run does not burn the
         // content-creation quota on failures
@@ -1839,10 +1874,60 @@ final class SecurityRun
             $this->target->subdir,
             $this->removedIn(...)
         );
-        $closed = $unresolved = $unverifiable = $rateLimited = $outOfScope = 0;
+        // Cross-run memory: a verdict younger than the reuse window stands
+        // while the files it read are untouched since it was drawn, so a
+        // re-run pays per changed manifest, not per open issue.
+        $state   = $this->closeState();
+        $changed = $this->changedSinceChecks($state);
+        $meta    = FixPlanner::issueMeta($db);
+        $lister  = $this->dirLister();
+        $verify  = [$verifier, 'verify'];
+
+        $closed = $unresolved = $unverifiable = $rateLimited = $outOfScope = $cached = $shared = 0;
         $whyUnverifiable = [];
+        /** @var array<string, array{ok: bool, reason: string, detail: string, evidence: string}> $batch */
+        $batch = [];
+        /** @var list<array{ref: string, days: int, entry: array<string, mixed>}> $annotate */
+        $annotate = [];
         foreach ($byIssue as $ref => $needs) {
-            ['ok' => $ok, 'reason' => $reason, 'detail' => $detail, 'evidence' => $evidence] = $verifier->verify($needs);
+            $refNum = (string)$ref;
+            $entry  = $state->get($refNum);
+            $age    = PrTriageState::secondsSince((string)($entry['checked_at'] ?? ''), $this->now);
+            [$verdict, $origin] = CloseState::resolve(
+                $needs,
+                $entry,
+                $age,
+                $changed === null || $this->entryPathsTouched($entry, $changed),
+                $this->lockfileAppeared($entry),
+                $verify,
+                $batch
+            );
+            ['ok' => $ok, 'reason' => $reason, 'detail' => $detail, 'evidence' => $evidence] = $verdict;
+            match ($origin) {
+                'cached' => $cached++,
+                'shared' => $shared++,
+                default  => null,
+            };
+            if ($origin !== 'cached' && $changed !== null) {
+                // Remember what this run verified — but only while every file
+                // the verdict leans on is clean: a verdict drawn from an
+                // uncommitted edit would outlive it (the edit reverted, the
+                // memory kept), and reuse would then rest on nothing.
+                $paths = $this->needsPaths($needs, $lister);
+                if (!self::pathsTouched($paths, $changed)) {
+                    $m = $meta[$ref] ?? ['title' => '', 'cve' => '', 'package' => ''];
+                    $state->remember($refNum, $ok ? 'fixed' : $reason, [
+                        'key'        => CloseState::key($needs),
+                        'why'        => $reason === 'unverifiable' ? self::unverifiableWhy($detail) : '',
+                        'detail'     => mb_substr($detail, 0, 240),
+                        'evidence'   => $ok ? mb_substr($evidence, 0, 4000) : '',
+                        'paths'      => $paths,
+                        'title_hash' => $m['title'] !== '' ? substr(sha1($m['title']), 0, 12) : '',
+                        'cve'        => $m['cve'],
+                        'package'    => $m['package'] !== '' ? $m['package'] : (string)($needs[0]['package'] ?? ''),
+                    ]);
+                }
+            }
             if (!$ok) {
                 match ($reason) {
                     'unresolved'   => $unresolved++,
@@ -1850,21 +1935,23 @@ final class SecurityRun
                     default        => $unverifiable++,
                 };
                 if ($reason === 'unverifiable') {
-                    $why = match (true) {
-                        str_contains($detail, 'no fixed version') => 'no fix known',
-                        str_contains($detail, 'manifest missing') => 'manifest missing',
-                        str_contains($detail, 'nor in its lockfile') => 'not declared or locked',
-                        default => 'transitive, no lockfile',
-                    };
+                    $why = $origin === 'cached' && ($entry['why'] ?? '') !== '' ? (string)$entry['why'] : self::unverifiableWhy($detail);
                     $whyUnverifiable[$why] = ($whyUnverifiable[$why] ?? 0) + 1;
+                    // An issue unverifiable for over a week gets one comment
+                    // saying what the repository is missing. It ages on
+                    // `since`, which re-verification does not reset.
+                    $sinceAge = PrTriageState::secondsSince((string)($entry['since'] ?? ''), $this->now);
+                    if (CloseState::needsAnnotation($entry, $sinceAge)) {
+                        $annotate[] = ['ref' => $refNum, 'days' => intdiv((int)$sinceAge, 86400), 'entry' => $entry];
+                    }
                 }
                 if ($this->opt->debug) {
-                    $c->info("  #{$ref} " . ($reason === 'unresolved' ? 'still open' : $reason) . ": {$detail}");
+                    $c->info("  #{$ref} " . ($reason === 'unresolved' ? 'still open' : $reason) . ($origin === 'cached' ? ' (cached)' : '') . ": {$detail}");
                 }
                 continue;
             }
             if (!$update) {
-                $c->info("  would close #{$ref} (all fixes verified)");
+                $c->info("  would close #{$ref} (all fixes verified)" . ($origin === 'cached' ? ', from the remembered verdict' : ''));
                 $this->wouldClose++;
                 continue;
             }
@@ -1888,7 +1975,7 @@ final class SecurityRun
             for ($attempt = 1; ; $attempt++) {
                 $res = $this->gh()->run(['issue', 'close', (string)$ref, '--repo', $repo, '--reason', 'completed', '--comment', $body], 120);
                 if ($res->ok()) {
-                    $c->ok("  closed #{$ref} (all fixes verified)");
+                    $c->ok("  closed #{$ref} (all fixes verified)" . ($origin === 'cached' ? ', from the remembered verdict' : ''));
                     $closed++;
                     break;
                 }
@@ -1907,6 +1994,8 @@ final class SecurityRun
                 break;
             }
             // Stop cleanly at the cap so a run stays inside the hourly quota
+            // (0 means uncapped, matching the help text: only a positive
+            // limit can cut the loop short)
             if ($this->opt->closeLimit > 0 && $closed >= $this->opt->closeLimit) {
                 $c->info("close-fixed: reached --close-limit {$this->opt->closeLimit}; re-run to continue");
                 break;
@@ -1915,10 +2004,377 @@ final class SecurityRun
         // A listing run closed nothing, and must not say it did
         $tally = $update ? "closed={$closed}" : "would-close={$this->wouldClose}";
         arsort($whyUnverifiable);
-        $c->info("close-fixed: {$tally} still-vulnerable={$unresolved} unverifiable={$unverifiable} rate-limited={$rateLimited}"
+        $c->info("close-fixed: {$tally} still-vulnerable={$unresolved} unverifiable={$unverifiable} rate-limited={$rateLimited} cached={$cached}"
+            . ($shared > 0 ? " shared-checks={$shared}" : '')
             . ($this->target->subdir !== '' ? " outside-subdir={$outOfScope}" : '')
             . ($whyUnverifiable !== [] ? ' (unverifiable: ' . implode(', ', array_map(static fn ($k, $n) => "{$n} {$k}", array_keys($whyUnverifiable), $whyUnverifiable)) . ')' : ''));
+        $dupes = FixPlanner::duplicateTitles($byIssue, $meta);
+        if ($dupes['issues'] > 0) {
+            $top = implode(', ', array_map(static fn (array $t): string => '"' . $t['title'] . '" x' . $t['count'], $dupes['titles']));
+            $c->info("close-fixed: {$dupes['issues']} duplicate-title issues (>2 per title) — consider closing dupes as duplicates on the tracker: {$top}");
+        }
+        $this->annotateUnverifiable($repo, $annotate, $update && $this->opt->push);
+        // Issues GitHub no longer lists as open have been closed, by this
+        // tool or by anyone else: their memory is spent.
+        $state->retain(array_map(static fn (int $n): string => (string)$n, $open));
+        $this->saveCloseState();
+        $this->notFixedSection($db);
         $this->record('close-fixed', 'PASS', 0, 0, $update ? "closed {$closed}" : "would close {$this->wouldClose} (not closed)");
+    }
+
+    /**
+     * Why an unverifiable detail says so, in tally words.
+     */
+    private static function unverifiableWhy(string $detail): string
+    {
+        return match (true) {
+            str_contains($detail, 'no fixed version')    => 'no fix known',
+            str_contains($detail, 'manifest missing')    => 'manifest missing',
+            str_contains($detail, 'nor in its lockfile') => 'not declared or locked',
+            default                                      => CloseState::TRANSITIVE_WHY,
+        };
+    }
+
+    /**
+     * The files a verdict leans on: every manifest a requirement names, plus
+     * the source manifest a lockfile would stand in for. A change to any of
+     * them can change the verdict.
+     *
+     * @param list<array{manifest: string}>  $needs
+     * @param callable(string): list<string> $lister
+     * @return list<string>
+     */
+    private function needsPaths(array $needs, callable $lister): array
+    {
+        $paths = [];
+        foreach ($needs as $need) {
+            $manifest = $need['manifest'];
+            if ($manifest === '') {
+                continue;
+            }
+            $paths[$manifest] = true;
+            $paths[ManifestPaths::sourceManifestFor($manifest, $lister)] = true;
+        }
+        $out = array_keys($paths);
+        sort($out);
+        return $out;
+    }
+
+    /**
+     * @param array<string, mixed> $entry
+     * @param array<string, true>  $changed
+     */
+    private function entryPathsTouched(array $entry, array $changed): bool
+    {
+        return self::pathsTouched(array_values(array_filter((array)($entry['paths'] ?? []), 'is_string')), $changed);
+    }
+
+    /**
+     * @param list<string>        $paths
+     * @param array<string, true> $changed
+     */
+    private static function pathsTouched(array $paths, array $changed): bool
+    {
+        return array_intersect($paths, array_keys($changed)) !== [];
+    }
+
+    /**
+     * Whether a cached "transitive, no lockfile" verdict has been overtaken
+     * by events: a lockfile now standing where the verifier found none.
+     * Without a package name to look for, the answer is unknown, and unknown
+     * means re-verify.
+     *
+     * @param array<string, mixed> $entry
+     */
+    private function lockfileAppeared(array $entry): bool
+    {
+        if ((string)($entry['verdict'] ?? '') !== 'unverifiable'
+            || (string)($entry['why'] ?? '') !== CloseState::TRANSITIVE_WHY) {
+            return false;
+        }
+        $package = (string)($entry['package'] ?? '');
+        if ($package === '') {
+            return true;
+        }
+        foreach ((array)($entry['paths'] ?? []) as $path) {
+            if (!is_string($path) || $path === '') {
+                continue;
+            }
+            $eco = ManifestPaths::ecosystemFor($path);
+            if (!in_array($eco, ['npm', 'composer'], true)) {
+                continue;
+            }
+            if (Lockfile::versions($this->root . '/' . dirname($path), $eco, $package) !== null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Every path changed since the oldest remembered verdict: commits on the
+     * checked-out branch (with a day of slack for committer clocks), plus
+     * whatever is uncommitted right now. Null when git cannot answer — a
+     * shallow clone's history proves nothing about a month of it — and null
+     * means no reuse and no new memory: today's verification stands on its
+     * own, never yesterday's verdict on unprovable ground.
+     *
+     * @return array<string, true>|null
+     */
+    private function changedSinceChecks(CloseState $state): ?array
+    {
+        $opt     = ['timeout' => 120, 'label' => 'git'];
+        $shallow = $this->ctx->runner->run(['git', '-C', $this->root, 'rev-parse', '--is-shallow-repository'], $this->root, ['timeout' => 30, 'label' => 'git']);
+        if (!$shallow->ok() || trim($shallow->stdout) !== 'false') {
+            return null;
+        }
+        $status = $this->ctx->runner->run(['git', '-C', $this->root, 'status', '--porcelain', '-z', '--untracked-files=all'], $this->root, $opt);
+        if (!$status->ok()) {
+            return null;
+        }
+        $changed = [];
+        $entries = explode("\0", rtrim($status->stdout, "\0"));
+        for ($i = 0; $i < count($entries); $i++) {
+            if (strlen($entries[$i]) < 4) {
+                continue;
+            }
+            $changed[substr($entries[$i], 3)] = true;
+            // A rename or copy is followed by its original path
+            if (in_array($entries[$i][0], ['R', 'C'], true)) {
+                $i++;
+                if (isset($entries[$i]) && $entries[$i] !== '') {
+                    $changed[$entries[$i]] = true;
+                }
+            }
+        }
+        $oldest = $state->oldestCheck();
+        if ($oldest === '') {
+            return $changed;
+        }
+        $epoch = strtotime($oldest);
+        if ($epoch === false) {
+            return null;
+        }
+        $log = $this->ctx->runner->run(['git', '-C', $this->root, 'log', '--since=@' . ($epoch - 86400), '--pretty=format:', '--name-only', 'HEAD'], $this->root, $opt);
+        if (!$log->ok()) {
+            return null;
+        }
+        foreach (preg_split('/\R/', $log->stdout) ?: [] as $line) {
+            $line = trim($line);
+            if ($line !== '') {
+                $changed[$line] = true;
+            }
+        }
+        return $changed;
+    }
+
+    /**
+     * Tell the issues that have been unverifiable for over a week exactly
+     * what the repository is missing — once. The comment is a write, so it
+     * rides on --push; without it the intention is only logged, and the
+     * memory stays unmarked so a later pushing run can still annotate.
+     *
+     * @param list<array{ref: string, days: int, entry: array<string, mixed>}> $annotate
+     */
+    private function annotateUnverifiable(string $repo, array $annotate, bool $write): int
+    {
+        if ($annotate === []) {
+            return 0;
+        }
+        $c   = $this->console;
+        $log = 0;
+        foreach ($annotate as $a) {
+            if (!$write) {
+                $log++;
+                if ($log <= 10) {
+                    $c->info("close-fixed: #{$a['ref']} has been unverifiable for {$a['days']} days — would annotate (run with --push to post)");
+                }
+                continue;
+            }
+            $body = self::unverifiableNote($a['entry'], $a['days']);
+            if ($this->gh()->run(['issue', 'comment', $a['ref'], '--repo', $repo, '--body', $body], 120)->ok()) {
+                $this->closeState()->markAnnotated($a['ref']);
+                $c->ok("  annotated #{$a['ref']} (unverifiable {$a['days']}d)");
+            } else {
+                $c->warn("  could not annotate #{$a['ref']}");
+            }
+        }
+        if (!$write && $log > 10) {
+            $c->info('close-fixed: ' . ($log - 10) . ' more long-unverifiable issue(s) would be annotated');
+        }
+        return count($annotate);
+    }
+
+    /**
+     * The one-shot comment body: what the check needs that the repository
+     * does not have, phrased per reason.
+     *
+     * @param array<string, mixed> $entry
+     */
+    public static function unverifiableNote(array $entry, int $days): string
+    {
+        $why      = (string)($entry['why'] ?? '');
+        $package  = (string)($entry['package'] ?? '');
+        $dirs     = self::entryDirs($entry);
+        $what     = $package !== '' ? "`{$package}`" : 'This dependency';
+        $sentence = match ($why) {
+            CloseState::TRANSITIVE_WHY => $what . ' is transitive, and ' . $dirs . ' hold no lockfile to verify against'
+                . ': commit a lockfile (package-lock.json, yarn.lock, pnpm-lock.yaml or composer.lock) there, or fix it manually.',
+            'no fix known'           => 'no fixed version is known upstream for ' . $what . '; watch the advisory, or replace the package.',
+            'manifest missing'       => 'the manifest this issue names is gone from the branch, so there is nothing to verify against; close it manually once the removal is confirmed.',
+            'not declared or locked' => $what . ' is neither declared nor locked where the issue expects it; the issue text may name the wrong manifest.',
+            default                  => ($entry['detail'] ?? '') !== '' ? (string)$entry['detail'] : 'the current manifests cannot confirm or deny it.',
+        };
+        return "### Not auto-verifiable\n\n"
+            . "dep-sec-patcher `--close-fixed` has not been able to verify this issue for {$days} days: {$sentence}\n\n"
+            . 'Checked by [dep-sec-patcher](https://github.com/detain/dep-sec-patcher), which closes nothing it cannot verify. '
+            . "Once the missing piece exists, a run with `--close-fixed` will decide again.\n\n"
+            . '<!-- security-update:unverifiable-note -->';
+    }
+
+    /**
+     * The directories a remembered verdict was about, for the note.
+     *
+     * @param array<string, mixed> $entry
+     */
+    private static function entryDirs(array $entry): string
+    {
+        $dirs = [];
+        foreach ((array)($entry['paths'] ?? []) as $path) {
+            if (!is_string($path) || $path === '') {
+                continue;
+            }
+            $dir = dirname($path);
+            $dirs[$dir === '.' ? '/' : '/' . ltrim($dir, '/')] = true;
+        }
+        if ($dirs === []) {
+            return 'the project';
+        }
+        $out = array_keys($dirs);
+        sort($out);
+        return '`' . implode('`, `', $out) . '`';
+    }
+
+    /**
+     * The run's diagnostic: everything still open, and the reason it waits.
+     * Dependabot alerts by what the bot is or is not doing about them,
+     * database records by the note auto-fix left on them.
+     *
+     * @param array<string, mixed> $db
+     */
+    private function notFixedSection(array $db): void
+    {
+        $report = NotFixedReport::build($this->alertBuckets(), $this->databaseBuckets($db));
+        if ($report['dependabot_alerts']['total'] === 0 && $report['vuln_db_records']['total'] === 0) {
+            return;
+        }
+        $this->notFixed = $report;
+        foreach (NotFixedReport::consoleLines($report) as $line) {
+            $this->console->line($line);
+        }
+    }
+
+    /**
+     * Open Dependabot alerts bucketed by why they are still open. Whether a
+     * bot PR covers one is only claimed from a complete PR listing; an
+     * unproven coverage just leaves the alert in the awaiting bucket.
+     *
+     * @return array<string, list<array{package: string, ecosystem: string, version: string}>>
+     */
+    private function alertBuckets(): array
+    {
+        $alerts = $this->openDependabotAlerts();
+        if ($alerts === null) {
+            return [];
+        }
+        $buckets = [];
+        foreach ($alerts as $alert) {
+            $fixed  = (string)($alert['fixed_version'] ?? '');
+            $reason = match (true) {
+                $fixed === ''                                                                  => 'no-fix-upstream',
+                FixPlanner::alertNeedsMajor((string)($alert['vulnerable_range'] ?? ''), $fixed) => 'needs-major',
+                $this->openBotPrs !== null && $this->botPrCovers($alert)                       => 'covered-by-open-PR',
+                default                                                                       => 'fix-available-awaiting-bot-PR',
+            };
+            $buckets[$reason][] = [
+                'package'   => (string)($alert['package'] ?? '?'),
+                'ecosystem' => (string)($alert['ecosystem'] ?? ''),
+                'version'   => $fixed,
+            ];
+        }
+        return $buckets;
+    }
+
+    /**
+     * Whether an open bot PR is already moving the package this alert is
+     * about, in the directory the PR title names.
+     *
+     * @param array<string, mixed> $alert
+     */
+    private function botPrCovers(array $alert): bool
+    {
+        foreach ($this->openBotPrs ?? [] as $pr) {
+            $packages = self::prPackages($pr['title'], $pr['body']);
+            if ($packages !== [] && self::alertsCoverPr($packages, self::prDirectory($pr['title']), [$alert])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Pending and skipped database records bucketed by the note that keeps
+     * them there; a record with no fix version needs no note to say so.
+     *
+     * @param array<string, mixed> $db
+     * @return array<string, list<array{package: string, ecosystem: string, version: string}>>
+     */
+    private function databaseBuckets(array $db): array
+    {
+        $buckets = [];
+        foreach ($db['vulns'] as $v) {
+            if (!in_array((string)($v['state'] ?? ''), ['pending', 'skipped'], true)) {
+                continue;
+            }
+            $fixed  = (string)($v['fixed_version'] ?? '');
+            $reason = $fixed === '' ? 'no-fix-yet' : NotFixedReport::noteReason((string)($v['note'] ?? ''));
+            $buckets[$reason][] = [
+                'package'   => (string)($v['package'] ?? '?'),
+                'ecosystem' => (string)($v['ecosystem'] ?? ''),
+                'version'   => $fixed,
+            ];
+        }
+        return $buckets;
+    }
+
+    /**
+     * The close memory of this run's repository, read on first use.
+     */
+    private function closeState(): CloseState
+    {
+        if ($this->closeState === null) {
+            $corrupt = false;
+            $this->closeState = CloseState::load($this->closeStateFile, $this->now, $this->repo(), $corrupt);
+            if ($corrupt) {
+                $this->console->warn("the close state was unreadable and starts fresh: {$this->closeStateFile}");
+            }
+        }
+        return $this->closeState;
+    }
+
+    private function saveCloseState(): void
+    {
+        if ($this->closeState === null) {
+            return;
+        }
+        try {
+            $this->closeState->save();
+        } catch (RuntimeException $e) {
+            if (!$this->closeStateWarned) {
+                $this->closeStateWarned = true;
+                $this->console->warn("close state cannot be saved ({$e->getMessage()}); this run's verdicts are not remembered");
+            }
+        }
     }
 
     // ── --push / --pr / --push-direct ────────────────────────────────────────
@@ -2240,7 +2696,7 @@ final class SecurityRun
                 'grype'  => ['enabled' => $this->opt->trivy !== 'no' && $this->opt->grype !== 'no'],
                 'netsec' => ['enabled' => $this->opt->netsec !== 'no'],
             ],
-        ];
+        ] + ($this->notFixed === null ? [] : ['not_fixed' => $this->notFixed]);
         $file = $this->reportDir . '/security-scan-report.json';
         if (@file_put_contents($file, JsonFile::encode($report)) !== false) {
             $this->console->info("JSON report generated: {$file}");

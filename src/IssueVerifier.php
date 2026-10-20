@@ -11,6 +11,13 @@ namespace Detain\DepSecPatcher;
  *
  * Anything that cannot be checked is "unverifiable", never "resolved":
  * under-closing is recoverable, closing a live vulnerability is not.
+ *
+ * Need is one requirement of one issue (FixPlanner::issueRequirements
+ * yields them); Verdict is what verify() answers, and what CloseState
+ * remembers.
+ *
+ * @phpstan-type Need array{ecosystem: string, package: string, fixed_version: string, fix_versions: list<string>, manifest: string}
+ * @phpstan-type Verdict array{ok: bool, reason: string, detail: string, evidence: string}
  */
 final class IssueVerifier
 {
@@ -34,8 +41,8 @@ final class IssueVerifier
     }
 
     /**
-     * @param list<array{ecosystem: string, package: string, fixed_version: string, fix_versions: list<string>, manifest: string}> $needs
-     * @return array{ok: bool, reason: string, detail: string, evidence: string}
+     * @param list<Need> $needs
+     * @return Verdict
      *         reason: '' when ok, else unresolved / unverifiable / out-of-scope;
      *         evidence: markdown table rows for the closing comment
      */
@@ -97,7 +104,7 @@ final class IssueVerifier
     }
 
     /**
-     * @return array{ok: bool, reason: string, detail: string, evidence: string}
+     * @return Verdict
      */
     private static function fail(string $reason, string $detail): array
     {

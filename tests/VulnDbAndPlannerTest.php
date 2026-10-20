@@ -256,4 +256,51 @@ class VulnDbAndPlannerTest extends TestCase
         $this->assertSame('6.15.2', $got['version']);
         $this->assertSame('', $got['why']);
     }
+
+    public function testIssueMetaReadsEachIssueThroughItsRecords(): void
+    {
+        $db = VulnDb::upsert(VulnDb::empty(), [
+            self::rec(['key' => 'k1', 'refs' => [5], 'ref' => 5, 'summary' => 'CVE-1 in qs', 'cve' => 'CVE-1', 'package' => 'qs']),
+            self::rec(['key' => 'k2', 'refs' => [6, 5], 'ref' => 6, 'summary' => 'CVE-2 in qs', 'cve' => 'CVE-2', 'package' => 'lodash']),
+            self::rec(['key' => 'k3', 'source' => 'dependabot', 'refs' => [9], 'ref' => 9, 'summary' => 'not an issue']),
+        ], 'now', '');
+        $meta = FixPlanner::issueMeta($db);
+        $this->assertSame(['title' => 'CVE-1 in qs', 'cve' => 'CVE-1', 'package' => 'qs'], $meta[5], 'the first record to say something wins');
+        $this->assertSame(['title' => 'CVE-2 in qs', 'cve' => 'CVE-2', 'package' => 'lodash'], $meta[6], 'a multi-issue record describes every issue it names');
+        $this->assertSame([], $meta[9] ?? [], 'dependabot records are not issues');
+    }
+
+    public function testDuplicateTitlesCountsOnlyTitlesWithMoreThanTwoIssues(): void
+    {
+        $need = static fn (string $p): array => [[
+            'ecosystem' => 'npm', 'package' => $p, 'fixed_version' => '1.0',
+            'fix_versions' => ['1.0'], 'manifest' => 'a/package.json',
+        ]];
+        $byIssue = [1 => $need('a'), 2 => $need('a'), 3 => $need('a'), 4 => $need('a'),
+                    5 => $need('b'), 6 => $need('b'), 7 => $need('c'), 8 => $need('')];
+        $meta = [1 => ['title' => 'Title A', 'cve' => '', 'package' => ''],
+                 2 => ['title' => 'Title A', 'cve' => '', 'package' => ''],
+                 3 => ['title' => 'Title A', 'cve' => '', 'package' => ''],
+                 4 => ['title' => 'Title A', 'cve' => '', 'package' => ''],
+                 5 => ['title' => 'Title B', 'cve' => '', 'package' => ''],
+                 6 => ['title' => 'Title B', 'cve' => '', 'package' => ''],
+                 7 => ['title' => '', 'cve' => '', 'package' => '']];
+        $got = FixPlanner::duplicateTitles($byIssue, $meta);
+        $this->assertSame(4, $got['issues'], 'only Title A crossed the more-than-two bar, and it counts its issues');
+        $this->assertSame([['title' => 'Title A', 'count' => 4]], $got['titles']);
+        $this->assertSame(0, FixPlanner::duplicateTitles([1 => $need('a')], $meta)['issues']);
+    }
+
+    public function testAlertNeedsMajorComparesTheFixToTheRangesFloor(): void
+    {
+        $this->assertTrue(FixPlanner::alertNeedsMajor('>= 4.0.0, < 5.0.0', '5.0.0'), 'the only fix is on the next major');
+        $this->assertTrue(FixPlanner::alertNeedsMajor('>= 1.0.0, < 1.9.0', '2.0.1'));
+        $this->assertTrue(FixPlanner::alertNeedsMajor('< 4.0.0', '5.0.0'), 'conservative when the range has one token');
+        $this->assertFalse(FixPlanner::alertNeedsMajor('>= 4.0.0, < 4.1.100', '4.1.100'), 'the ordinary case: a patch-line fix');
+        $this->assertFalse(FixPlanner::alertNeedsMajor('>= 1.0.0, < 1.9.0', '1.5.0'));
+        $this->assertFalse(FixPlanner::alertNeedsMajor('>= 2.0.0, < 3.0.0', '2.9.9'));
+        $this->assertFalse(FixPlanner::alertNeedsMajor('', '5.0.0'), 'no range claims nothing');
+        $this->assertFalse(FixPlanner::alertNeedsMajor('>= 4.0.0', ''), 'no fix means no fix line to compare');
+        $this->assertFalse(FixPlanner::alertNeedsMajor('all versions', '3.0.0'), 'a range without version tokens says nothing');
+    }
 }

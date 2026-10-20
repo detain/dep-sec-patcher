@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Detain\DepSecPatcher\Tests;
 
+use Detain\DepSecPatcher\CloseState;
 use Detain\DepSecPatcher\FixPlanner;
 use Detain\DepSecPatcher\GitHub;
 use Detain\DepSecPatcher\IssueVerifier;
@@ -194,6 +195,29 @@ class IssueListingAndVerifierTest extends TestCase
         $line = $m->invoke(null, 'close-fixed', ['status' => 'PASS', 'vulns' => 0, 'outdated' => 0, 'note' => 'would close 58 (not closed)']);
         $this->assertSame('close-fixed       PASS     0                0          would close 58 (not closed)', $line);
         $this->assertSame('maven             FAIL     206              3', $m->invoke(null, 'maven', ['status' => 'FAIL', 'vulns' => 206, 'outdated' => 3, 'note' => '']));
+    }
+
+    public function testTheUnverifiableNoteSpellsOutWhatTheRepositoryIsMissing(): void
+    {
+        $transitive = SecurityRun::unverifiableNote([
+            'verdict' => 'unverifiable', 'why' => CloseState::TRANSITIVE_WHY, 'package' => 'qs',
+            'paths' => ['web/package.json', 'api/package.json', 'web/package.json'],
+        ], 9);
+        $this->assertStringContainsString('has not been able to verify this issue for 9 days', $transitive);
+        $this->assertStringContainsString('`qs` is transitive', $transitive);
+        $this->assertStringContainsString('`/api`, `/web` hold no lockfile', $transitive, 'directories dedup and sort');
+        $this->assertStringContainsString('commit a lockfile', $transitive);
+        $this->assertStringContainsString('<!-- security-update:unverifiable-note -->', $transitive, 'the marker says who spoke and stops a repeat');
+
+        $noFix = SecurityRun::unverifiableNote(['verdict' => 'unverifiable', 'why' => 'no fix known', 'package' => 'old-lib'], 30);
+        $this->assertStringContainsString('no fixed version is known upstream for `old-lib`', $noFix);
+
+        $unknown = SecurityRun::unverifiableNote(['verdict' => 'unverifiable', 'why' => 'quite peculiar', 'detail' => 'the resolver shrugged'], 8);
+        $this->assertStringContainsString('the resolver shrugged', $unknown, 'an unclassified reason quotes the verifier');
+
+        $noPackage = SecurityRun::unverifiableNote(['verdict' => 'unverifiable', 'why' => CloseState::TRANSITIVE_WHY, 'paths' => []], 7);
+        $this->assertStringContainsString('This dependency is transitive', $noPackage);
+        $this->assertStringContainsString('the project hold no lockfile', $noPackage, 'no known directory still reads as a sentence');
     }
 
     /**
