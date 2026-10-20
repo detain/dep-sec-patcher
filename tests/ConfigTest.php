@@ -41,6 +41,7 @@ class ConfigTest extends TestCase
             'close-label'    => 'verified',
             'close-delay'    => 0,
             'close-limit'    => 10,
+            'retriage'       => false,
             'allow-http'     => ['http://intranet.example/', '*.corp.example/'],
             'exclude-dirs'   => ['docs', './test/fixtures/'],
         ];
@@ -64,6 +65,7 @@ class ConfigTest extends TestCase
         $this->assertSame('verified', $o->closeLabel);
         $this->assertSame(0, $o->closeDelay);
         $this->assertSame(10, $o->closeLimit);
+        $this->assertFalse($o->retriage);
         $this->assertSame(['intranet.example/', '*.corp.example/'], $o->allowHttp, 'http:// prefix dropped');
         $this->assertSame(['docs', 'test/fixtures'], $o->excludeDirs, 'paths normalised');
     }

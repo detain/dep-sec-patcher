@@ -54,6 +54,22 @@ final class SecurityRun
     /** @var list<int>|null every open issue's number, when the collection read them all */
     private ?array $openIssueNumbers = null;
     private int $openIssueRecords = 0;
+    /** The repo's PR triage memory; null until the triage step needs it. */
+    private ?PrTriageState $prTriageState = null;
+    /** Whether saving that memory failed; say so once, not per PR. */
+    private bool $prStateWarned = false;
+    /**
+     * Dependabot's open alerts, read once per pass; null when the read failed.
+     * @var list<array<string, mixed>>|null
+     */
+    private ?array $openAlerts = null;
+    private bool $openAlertsRead = false;
+    /** Whether a triage pass got past its guards (the recheck needs that). */
+    private bool $triageListed = false;
+    /** @var array<string, true> PRs the first pass of this run already handled */
+    private array $triageHandled = [];
+    /** The repository's default branch, read once when a PR needs its name. */
+    private string $defaultBranchRef = '';
 
     public function __construct(
         private Options $opt,
@@ -66,11 +82,14 @@ final class SecurityRun
         private array $argv = [],
         /** Where OSV answers are cached between runs; '' keeps them for this run only */
         private string $advisoryCache = '',
+        /** Per-repo PR triage memory; '' puts it beside the reports */
+        private string $triageStateFile = '',
         ?RegistryProbe $registry = null,
     ) {
-        $this->now      = gmdate('Y-m-d\TH:i:s\Z');
-        $this->root     = $target->root;
-        $this->registry = $registry ?? new RegistryProbe();
+        $this->now             = gmdate('Y-m-d\TH:i:s\Z');
+        $this->root            = $target->root;
+        $this->registry        = $registry ?? new RegistryProbe();
+        $this->triageStateFile = $triageStateFile !== '' ? $triageStateFile : dirname($reportDir) . '/triage-state.json';
     }
 
     public function run(): int
@@ -160,6 +179,12 @@ final class SecurityRun
         }
         // Publish before close-fixed, which only closes what reached the base branch
         $this->publishChanges($publisher, $cleanAtStart, $startBranch);
+        // The pushed fixes raise Dependabot alerts of their own, and the bot
+        // opens PRs for them while the run is still going; look once more
+        // before the run ends so a clean one does not wait for a whole cycle
+        if ($triaged && $this->opt->retriage && $this->triageListed && $this->appliedFixes !== []) {
+            $this->triagePullRequests(true);
+        }
         $this->closeFixedIssues();
 
         $this->printSummary();
@@ -493,9 +518,12 @@ final class SecurityRun
         $repo = $this->repo();
         $c->info("GitHub repository: {$repo}");
 
-        $alerts = $this->gh()->paginate("repos/{$repo}/dependabot/alerts?state=open&per_page=100");
-        $alertRecords = RecordNormalizer::fromDependabotAlerts($alerts ?? []);
-        if ($alerts === null) {
+        // The same rows the triage step reads to spot superseded PRs; when
+        // it already looked, no second call is made
+        $alertRows    = $this->openDependabotAlerts();
+        $alertsReadOk = $alertRows !== null;
+        $alertRecords = $alertRows ?? [];
+        if (!$alertsReadOk) {
             $c->warn('Dependabot: could not list alerts (API error or no access)');
             $this->record('dependabot', 'SKIP');
         } elseif ($alertRecords !== []) {
@@ -579,7 +607,7 @@ final class SecurityRun
         }
         // Alerts fixed or dismissed and issues closed since they were recorded
         // are retired, but only from a complete listing
-        if ($alerts !== null) {
+        if ($alertsReadOk) {
             $db = VulnDb::retire($db, 'dependabot', array_fill_keys(array_column($alertRecords, 'key'), true), $this->now);
         }
         if ($issues !== null && $complete) {
@@ -639,7 +667,15 @@ final class SecurityRun
 
     // ── dependency-bot PR triage ─────────────────────────────────────────────
 
-    private function triagePullRequests(): void
+    /**
+     * Merge what dependency bots raised and GitHub can merge, ask the bots
+     * to rebase what conflicts or fell behind, close what another change has
+     * made redundant, and remember every verdict in the repo's triage state
+     * so the next pass escalates instead of rediscovering. $recheck is the
+     * second pass after a push: the run's own changes may have raised alerts
+     * the bot opened PRs for while the run was going.
+     */
+    private function triagePullRequests(bool $recheck = false): void
     {
         $c = $this->console;
         if (!$this->opt->githubEnabled() || $this->opt->mergePrs === 'no') {
@@ -659,114 +695,197 @@ final class SecurityRun
             return;
         }
         $repo = $this->repo();
-        $c->info("Triaging dependency-bot PRs on {$repo}...");
+        $c->info($recheck
+            ? "Re-checking {$repo} for dependency-bot PRs opened during the run..."
+            : "Triaging dependency-bot PRs on {$repo}...");
+        $this->triageListed = true;
+        if ($recheck) {
+            // This run's own push may have resolved the alerts the first
+            // pass read; the supersede test needs the list as it stands now
+            $this->openAlertsRead = false;
+            $this->openAlerts     = null;
+        }
 
-        $prs = $this->gh()->json(['pr', 'list', '--repo', $repo, '--state', 'open', '--limit', '100',
-            '--json', 'number,title,author,isDraft,headRefName,body']);
-        if (!is_array($prs)) {
+        // A listing capped at 100 silently dropped the rest on busy repos,
+        // so page through the REST list until a short page ends it
+        $prs = self::pullRequestRows(GitHub::collectPulls(
+            fn (int $page): ?array => $this->pullRequestPage($repo, $page),
+            $complete
+        ));
+        if ($prs === [] && !$complete) {
             $c->warn('PR triage: could not list pull requests');
             return;
+        }
+        if (!$complete) {
+            $c->warn('PR triage: the pull request listing was cut short; acting on what was read, '
+                . 'and the triage state stays unpruned');
         }
         // Only touch PRs raised by dependency bots, never a human contributor's work
         $bots = array_values(array_filter($prs, static fn ($pr) => empty($pr['isDraft']) && self::isBot($pr['author'] ?? null)));
         if ($bots === []) {
             $c->ok($prs === [] ? 'No open PRs' : 'No dependency-bot PRs open');
-            $this->record('dep-prs', 'PASS');
+            if (!$recheck) {
+                $this->record('dep-prs', 'PASS');
+            }
+            $this->pruneTriageState($complete, []);
             return;
         }
         $c->info('Found ' . count($bots) . ' dependency-bot PR(s)');
 
-        $merged = $rebased = $blocked = 0;
-        $defaultBranch = null;
+        $merged = $rebased = $blocked = $closed = $handled = 0;
+        $seen   = [];
         foreach ($bots as $pr) {
             $num    = (string)$pr['number'];
+            $seen[] = $num;
             $author = (string)($pr['author']['login'] ?? '');
+            if ($recheck && isset($this->triageHandled[$num])) {
+                $handled++;   // the first pass of this run already dealt with it
+                continue;
+            }
             [$mergeable, $status] = $this->mergeState($repo, $num);
-            $c->info("PR #{$num} [{$mergeable}/{$status}] " . ($pr['title'] ?? ''));
+            $c->info("PR #{$num} [{$mergeable}/{$status}] " . ($pr['title'] ?? '')
+                . self::seenNote($this->triageState()->get($num)));
             // A bot PR moving a dependency to a new major version gets the
             // same opt-in as an auto-fix doing it
             $majors = $this->opt->allowMajor ? [] : self::majorBumps((string)($pr['title'] ?? ''), (string)($pr['body'] ?? ''));
-            if ($this->opt->mode !== 'update') {
-                if ($majors !== []) {
-                    $this->needsMajor++;
-                } else {
-                    $this->mergeablePrs += $mergeable === 'MERGEABLE' && $status !== 'UNSTABLE' ? 1 : 0;
-                }
+            [$outcome, $fields] = match (true) {
+                $this->opt->mode !== 'update' => $this->countCheckMode($mergeable, $status, $majors),
+                $majors !== []                => $this->needsMajorPullRequest($num, $majors),
+                $mergeable === 'MERGEABLE'    => $this->mergeablePullRequest($repo, $num, $author, $status, $pr),
+                $mergeable === 'CONFLICTING'  => $this->conflictingPullRequest($repo, $pr, $author),
+                default                       => $this->unsettledMergeability($num, $mergeable),
+            };
+            match (true) {
+                $outcome === 'merged' || $outcome === 'auto-merge'                       => $merged++,
+                $outcome === 'rebase-requested' || $outcome === 'rebase-nudged'
+                    || $outcome === 'manual-instructions'                                => $rebased++,
+                $outcome === 'superseded-closed'                                         => $closed++,
+                in_array($outcome, ['counted', 'behind-waiting', 'rebase-waiting'], true) => null,
+                default                                                                  => $blocked++,
+            };
+            if ($this->opt->mode === 'update') {
+                $this->triageState()->record($num, [
+                    'outcome' => $outcome,
+                    'title'   => mb_substr((string)($pr['title'] ?? ''), 0, 120),
+                ] + $fields);
+                $this->saveTriageState();
+            }
+            $this->triageHandled[$num] = true;
+        }
+        $c->info('PR triage: merged=' . $merged . ' rebase-requested=' . $rebased
+            . ($closed > 0 ? ' superseded-closed=' . $closed : '')
+            . ($handled > 0 ? ' already-handled=' . $handled : '')
+            . ' blocked=' . $blocked);
+        if (!$recheck) {
+            $this->record('dep-prs', $blocked > 0 ? 'FAIL' : 'PASS', $blocked, count($bots));
+        } elseif ($merged + $closed > 0) {
+            $this->record('dep-prs', 'PASS', 0, 0, "{$merged} merged and {$closed} superseded closed on the re-check");
+        }
+        $this->pruneTriageState($complete, $seen);
+    }
+
+    /**
+     * One page of the open pull requests, as the REST API lists them; null
+     * when the call failed.
+     *
+     * @return list<array<string, mixed>>|null
+     */
+    private function pullRequestPage(string $repo, int $page): ?array
+    {
+        $rows = $this->gh()->json(
+            ['api', "repos/{$repo}/pulls?state=open&per_page=" . GitHub::PULL_PAGE . "&page={$page}"],
+            300
+        );
+        return is_array($rows) ? array_values(array_filter($rows, 'is_array')) : null;
+    }
+
+    /**
+     * The REST /pulls rows in the shape `gh pr list --json number,title,
+     * author,isDraft,headRefName,body` gives, so the triage loop reads one
+     * format whoever produced the listing. REST names the author's account
+     * "dependabot[bot]" where gh's GraphQL prints "app/dependabot"; isBot()
+     * accepts both.
+     *
+     * @param list<array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function pullRequestRows(array $rows): array
+    {
+        $out = [];
+        foreach ($rows as $pr) {
+            if (!isset($pr['number'])) {
                 continue;
             }
-            $rebaseCmd = self::rebaseCommand($author);
-            if ($majors !== []) {
-                $c->warn("  PR #{$num} is a major upgrade (" . implode(', ', $majors) . '); not merged without --allow-major');
-                $this->needsMajor++;
-                $blocked++;
-            } elseif ($mergeable === 'MERGEABLE') {
-                if ($status === 'UNSTABLE') {
-                    // Failing or still-running checks: merging now could ship a broken build
-                    $c->warn("  PR #{$num} has checks that are failing or still running; left for a later run");
-                    $blocked++;
-                } elseif ($status === 'BLOCKED') {
-                    $c->warn("  PR #{$num} is mergeable but blocked by branch protection");
-                    $blocked++;
-                } elseif ($status === 'BEHIND') {
-                    if ($rebaseCmd !== '' && !$this->rebaseRequested($repo, $num)) {
-                        if ($this->comment($repo, $num, $rebaseCmd)) {
-                            $c->ok("  Asked {$author} to rebase PR #{$num} (branch behind base)");
-                            $rebased++;
-                        }
-                    } else {
-                        $c->info("  PR #{$num} behind base, rebase already requested");
-                    }
-                } elseif ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--delete-branch'])->ok()) {
-                    $c->ok("  Merged PR #{$num}");
-                    $merged++;
-                } elseif ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--auto', '--delete-branch'])->ok()) {
-                    $c->ok("  Enabled auto-merge on PR #{$num} (pending required checks)");
-                    $merged++;
-                } else {
-                    $c->fail("  Could not merge PR #{$num}");
-                    $blocked++;
-                }
-            } elseif ($mergeable === 'CONFLICTING') {
-                $comments = $this->prComments($repo, $num);
-                $refused  = false;
-                foreach ($comments['comments'] as $cm) {
-                    if (preg_match('/can.t be rebased|Please close the PR/', (string)($cm['body'] ?? '')) === 1) {
-                        $refused = true;
-                    }
-                }
-                if ($refused) {
-                    $c->warn("  PR #{$num} cannot be rebased by {$author} — close it so a fresh PR is raised");
-                    $blocked++;
-                } elseif ($this->rebaseRequested($repo, $num, $comments)) {
-                    $c->info("  PR #{$num} conflicts, rebase already requested — waiting on {$author}");
-                } elseif ($rebaseCmd !== '') {
-                    if ($this->comment($repo, $num, $rebaseCmd)) {
-                        $c->ok("  PR #{$num} conflicts — commented '{$rebaseCmd}'");
-                        $rebased++;
-                    } else {
-                        $c->fail("  PR #{$num} conflicts — could not post rebase comment");
-                    }
-                } else {
-                    // No bot command available: leave the human-runnable equivalent
-                    if ($defaultBranch === null) {
-                        $info          = $this->gh()->json(['repo', 'view', $repo, '--json', 'defaultBranchRef'], 60);
-                        $defaultBranch = (string)($info['defaultBranchRef']['name'] ?? 'master');
-                    }
-                    $branch = (string)($pr['headRefName'] ?? '');
-                    $body   = "This PR has merge conflicts. To rebase it manually:\n\n```bash\n"
-                        . "git fetch origin && git checkout {$branch} && git rebase origin/{$defaultBranch} && git push --force-with-lease\n```";
-                    if ($this->comment($repo, $num, $body)) {
-                        $c->ok("  PR #{$num} conflicts — posted manual rebase instructions");
-                        $rebased++;
-                    }
-                }
-            } else {
-                $c->warn("  PR #{$num} mergeability still {$mergeable} — skipped this run");
-                $blocked++;
-            }
+            $user = is_array($pr['user'] ?? null) ? $pr['user'] : [];
+            $head = is_array($pr['head'] ?? null) ? $pr['head'] : [];
+            $out[] = [
+                'number'      => (int)$pr['number'],
+                'title'       => (string)($pr['title'] ?? ''),
+                'author'      => [
+                    'login'  => (string)($user['login'] ?? ''),
+                    'is_bot' => ($user['type'] ?? '') === 'Bot',
+                ],
+                'isDraft'     => ($pr['draft'] ?? false) === true,
+                'headRefName' => (string)($head['ref'] ?? ''),
+                'body'        => (string)($pr['body'] ?? ''),
+            ];
         }
-        $c->info("PR triage: merged={$merged} rebase-requested={$rebased} blocked={$blocked}");
-        $this->record('dep-prs', $blocked > 0 ? 'FAIL' : 'PASS', $blocked, count($bots));
+        return $out;
+    }
+
+    /**
+     * What earlier passes remembered about a PR, for its listing line, so a
+     * PR blocked for the tenth time reads differently from a new arrival.
+     *
+     * @param array<string, mixed> $prior
+     */
+    private static function seenNote(array $prior): string
+    {
+        if ($prior === [] || (int)($prior['sightings'] ?? 0) < 2) {
+            return '';
+        }
+        return ' (seen ' . (int)$prior['sightings'] . 'x since ' . substr((string)($prior['first_seen'] ?? '?'), 0, 10)
+            . ', last: ' . (string)($prior['outcome'] ?? '?') . ')';
+    }
+
+    /**
+     * Check mode touches nothing, not even the bots: it only counts what
+     * update mode could do.
+     *
+     * @param list<string> $majors
+     * @return array{0: string, 1: array<string, mixed>}
+     */
+    private function countCheckMode(string $mergeable, string $status, array $majors): array
+    {
+        if ($majors !== []) {
+            $this->needsMajor++;
+        } else {
+            $this->mergeablePrs += $mergeable === 'MERGEABLE' && $status !== 'UNSTABLE' ? 1 : 0;
+        }
+        return ['counted', []];
+    }
+
+    /**
+     * @param list<string> $majors
+     * @return array{0: string, 1: array<string, mixed>}
+     */
+    private function needsMajorPullRequest(string $num, array $majors): array
+    {
+        $this->console->warn("  PR #{$num} is a major upgrade (" . implode(', ', $majors) . '); not merged without --allow-major');
+        $this->needsMajor++;
+        return ['needs-major', []];
+    }
+
+    /**
+     * GitHub has not decided whether the PR merges (a big diff still being
+     * computed, or a just-opened one); the next pass looks again.
+     *
+     * @return array{0: string, 1: array<string, mixed>}
+     */
+    private function unsettledMergeability(string $num, string $mergeable): array
+    {
+        $this->console->warn("  PR #{$num} mergeability still {$mergeable} — skipped this run");
+        return ['unknown-mergeability', []];
     }
 
     /**
@@ -803,6 +922,386 @@ final class SecurityRun
     }
 
     /**
+     * A mergeable bot PR: take it when GitHub's checks allow it, ask the bot
+     * to rebase a branch that trails the base, and leave branch protection
+     * and failing checks to a human or a later run.
+     *
+     * @param array<string, mixed> $pr
+     * @return array{0: string, 1: array<string, mixed>}
+     */
+    private function mergeablePullRequest(string $repo, string $num, string $author, string $status, array $pr): array
+    {
+        $c = $this->console;
+        if ($status === 'UNSTABLE') {
+            // Failing or still-running checks: merging now could ship a broken build
+            $c->warn("  PR #{$num} has checks that are failing or still running; left for a later run");
+            return ['blocked-ci', []];
+        }
+        if ($status === 'BLOCKED') {
+            $c->warn("  PR #{$num} is mergeable but blocked by branch protection");
+            return ['blocked-protection', []];
+        }
+        if ($status === 'BEHIND') {
+            return $this->behindPullRequest($repo, $pr, $author);
+        }
+        if ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--delete-branch'])->ok()) {
+            $c->ok("  Merged PR #{$num}");
+            $view   = $this->gh()->json(['pr', 'view', $num, '--repo', $repo, '--json', 'mergeCommit'], 60);
+            $commit = is_array($view) ? (string)($view['mergeCommit'] ?? '') : '';
+            return ['merged', $commit === '' ? [] : ['merge_commit' => $commit]];
+        }
+        if ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--auto', '--delete-branch'])->ok()) {
+            $c->ok("  Enabled auto-merge on PR #{$num} (pending required checks)");
+            return ['auto-merge', []];
+        }
+        $c->fail("  Could not merge PR #{$num}");
+        return ['merge-failed', []];
+    }
+
+    /**
+     * Mergeable but behind base: redundant once the alert that raised it is
+     * resolved by other work; otherwise the bot gets its rebase request,
+     * within the throttle.
+     *
+     * @param array<string, mixed> $pr
+     * @return array{0: string, 1: array<string, mixed>}
+     */
+    private function behindPullRequest(string $repo, array $pr, string $author): array
+    {
+        $c    = $this->console;
+        $num  = (string)$pr['number'];
+        [$superseded, $fields] = $this->supersede($repo, $pr);
+        if ($superseded !== null) {
+            return [$superseded, $fields];
+        }
+        $rebaseCmd = self::rebaseCommand($author);
+        if ($rebaseCmd === '') {
+            $c->info("  PR #{$num} is behind base; {$author} takes no rebase command");
+            return ['behind-waiting', $fields];
+        }
+        if ($this->rebaseRequested($repo, $num)) {
+            [$outcome, $extra] = $this->unansweredRebase($repo, $num, $author, $rebaseCmd, 'is still behind base');
+            return [$outcome, $fields + $extra];
+        }
+        if (!$this->comment($repo, $num, $rebaseCmd)) {
+            $c->fail("  PR #{$num} is behind base — could not post the rebase request");
+            return ['rebase-failed', $fields];
+        }
+        $c->ok("  Asked {$author} to rebase PR #{$num} (branch behind base)");
+        return ['rebase-requested', $fields + $this->firstRebaseRequest()];
+    }
+
+    /**
+     * The PR conflicts: redundant when its alert is resolved anyway; a PR the
+     * bot itself refuses to rebase waits for a human; otherwise the rebase
+     * request goes out, and an unanswered one escalates only within the
+     * throttle instead of being rediscovered forever.
+     *
+     * @param array<string, mixed> $pr
+     * @return array{0: string, 1: array<string, mixed>}
+     */
+    private function conflictingPullRequest(string $repo, array $pr, string $author): array
+    {
+        $c   = $this->console;
+        $num = (string)$pr['number'];
+        [$superseded, $fields] = $this->supersede($repo, $pr);
+        if ($superseded !== null) {
+            return [$superseded, $fields];
+        }
+        $comments = $this->prComments($repo, $num);
+        foreach ($comments['comments'] as $cm) {
+            if (preg_match('/can.t be rebased|Please close the PR/', (string)($cm['body'] ?? '')) === 1) {
+                $c->warn("  PR #{$num} cannot be rebased by {$author} — close it so a fresh PR is raised");
+                return ['rebase-refused', $fields];
+            }
+        }
+        $rebaseCmd = self::rebaseCommand($author);
+        if ($rebaseCmd !== '') {
+            if ($this->rebaseRequested($repo, $num, $comments)) {
+                [$outcome, $extra] = $this->unansweredRebase($repo, $num, $author, $rebaseCmd, 'conflicts');
+                return [$outcome, $fields + $extra];
+            }
+            if ($this->comment($repo, $num, $rebaseCmd)) {
+                $c->ok("  PR #{$num} conflicts — commented '{$rebaseCmd}'");
+                return ['rebase-requested', $fields + $this->firstRebaseRequest()];
+            }
+            $c->fail("  PR #{$num} conflicts — could not post rebase comment");
+            return ['rebase-failed', $fields];
+        }
+        // No bot command available: leave the human-runnable equivalent
+        $default = $this->defaultBranch($repo);
+        $branch  = (string)($pr['headRefName'] ?? '');
+        $body    = "This PR has merge conflicts. To rebase it manually:\n\n```bash\n"
+            . "git fetch origin && git checkout {$branch} && git rebase origin/{$default} && git push --force-with-lease\n```";
+        if (!$this->comment($repo, $num, $body)) {
+            $c->fail("  PR #{$num} conflicts — could not post the manual rebase instructions");
+            return ['rebase-failed', $fields];
+        }
+        $c->ok("  PR #{$num} conflicts — posted manual rebase instructions");
+        return ['manual-instructions', $fields];
+    }
+
+    /**
+     * The rebase request went unanswered, and a day or more has passed. Ask
+     * once a day at most, MAX_REBASE_REQUESTS times in all, then say so once
+     * and stop: a PR the bot has ignored three times is blocked on something
+     * another comment cannot fix.
+     *
+     * @return array{0: string, 1: array<string, mixed>}
+     */
+    private function unansweredRebase(string $repo, string $num, string $author, string $rebaseCmd, string $what): array
+    {
+        $c        = $this->console;
+        $prior    = $this->triageState()->get($num);
+        $requests = max(1, (int)($prior['rebase_requests'] ?? 1));
+        $since    = PrTriageState::secondsSince((string)($prior['rebase_last_at'] ?? ''), $this->now);
+        if ($since === null) {
+            // An earlier pass asked but this state file cannot say when:
+            // start the clock now rather than risk a comment flood
+            $c->info("  PR #{$num} {$what}, rebase requested — waiting on {$author}");
+            return ['rebase-waiting', ['rebase_requested_at' => $this->now, 'rebase_requests' => $requests, 'rebase_last_at' => $this->now]];
+        }
+        $action = PrTriageState::rebaseAction($requests, $since);
+        if ($action === 'nudge') {
+            if ($this->comment($repo, $num, $rebaseCmd)) {
+                $c->ok("  PR #{$num} {$what} after a day — asked {$author} again (" . ($requests + 1)
+                    . '/' . PrTriageState::MAX_REBASE_REQUESTS . ')');
+                return ['rebase-nudged', ['rebase_requests' => $requests + 1, 'rebase_last_at' => $this->now]];
+            }
+            $c->fail("  PR #{$num} {$what} — could not post the rebase nudge");
+            return ['rebase-failed', ['rebase_last_at' => $this->now]];
+        }
+        if ($action === 'stop') {
+            if (($prior['outcome'] ?? '') === 'blocked-permanent') {
+                $c->info("  PR #{$num} {$what} — permanently blocked, not asking again");
+                return ['blocked-permanent', []];
+            }
+            $body = "This PR has been asked to rebase {$requests} times over the last "
+                . (int)round($since / 86400) . " days and still needs it, so dep-sec-patcher will not ask again."
+                . " Close it so {$author} raises a fresh one, or rebase it manually.\n"
+                . '<!-- security-update:stop -->';
+            $this->commentRaw($repo, $num, $body);
+            $c->warn("  PR #{$num} {$what} after {$requests} requests — marked permanently blocked, said so once");
+            return ['blocked-permanent', []];
+        }
+        $c->info("  PR #{$num} {$what}, rebase requested {$requests}x (last "
+            . CommandResult::duration($since) . ' ago) — waiting on ' . $author);
+        return ['rebase-waiting', []];
+    }
+
+    /**
+     * The fields a first rebase request leaves in the state file.
+     *
+     * @return array<string, mixed>
+     */
+    private function firstRebaseRequest(): array
+    {
+        return ['rebase_requested_at' => $this->now, 'rebase_requests' => 1, 'rebase_last_at' => $this->now];
+    }
+
+    /**
+     * Whether this PR is redundant now: every Dependabot alert covering it
+     * has been resolved on the default branch by other work, and the PR is
+     * known to have been raised for one of those alerts. Scheduled version
+     * updates never were, and an alert list that cannot be read proves
+     * nothing, so both are left alone; the alert-driven link is latched into
+     * the state file on any sighting that still finds an open alert, which
+     * is what lets a later run notice it is gone.
+     *
+     * @param array<string, mixed> $pr
+     * @return array{0: string|null, 1: array<string, mixed>} outcome null when not superseded
+     */
+    private function supersede(string $repo, array $pr): array
+    {
+        $covered = $this->alertCoverage($pr);
+        $fields  = $covered === true ? ['alert_driven' => 'yes'] : [];
+        if ($covered !== false || ($this->triageState()->get((string)$pr['number'])['alert_driven'] ?? null) !== 'yes') {
+            return [null, $fields];
+        }
+        $num     = (string)$pr['number'];
+        $default = $this->defaultBranch($repo);
+        if (!$this->opt->push) {
+            // Closing is as destructive as merging; --push owns the gate
+            $this->console->info("  PR #{$num} is superseded — its advisory is already resolved on {$default}; --push would close it");
+            return ['would-supersede', $fields];
+        }
+        $body = "Superseded — advisory already resolved on {$default} by another change; closing.";
+        $r    = $this->gh()->run(['pr', 'close', $num, '--repo', $repo, '--comment', $body . "\n\n<!-- security-update:superseded -->"]);
+        if (!$r->ok()) {
+            $this->console->fail("  PR #{$num} is superseded but could not be closed (" . $r->failureReason() . ')');
+            return ['close-failed', $fields];
+        }
+        $this->console->ok("  PR #{$num} superseded — closed (advisory already resolved on {$default})");
+        return ['superseded-closed', $fields];
+    }
+
+    /**
+     * Whether an open Dependabot alert still covers one of the packages the
+     * PR moves. null when the PR cannot be judged on alerts at all: not a
+     * Dependabot PR (the alerts speak only for what raised them), no package
+     * could be read from it, or the alert list could not be read.
+     *
+     * @param array<string, mixed> $pr
+     */
+    private function alertCoverage(array $pr): ?bool
+    {
+        if (stripos((string)($pr['author']['login'] ?? ''), 'dependabot') === false) {
+            return null;
+        }
+        $packages = self::prPackages((string)($pr['title'] ?? ''), (string)($pr['body'] ?? ''));
+        if ($packages === []) {
+            return null;
+        }
+        $alerts = $this->openDependabotAlerts();
+        if ($alerts === null) {
+            return null;
+        }
+        return self::alertsCoverPr($packages, self::prDirectory((string)($pr['title'] ?? '')), $alerts);
+    }
+
+    /**
+     * The packages a bot PR moves: the name in "Bump x from A to B" (with or
+     * without a conventional-commit prefix) plus every "Updates `x` from A
+     * to B" line in the body, which is where grouped PRs list theirs. The
+     * changelog quoted further down a body is not read.
+     *
+     * @return list<string>
+     */
+    public static function prPackages(string $title, string $body): array
+    {
+        $names = [];
+        $bare  = (string)preg_replace('/^[a-z]+(?:\([^)]*\))?!?:\s*/i', '', trim($title));
+        if (preg_match('/^bump (\S+) from /i', $bare, $m) === 1) {
+            $names[strtolower($m[1])] = true;
+        }
+        preg_match_all('/^Updates `([^`]+)` from /m', $body, $mm);
+        foreach ($mm[1] as $name) {
+            $names[strtolower($name)] = true;
+        }
+        return array_keys($names);
+    }
+
+    /**
+     * The manifest directory a PR title names — "Bump x from A to B in /app
+     * ..." is about app/ — or null when it names none, as grouped
+     * multi-directory titles do, leaving matching to the package alone.
+     */
+    public static function prDirectory(string $title): ?string
+    {
+        return preg_match('# in (/[^ ]+)#', $title, $m) === 1 ? trim($m[1], '/') : null;
+    }
+
+    /**
+     * Whether one open alert still covers one of the packages: the same
+     * name, in the PR's directory when both name one. The ecosystem is
+     * deliberately not compared — GitHub files Maven, Gradle and sbt apart
+     * from how a PR groups them, and a too-generous match only keeps a PR
+     * open, which is the safe direction for an auto-close.
+     *
+     * @param list<string> $packages
+     * @param list<array<string, mixed>> $alerts normalised Dependabot alert rows
+     */
+    public static function alertsCoverPr(array $packages, ?string $dir, array $alerts): bool
+    {
+        if ($packages === []) {
+            return false;
+        }
+        $wanted = array_map('strtolower', $packages);
+        foreach ($alerts as $alert) {
+            if (!in_array(strtolower((string)($alert['package'] ?? '')), $wanted, true)) {
+                continue;
+            }
+            $manifest = (string)($alert['manifest'] ?? '');
+            if ($dir === null || $manifest === '') {
+                return true;
+            }
+            $alertDir = dirname($manifest);
+            $alertDir = $alertDir === '.' ? '' : trim($alertDir, '/');
+            if ($alertDir === $dir) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Dependabot's open alerts as normalised records, read once per pass and
+     * shared with the collection step; null when the read failed. After the
+     * re-check's reset, this run's own push is what the answer reflects.
+     *
+     * @return list<array<string, mixed>>|null
+     */
+    private function openDependabotAlerts(): ?array
+    {
+        if ($this->openAlertsRead) {
+            return $this->openAlerts;
+        }
+        $this->openAlertsRead = true;
+        $raw                  = $this->gh()->paginate("repos/{$this->repo()}/dependabot/alerts?state=open&per_page=100");
+        $this->openAlerts     = $raw === null ? null : array_map(
+            [RecordNormalizer::class, 'withEcosystem'],
+            RecordNormalizer::fromDependabotAlerts($raw)
+        );
+        return $this->openAlerts;
+    }
+
+    /**
+     * The repository's default branch, read once per run.
+     */
+    private function defaultBranch(string $repo): string
+    {
+        if ($this->defaultBranchRef === '') {
+            $info = $this->gh()->json(['repo', 'view', $repo, '--json', 'defaultBranchRef'], 60);
+            $name = is_array($info) ? (string)($info['defaultBranchRef']['name'] ?? '') : '';
+            $this->defaultBranchRef = $name !== '' ? $name : 'master';
+        }
+        return $this->defaultBranchRef;
+    }
+
+    /**
+     * The triage memory of this run's repository, read on first use.
+     */
+    private function triageState(): PrTriageState
+    {
+        if ($this->prTriageState === null) {
+            $corrupt = false;
+            $this->prTriageState = PrTriageState::load($this->triageStateFile, $this->now, $this->repo(), $corrupt);
+            if ($corrupt) {
+                $this->console->warn("the PR triage state was unreadable and starts fresh: {$this->triageStateFile}");
+            }
+        }
+        return $this->prTriageState;
+    }
+
+    private function saveTriageState(): void
+    {
+        if ($this->prStateWarned) {
+            return;
+        }
+        try {
+            $this->triageState()->save();
+        } catch (RuntimeException $e) {
+            $this->prStateWarned = true;
+            $this->console->warn("PR triage state cannot be saved ({$e->getMessage()}); this run's verdicts are not remembered");
+        }
+    }
+
+    /**
+     * Forget what a complete listing no longer sees; a truncated one says
+     * nothing about the PRs missing from it.
+     *
+     * @param list<string> $openNumbers
+     */
+    private function pruneTriageState(bool $complete, array $openNumbers): void
+    {
+        if (!$complete) {
+            return;
+        }
+        $this->triageState()->retain($openNumbers);
+        $this->saveTriageState();
+    }
+
+    /**
      * Whether our last rebase request is still outstanding: nothing has been
      * pushed to the branch since we asked. (Comparing against the newest
      * comment would not do: the bot's own reply displaces ours.)
@@ -829,7 +1328,12 @@ final class SecurityRun
 
     private function comment(string $repo, string $num, string $body): bool
     {
-        return $this->gh()->run(['pr', 'comment', $num, '--repo', $repo, '--body', $body . "\n\n<!-- security-update:rebase -->"])->ok();
+        return $this->commentRaw($repo, $num, $body . "\n\n<!-- security-update:rebase -->");
+    }
+
+    private function commentRaw(string $repo, string $num, string $body): bool
+    {
+        return $this->gh()->run(['pr', 'comment', $num, '--repo', $repo, '--body', $body])->ok();
     }
 
     /**

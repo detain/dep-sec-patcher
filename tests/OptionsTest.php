@@ -120,6 +120,9 @@ class OptionsTest extends TestCase
         $this->assertFalse(Options::parse([], [])->allowMajor);
         $this->assertTrue(Options::parse(['--allow-major'], [])->allowMajor);
 
+        $this->assertTrue(Options::parse([], [])->retriage);
+        $this->assertFalse(Options::parse(['--no-retriage'], [])->retriage);
+
         $o = Options::parse(['--push-direct'], []);
         $this->assertTrue($o->push, '--push-direct implies --push');
         $this->assertSame('direct', $o->pushMode);

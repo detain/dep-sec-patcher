@@ -72,7 +72,8 @@ final class Application
         }
 
         try {
-            $run  = new SecurityRun($opt, $console, $target, $state->vulnDb, $state->reportDir, $configFile, $argv, $state->stateDir . '/osv-cache.json');
+            $run  = new SecurityRun($opt, $console, $target, $state->vulnDb, $state->reportDir, $configFile, $argv,
+                $state->stateDir . '/osv-cache.json', $state->stateDir . '/triage-state.json');
             $code = $run->run();
         } finally {
             $this->cleanup($console);

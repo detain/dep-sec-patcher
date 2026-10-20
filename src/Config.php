@@ -26,7 +26,8 @@ use JsonException;
  *     "close-limit":    400,
  *     "allow-http":     ["intranet.example.com/", "*.corp.example/"],
  *     "exclude-dirs":   ["docs", "test/fixtures"],
- *     "allow-major":    false
+ *     "allow-major":    false,
+ *     "retriage":       true
  *   }
  *
  * Keys starting with "$" or "_" are ignored (for "$schema" and comments).
@@ -47,7 +48,7 @@ final class Config
     ];
     private const KEYS = [
         'ecosystems', 'scanners', 'only', 'threads', 'timeout', 'nvd-timeout', 'cvss-threshold', 'max-issues',
-        'close-label', 'close-delay', 'close-limit', 'allow-http', 'exclude-dirs', 'allow-major',
+        'close-label', 'close-delay', 'close-limit', 'allow-http', 'exclude-dirs', 'allow-major', 'retriage',
     ];
 
     /** @var array<string, bool> */
@@ -65,6 +66,7 @@ final class Config
     /** @var list<string> */
     public array $excludeDirs = [];
     public ?bool $allowMajor = null;
+    public ?bool $retriage = null;
 
     private function __construct(public readonly string $source)
     {
@@ -138,10 +140,15 @@ final class Config
                     );
                     break;
                 case 'allow-major':
+                case 'retriage':
                     if (!is_bool($value)) {
-                        throw $c->error('"allow-major" must be true or false, got ' . self::show($value));
+                        throw $c->error("\"{$key}\" must be true or false, got " . self::show($value));
                     }
-                    $c->allowMajor = $value;
+                    if ($key === 'allow-major') {
+                        $c->allowMajor = $value;
+                    } else {
+                        $c->retriage = $value;
+                    }
                     break;
                 case 'exclude-dirs':
                     $c->excludeDirs = array_map(
@@ -193,6 +200,9 @@ final class Config
         }
         if ($this->allowMajor !== null) {
             $o->allowMajor = $this->allowMajor;
+        }
+        if ($this->retriage !== null) {
+            $o->retriage = $this->retriage;
         }
         $o->allowHttp   = array_merge($this->allowHttp, $o->allowHttp);
         $o->excludeDirs = array_merge($this->excludeDirs, $o->excludeDirs);

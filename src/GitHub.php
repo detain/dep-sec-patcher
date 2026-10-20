@@ -131,6 +131,42 @@ final class GitHub
     /** Issues per GraphQL page; the API's maximum. */
     public const ISSUE_PAGE = 100;
 
+    /** Pull requests per REST page; the API's maximum. */
+    public const PULL_PAGE = 100;
+
+    /**
+     * Read a REST list endpoint a page at a time until a short page says it
+     * is the end. `gh pr list` has no page flag, so this pages the API's own
+     * `page=` parameter instead. $fetch takes the 1-based page number and
+     * returns that page's decoded rows, or null when the call failed. A
+     * failure after some rows already arrived yields what was read with
+     * $complete still false: acting on a part of the listing is fine,
+     * concluding that the missing rest is gone is not.
+     *
+     * @param callable(int): (list<array<string, mixed>>|null) $fetch
+     * @param-out bool $complete
+     * @return list<array<string, mixed>>
+     */
+    public static function collectPulls(callable $fetch, ?bool &$complete = null, int $maxPages = 100): array
+    {
+        $complete = false;
+        $rows     = [];
+        for ($page = 1; $page <= $maxPages; $page++) {
+            $rowsOnPage = $fetch($page);
+            if ($rowsOnPage === null) {
+                return $rows;
+            }
+            foreach ($rowsOnPage as $row) {
+                $rows[] = $row;
+            }
+            if (count($rowsOnPage) < self::PULL_PAGE) {
+                $complete = true;
+                return $rows;
+            }
+        }
+        return $rows;
+    }
+
     /**
      * Every open issue (up to $limit, 0 = all), newest first, in the shape
      * `gh issue list --json number,title,body,url,author` gives. Read a page

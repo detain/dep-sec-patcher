@@ -45,6 +45,8 @@ final class Options
     public int $maxIssues = 0;
     public string $github = 'auto';
     public string $mergePrs = 'auto';
+    /** Re-triage at the end of an --update --push run, for bot PRs the push itself opened. */
+    public bool $retriage = true;
     public string $autoFix = 'auto';
     /** Let auto-fix move a declared dependency to a new major version. */
     public bool $allowMajor = false;
@@ -178,6 +180,9 @@ final class Options
                     break;
                 case '--no-merge-prs':
                     $o->mergePrs = 'no';
+                    break;
+                case '--no-retriage':
+                    $o->retriage = false;
                     break;
                 case '--no-auto-fix':
                     $o->autoFix = 'no';
@@ -437,6 +442,10 @@ GitHub integration (requires the gh CLI):
   --max-issues N        Max open issues to read, newest first (default: 0 = all)
   --no-github           Skip all GitHub API work
   --no-merge-prs        Do not merge Dependabot PRs or request rebases
+  --no-retriage         An --update --push run triages PRs once more after
+                        publishing, because the pushed changes make
+                        Dependabot open new PRs while the run is going; this
+                        turns that second pass off (config: retriage)
   --no-auto-fix         Record vulnerabilities but never edit manifests
   --allow-major         Let auto-fix move a dependency to a new major version
                         when that is the only fix (default: such fixes are

@@ -195,4 +195,75 @@ class IssueListingAndVerifierTest extends TestCase
         $this->assertSame('close-fixed       PASS     0                0          would close 58 (not closed)', $line);
         $this->assertSame('maven             FAIL     206              3', $m->invoke(null, 'maven', ['status' => 'FAIL', 'vulns' => 206, 'outdated' => 3, 'note' => '']));
     }
+
+    /**
+     * A fake paged listing: $pages holds the rows of each page (null = the
+     * call failed); beyond the end every page comes back short and empty.
+     *
+     * @param list<list<array<string, mixed>>|null> $pages
+     * @param list<int>                             $calls
+     * @return callable(int): (list<array<string, mixed>>|null)
+     */
+    private static function pullPages(array $pages, array &$calls): callable
+    {
+        return static function (int $page) use ($pages, &$calls): ?array {
+            $calls[] = $page;
+            if ($page > count($pages)) {
+                return [];
+            }
+            return $pages[$page - 1];
+        };
+    }
+
+    public function testPullsAreReadUntilAShortPageEndsTheListing(): void
+    {
+        $calls = [];
+        $rows  = GitHub::collectPulls(self::pullPages([
+            array_fill(0, 100, ['number' => 1]),
+            array_fill(0, 100, ['number' => 2]),
+            [['number' => 3], ['number' => 4]],
+        ], $calls), $complete);
+        $this->assertCount(202, $rows);
+        $this->assertTrue($complete);
+        $this->assertSame([1, 2, 3], $calls);
+    }
+
+    public function testExactlyFullPagesEndWithAnEmptyOne(): void
+    {
+        $calls = [];
+        $rows  = GitHub::collectPulls(self::pullPages([array_fill(0, 100, ['number' => 1])], $calls), $complete);
+        $this->assertCount(100, $rows);
+        $this->assertTrue($complete, 'the empty page says there was nothing more');
+        $this->assertSame([1, 2], $calls);
+    }
+
+    public function testAFailedListingIsNothingAndIncomplete(): void
+    {
+        $calls = [];
+        $rows  = GitHub::collectPulls(self::pullPages([null], $calls), $complete);
+        $this->assertSame([], $rows);
+        $this->assertFalse($complete, 'triage must not prune its memory against this');
+    }
+
+    public function testAMidListingFailureKeepsWhatWasRead(): void
+    {
+        $calls = [];
+        $rows  = GitHub::collectPulls(self::pullPages([array_fill(0, 100, ['number' => 1]), null, []], $calls), $complete);
+        $this->assertCount(100, $rows);
+        $this->assertFalse($complete, 'the rest is unread, not absent');
+        $this->assertSame([1, 2], $calls, 'a failed page ends the pass');
+    }
+
+    public function testThePageCapStopsWithoutClaimingCompletion(): void
+    {
+        $calls = [];
+        $rows  = GitHub::collectPulls(self::pullPages([
+            array_fill(0, 100, ['number' => 1]),
+            array_fill(0, 100, ['number' => 2]),
+            array_fill(0, 100, ['number' => 3]),
+        ], $calls), $complete, 2);
+        $this->assertCount(200, $rows);
+        $this->assertFalse($complete);
+        $this->assertSame([1, 2], $calls);
+    }
 }

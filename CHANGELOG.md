@@ -49,6 +49,20 @@ First release: a standalone, generic port of MyAdmin's
 - `--allow-major` (config `allow-major`): without it, auto-fix leaves fixes
   that need a new major version pending, and PR triage does not merge bot PRs
   that are major upgrades.
+- PR triage reads the open pull requests through the paged GitHub API instead
+  of one capped `gh pr list`, so a busy repository is seen in full, and it
+  remembers its verdicts between runs in `triage-state.json` under the
+  repository's state directory: each PR's outcome and sighting history, when
+  a rebase was requested and how often, and whether it was raised for alerts
+  that were open. A Dependabot PR whose alerts are all resolved on the default
+  branch — superseded by another change — is closed with a note (with
+  `--push`; without it the pass only reports what it would close). A rebase
+  request the bot has not answered is repeated at most once a day and at most
+  three times in all, after which the PR is marked permanently blocked and
+  left alone instead of rediscovered every run. An `--update --push` run whose
+  fixes raised new alerts triages once more after publishing, so Dependabot
+  PRs opened while the run was going are merged in the same pass;
+  `--no-retriage` (config `retriage: false`) skips that second pass.
 - A "Next steps" section at the end of a run that found fixes it did not
   apply or publish, with the exact command line that would.
 - Mend's grouped issue format (one issue per library, a summary table and
