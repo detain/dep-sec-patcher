@@ -168,6 +168,42 @@ class NodeWorkspaceTest extends TestCase
         $this->assertSame([], $aud->guardPurge($this->context($outside, ['--update']), ''), 'npm keeps what it resolved outside any workspace');
     }
 
+    public function testTheCorepackTiebreakerReadsTheVersionedField(): void
+    {
+        // "packageManager": "yarn@3.6.4" is what the field holds; the bare
+        // names the old tiebreaker compared for never matched it, so every
+        // such directory dispatched to npm
+        $root = $this->scratchDir('declared');
+        $this->silentShims(['npm', 'yarn', 'pnpm']);
+        $aud = new NodeAuditor();
+
+        file_put_contents($root . '/package.json', "{\"name\":\"solo\",\"packageManager\":\"yarn@3.6.4\"}\n");
+        $this->assertSame('node:yarn', $aud->group($this->context($root, ['--update']), ''));
+        file_put_contents($root . '/package.json', "{\"name\":\"solo\",\"packageManager\":\"pnpm@9.1.2\"}\n");
+        $this->assertSame('node:pnpm', $aud->group($this->context($root, ['--update']), ''));
+        file_put_contents($root . '/package.json', "{\"name\":\"solo\",\"packageManager\":\"npm@10.1.0\"}\n");
+        $this->assertSame('node:npm', $aud->group($this->context($root, ['--update']), ''), 'npm stays npm, versioned or not');
+        file_put_contents($root . '/package.json', "{\"name\":\"solo\",\"packageManager\":\"deno@2.0.0\"}\n");
+        $this->assertSame('node:npm', $aud->group($this->context($root, ['--update']), ''), 'an unknown manager falls back as before');
+    }
+
+    public function testAYarnDeclaredRootWithoutALockfileAuditsWithYarnAndPurgesNpmLocks(): void
+    {
+        $log  = $this->silentShims(['npm', 'yarn', 'pnpm']);
+        $root = $this->scratchDir('yarn-declared');
+        file_put_contents($root . '/package.json', "{\"name\":\"r\",\"workspaces\":[\"packages/*\"],\"packageManager\":\"yarn@3.6.4\"}\n");
+        mkdir($root . '/packages', 0775, true);
+        $ctx = $this->context($root, ['--update']);
+        $aud = new NodeAuditor();
+
+        $aud->audit($ctx, '');
+        $calls = $this->calls($log);
+        $this->assertStringContainsString('yarn audit', $calls, 'the declared manager runs, npm is not tried');
+        $this->assertStringNotContainsString('npm install', $calls);
+        $this->assertSame(['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml'], $aud->guardPurge($ctx, ''),
+            'what npm would leave here is a foreign lock: the purge keeps yarn.lock and removes the rest');
+    }
+
     public function testTheGuardRemovesACreatedLockfilePurgedEvenInUpdateMode(): void
     {
         $dir = $this->scratchDir('guard');

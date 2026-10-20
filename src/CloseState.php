@@ -20,7 +20,8 @@ use RuntimeException;
  * An entry carries verdict, checked_at, since (how long this same verdict
  * has stood) and the needs key, plus what the verdict was about — why
  * (unverifiable reason class), detail, evidence (closing table for a fixed
- * verdict), paths (the manifest and lockfile names it read), key, and the
+ * verdict), paths (the manifest and lockfile names it read), head (the
+ * commit it was drawn against, for a diff-based change scan), key, and the
  * bookkeeping title_hash, cve, package, annotated_at.
  *
  * reuseVerdict(), needsAnnotation(), resolve() and key() are pure;
@@ -106,7 +107,7 @@ final class CloseState
      * of having been annotated, so re-verification cannot restart either clock.
      *
      * @param array<string, mixed> $fields key, why, detail, evidence, paths,
-     *                                     title_hash, cve, package
+     *                                     head, title_hash, cve, package
      */
     public function remember(string $number, string $verdict, array $fields): void
     {
@@ -200,6 +201,23 @@ final class CloseState
             }
         }
         return $oldest;
+    }
+
+    /**
+     * The distinct commits remembered verdicts were drawn against. Entries
+     * from before commits were recorded come back as '' among them: nothing
+     * can be diffed against those, and the caller falls back to scanning by
+     * date until re-verification has replaced them.
+     *
+     * @return list<string>
+     */
+    public function rememberedHeads(): array
+    {
+        $heads = [];
+        foreach ($this->issues as $entry) {
+            $heads[(string)($entry['head'] ?? '')] = true;
+        }
+        return array_keys($heads);
     }
 
     /**

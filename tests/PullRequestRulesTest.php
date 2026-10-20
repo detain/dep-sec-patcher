@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Detain\DepSecPatcher\Tests;
 
+use Detain\DepSecPatcher\PrTriageState;
 use Detain\DepSecPatcher\SecurityRun;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;
@@ -112,15 +113,72 @@ class PullRequestRulesTest extends TestCase
             ['package' => 'qs', 'manifest' => 'package.json', 'ecosystem' => 'npm'],
             ['package' => 'other', 'manifest' => '', 'ecosystem' => 'pip'],
         ];
-        $this->assertTrue(SecurityRun::alertsCoverPr(['yargs-parser'], null, $alerts), 'names match case-insensitively');
-        $this->assertTrue(SecurityRun::alertsCoverPr(['yargs-parser'], 'app', $alerts), 'and the directories agree');
-        $this->assertFalse(SecurityRun::alertsCoverPr(['yargs-parser'], 'elsewhere', $alerts),
+        $this->assertTrue(self::covers(['yargs-parser'], null, $alerts), 'names match case-insensitively');
+        $this->assertTrue(self::covers(['yargs-parser'], 'app', $alerts), 'and the directories agree');
+        $this->assertFalse(self::covers(['yargs-parser'], 'elsewhere', $alerts),
             'an alert on another manifest does not cover a PR moving this one');
-        $this->assertTrue(SecurityRun::alertsCoverPr(['qs'], null, $alerts));
-        $this->assertTrue(SecurityRun::alertsCoverPr(['other'], 'frontend', $alerts), 'an alert naming no manifest cannot be placed in another directory, so it covers');
-        $this->assertFalse(SecurityRun::alertsCoverPr(['qs'], 'frontend', $alerts), 'a root manifest is not frontend');
-        $this->assertFalse(SecurityRun::alertsCoverPr(['gone-package'], null, $alerts));
-        $this->assertFalse(SecurityRun::alertsCoverPr([], null, $alerts), 'nothing to cover');
-        $this->assertFalse(SecurityRun::alertsCoverPr(['lodash'], 'app', []), 'the empty alert list is the superseded case');
+        $this->assertTrue(self::covers(['qs'], null, $alerts));
+        $this->assertTrue(self::covers(['other'], 'frontend', $alerts), 'an alert naming no manifest cannot be placed in another directory, so it covers');
+        $this->assertFalse(self::covers(['qs'], 'frontend', $alerts), 'a root manifest is not frontend');
+        $this->assertFalse(self::covers(['gone-package'], null, $alerts));
+        $this->assertFalse(self::covers([], null, $alerts), 'nothing to cover');
+        $this->assertFalse(self::covers(['lodash'], 'app', []), 'the empty alert list is the superseded case');
+        $this->assertFalse(self::latches(['lodash'], 'app', []));
+
+        // latching is stricter: only an alert in the named directory (or a
+        // title that names none) may plant the memory that later closes
+        $this->assertTrue(self::latches(['yargs-parser'], 'app', $alerts), 'the PR directory and the alert agree');
+        $this->assertFalse(self::latches(['yargs-parser'], 'elsewhere', $alerts), 'another directory never latches');
+        $this->assertFalse(self::latches(['other'], 'frontend', $alerts), 'an unplaceable alert covers but never latches');
+        $this->assertTrue(self::latches(['other'], null, $alerts), 'a grouped title has no directory to contradict');
+        $this->assertFalse(self::latches(['qs'], 'app', $alerts), 'a root manifest is a placement too — and it is not the PR’s');
+    }
+
+    /**
+     * @param list<string>                  $packages
+     * @param list<array<string, mixed>>    $alerts
+     */
+    private static function covers(array $packages, ?string $dir, array $alerts): bool
+    {
+        return SecurityRun::alertsCoverPr($packages, $dir, $alerts)['covered'];
+    }
+
+    /**
+     * @param list<string>                  $packages
+     * @param list<array<string, mixed>>    $alerts
+     */
+    private static function latches(array $packages, ?string $dir, array $alerts): bool
+    {
+        return SecurityRun::alertsCoverPr($packages, $dir, $alerts)['strict'];
+    }
+
+    public function testTheTallySplitsPendingByDesignFromGenuinelyBlocked(): void
+    {
+        $tally = static function (string $outcome): string {
+            $m = new ReflectionMethod(SecurityRun::class, 'tallyOf');
+            return $m->invoke(null, $outcome);
+        };
+        // by design: --push, --allow-major or the human waits, the run is correct
+        foreach (['would-supersede', 'needs-major', 'rebase-refused', 'close-failed'] as $pending) {
+            $this->assertSame('pending', $tally($pending), $pending);
+        }
+        // genuinely stuck keeps the FAIL
+        foreach (['merge-failed', 'rebase-failed', 'blocked-ci', 'blocked-protection', 'unknown-mergeability', 'blocked-permanent'] as $blocked) {
+            $this->assertSame('blocked', $tally($blocked), $blocked);
+        }
+        foreach (['merged', 'auto-merge'] as $merged) {
+            $this->assertSame('merged', $tally($merged), $merged);
+        }
+        foreach (['rebase-requested', 'rebase-nudged', 'manual-instructions'] as $rebased) {
+            $this->assertSame('rebased', $tally($rebased), $rebased);
+        }
+        $this->assertSame('closed', $tally('superseded-closed'));
+        foreach (['counted', 'behind-waiting', 'rebase-waiting'] as $quiet) {
+            $this->assertSame('none', $tally($quiet), $quiet);
+        }
+        // every outcome the state file documents is classified
+        foreach (PrTriageState::OUTCOMES as $outcome) {
+            $this->assertContains($tally($outcome), ['merged', 'rebased', 'closed', 'pending', 'blocked', 'none'], $outcome);
+        }
     }
 }

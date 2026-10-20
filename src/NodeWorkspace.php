@@ -22,6 +22,9 @@ final class NodeWorkspace
     /** Dependency specifiers that link inside the repository, not to the registry. */
     public const PROTOCOL_RX = '/^(?:workspace|catalog):/';
 
+    /** Corepack's "packageManager" field: the manager name in front of its "@version". */
+    public const MANAGER_RX = '/^(pnpm|yarn|npm)@/';
+
     /** The lockfile(s) each package manager owns. */
     public const MANAGER_LOCKS = [
         'npm'  => ['package-lock.json', 'npm-shrinkwrap.json'],
@@ -96,10 +99,17 @@ final class NodeWorkspace
                 return $manager;
             }
         }
-        if (preg_match('/^(pnpm|yarn|npm)@/', self::packageManager($root), $m) === 1) {
-            return $m[1];
-        }
-        return 'npm';
+        return self::declaredManager($root) ?? 'npm';
+    }
+
+    /**
+     * The manager a directory's corepack "packageManager" field names
+     * ("pnpm" of "pnpm@9.12.3"), or null when the field is absent or names
+     * no manager this tool knows.
+     */
+    public static function declaredManager(string $dir): ?string
+    {
+        return preg_match(self::MANAGER_RX, self::packageManager($dir), $m) === 1 ? $m[1] : null;
     }
 
     /**

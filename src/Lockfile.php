@@ -64,6 +64,37 @@ final class Lockfile
     }
 
     /**
+     * Whether $dir holds a lockfile for the ecosystem that cannot be decoded
+     * into a dependency tree. A corrupt lock parses to the same empty list
+     * as a lock that genuinely lacks the package, and "not found" must never
+     * be trusted as "evicted". Line-based formats (yarn, pnpm) have no
+     * detectable decode failure here — their parse miss and their corrupt
+     * read are the same shape — so only the JSON locks are judged.
+     */
+    public static function unreadable(string $dir, string $ecosystem): bool
+    {
+        foreach (self::lockNamesFor($ecosystem) as $file) {
+            $path = $dir . '/' . $file;
+            if (is_file($path) && !self::decodes($file, (string)file_get_contents($path))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the named lockfile's content parses at all: the JSON ones must
+     * decode to an object or array; nothing else can fail in a way we see.
+     */
+    private static function decodes(string $file, string $content): bool
+    {
+        if (!in_array($file, ['package-lock.json', 'npm-shrinkwrap.json', 'composer.lock'], true)) {
+            return true;
+        }
+        return is_array(json_decode($content, true));
+    }
+
+    /**
      * @return list<string>
      */
     public static function parse(string $file, string $content, string $pkg): array

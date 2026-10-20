@@ -66,4 +66,33 @@ class LockfileTest extends TestCase
         $this->assertSame([], Lockfile::versions($dir, 'npm', 'axios'), 'lockfile without the package');
         $this->assertNull(Lockfile::versions($dir, 'composer', 'qs'));
     }
+
+    public function testUnreadableSeparatesACorruptLockFromAnEmptyOne(): void
+    {
+        $dir = $this->scratchDir('unreadable');
+        $this->assertFalse(Lockfile::unreadable($dir, 'npm'), 'no lockfile is nothing to fail to read');
+        $this->assertFalse(Lockfile::unreadable($dir, 'composer'));
+
+        file_put_contents($dir . '/package-lock.json', '{"lockfileVersion":3,"packages":{"node_modules/qs":{"version":"6.11.0"}}}');
+        $this->assertFalse(Lockfile::unreadable($dir, 'npm'), 'a lock that decodes is readable, even one missing the package');
+        file_put_contents($dir . '/package-lock.json', '{"lockfileVersion":3,"packages"');
+        $this->assertTrue(Lockfile::unreadable($dir, 'npm'), 'truncated JSON — versions() would call its [] an eviction');
+        file_put_contents($dir . '/package-lock.json', '"not even an object"');
+        $this->assertTrue(Lockfile::unreadable($dir, 'npm'), 'decodable but not a tree');
+
+        file_put_contents($dir . '/package-lock.json', 'still broken');
+        file_put_contents($dir . '/composer.lock', '{"packages":[]}');
+        $this->assertTrue(Lockfile::unreadable($dir, 'npm'));
+        $this->assertFalse(Lockfile::unreadable($dir, 'composer'), 'the other ecosystem is judged on its own lock');
+
+        $this->assertFalse(Lockfile::unreadable($dir, 'pip'), 'an ecosystem with no lockfiles to read');
+    }
+
+    public function testYarnAndPnpmLocksHaveNoDetectableDecodeFailure(): void
+    {
+        $dir = $this->scratchDir('line-locks');
+        file_put_contents($dir . '/yarn.lock', "this is not a yarn lock at all\n");
+        $this->assertFalse(Lockfile::unreadable($dir, 'npm'),
+            'a line-based parse miss is indistinguishable from corruption; only JSON locks fail loudly here');
+    }
 }

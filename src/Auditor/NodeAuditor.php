@@ -117,9 +117,12 @@ final class NodeAuditor extends Auditor
             && $workspace['manager'] !== 'npm' && ProcessRunner::has($workspace['manager'])) {
             return $workspace['manager'];
         }
-        // corepack's "packageManager" field, as a tiebreaker only
-        $declared = NodeWorkspace::packageManager($this->abs($ctx, $dir));
-        if (in_array($declared, ['pnpm', 'yarn'], true) && ProcessRunner::has($declared)) {
+        // corepack's "packageManager" field, as a tiebreaker only — read
+        // the way rootManager reads it: "pnpm@9.12.3" names pnpm, and the
+        // bare "pnpm"/"yarn" the old comparison expected is not what the
+        // field ever holds
+        $declared = NodeWorkspace::declaredManager($this->abs($ctx, $dir));
+        if ($declared !== null && $declared !== 'npm' && ProcessRunner::has($declared)) {
             return $declared;
         }
         return 'npm';
@@ -377,6 +380,10 @@ final class NodeAuditor extends Auditor
             if (($ranges[$name] ?? []) === []) {
                 continue;
             }
+            // npm just rewrote this lock: the install above succeeded, so it
+            // is present and decodable — a corrupt or missing lock fails the
+            // install, and that path returned "not kept" before reaching
+            // this line. Null is unreachable, [] is a real eviction.
             $still = array_values(array_filter(
                 Lockfile::versions($abs, 'npm', $name) ?? [],
                 static fn (string $v): bool => NpmOverrides::affected($v, $ranges[$name])

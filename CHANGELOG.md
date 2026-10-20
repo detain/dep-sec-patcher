@@ -66,10 +66,15 @@ First release: a standalone, generic port of MyAdmin's
 - close-fixed remembers its verdicts between runs in `close-state.json` under
   the repository's state directory, so a re-run pays per changed manifest
   instead of per open issue: a verdict younger than seven days stands while
-  the files it read are untouched on the checked-out branch (any commit since
-  the check touching one, or any uncommitted edit to one, forces a fresh
-  look), and a "transitive, no lockfile" verdict — the one kind that can only
-  change when a lockfile appears — is reused until a lockfile shows up in an
+  the files it read — the manifests and every lockfile beside them it may
+  have consulted — are untouched since the very commit the check ran
+  against (each remembered verdict records that commit, and `git diff` from
+  it to HEAD decides, so a late-landing old-dated pull cannot hide behind a
+  committer date; commits touching one, or uncommitted edits to one, force a
+  fresh look; a remembered commit the clone no longer holds — a rewritten
+  history — re-verifies the run and remembers nothing new until the memory
+  rebuilds), and a "transitive, no lockfile" verdict — the one kind that can
+  only change when a lockfile appears — is reused until a lockfile shows up in an
   affected directory. Issues sharing one requirement list (the Mend bot files
   one issue per affected directory per CVE) are verified once per run, the
   duplicates sharing the answer; a run logs how many same-title issues it saw
@@ -83,6 +88,24 @@ First release: a standalone, generic port of MyAdmin's
   major, an open PR already covers it) and pending database records bucketed
   by the note that keeps them pending, each bounded to the largest ten per
   bucket with the totals alongside.
+- Review corrections to the memory-based paths above: an npm override edit
+  whose lockfile turns out corrupt or gone stays pending with a `lock
+  unreadable, not verified` note (and a WARN) instead of counting an empty
+  unreadable read as an evicted package; a corepack `packageManager` field
+  like `yarn@3.6.4` now actually dispatches the manager it declares — the
+  tiebreaker compared bare names the field never holds — so a directory or
+  workspace root without a committed lockfile is audited by its own tool and
+  foreign locks it leaves behind are purged; the superseded-PR close says
+  only what the alert list can prove ("no open Dependabot alert covers these
+  packages anymore", since a human dismissing an alert reads the same as a
+  resolution), and the "raised for this alert" latch now requires an alert
+  in the very directory a PR title names; majors counted from PR titles and
+  by auto-fix add up in the tally instead of the last writer winning; the
+  `dep-prs` row distinguishes PRs left waiting by design (`--push`,
+  `--allow-major`, or a human — reported as `pending=`, a WARN) from
+  genuinely stuck ones (still FAIL), and a head commit dated ahead of the
+  tool's own clock no longer resets the rebase-request throttle a skewed
+  bot could otherwise walk back forever.
 - `--enable-posture` (config `enable-posture`): the repository settings check,
   which until now only reported secret scanning and Dependabot security updates
   being off, now switches them on in update mode for repositories the run

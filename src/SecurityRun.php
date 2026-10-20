@@ -70,6 +70,9 @@ final class SecurityRun
     private ?CloseState $closeState = null;
     /** Whether saving that memory failed; say so once, not per issue. */
     private bool $closeStateWarned = false;
+    /** The commit verdicts are drawn against, read once the close memory is consulted. */
+    private ?string $headSha = null;
+    private bool $headShaRead = false;
     /**
      * The dependency-bot PRs this run's complete triage listing saw; null
      * when it never saw one whole.
@@ -884,7 +887,7 @@ final class SecurityRun
         }
         $c->info('Found ' . count($bots) . ' dependency-bot PR(s)');
 
-        $merged = $rebased = $blocked = $closed = $handled = 0;
+        $merged = $rebased = $blocked = $pending = $closed = $handled = 0;
         $seen   = [];
         foreach ($bots as $pr) {
             $num    = (string)$pr['number'];
@@ -907,13 +910,13 @@ final class SecurityRun
                 $mergeable === 'CONFLICTING'  => $this->conflictingPullRequest($repo, $pr, $author),
                 default                       => $this->unsettledMergeability($num, $mergeable),
             };
-            match (true) {
-                $outcome === 'merged' || $outcome === 'auto-merge'                       => $merged++,
-                $outcome === 'rebase-requested' || $outcome === 'rebase-nudged'
-                    || $outcome === 'manual-instructions'                                => $rebased++,
-                $outcome === 'superseded-closed'                                         => $closed++,
-                in_array($outcome, ['counted', 'behind-waiting', 'rebase-waiting'], true) => null,
-                default                                                                  => $blocked++,
+            match (self::tallyOf($outcome)) {
+                'merged'  => $merged++,
+                'rebased' => $rebased++,
+                'closed'  => $closed++,
+                'pending' => $pending++,
+                'blocked' => $blocked++,
+                default   => null,
             };
             if ($this->opt->mode === 'update') {
                 $this->triageState()->record($num, [
@@ -927,13 +930,36 @@ final class SecurityRun
         $c->info('PR triage: merged=' . $merged . ' rebase-requested=' . $rebased
             . ($closed > 0 ? ' superseded-closed=' . $closed : '')
             . ($handled > 0 ? ' already-handled=' . $handled : '')
-            . ' blocked=' . $blocked);
+            . ' blocked=' . $blocked
+            . ($pending > 0 ? ' pending=' . $pending : ''));
         if (!$recheck) {
-            $this->record('dep-prs', $blocked > 0 ? 'FAIL' : 'PASS', $blocked, count($bots));
+            $this->record('dep-prs', $blocked > 0 ? 'FAIL' : ($pending > 0 ? 'WARN' : 'PASS'), $blocked, count($bots),
+                $pending > 0 ? "{$pending} pending (--push, --allow-major or a human)" : '');
         } elseif ($merged + $closed > 0) {
             $this->record('dep-prs', 'PASS', 0, 0, "{$merged} merged and {$closed} superseded closed on the re-check");
         }
         $this->pruneTriageState($complete, $seen);
+    }
+
+    /**
+     * Which tally an outcome belongs in. "pending" is by design: the tool
+     * did all its mode allows and waits for --push (would-supersede, and
+     * close-failed is a close the next run retries), for --allow-major
+     * (needs-major), or for the human the bot itself addressed
+     * (rebase-refused). None of those makes a run wrong. "blocked" stays
+     * for what is genuinely stuck: failed merges and comments, protection,
+     * CI and undecided mergeability the next pass must revisit.
+     */
+    private static function tallyOf(string $outcome): string
+    {
+        return match (true) {
+            in_array($outcome, ['merged', 'auto-merge'], true) => 'merged',
+            in_array($outcome, ['rebase-requested', 'rebase-nudged', 'manual-instructions'], true) => 'rebased',
+            $outcome === 'superseded-closed' => 'closed',
+            in_array($outcome, ['counted', 'behind-waiting', 'rebase-waiting'], true) => 'none',
+            in_array($outcome, ['would-supersede', 'needs-major', 'rebase-refused', 'close-failed'], true) => 'pending',
+            default => 'blocked',
+        };
     }
 
     /**
@@ -1131,7 +1157,8 @@ final class SecurityRun
             $c->info("  PR #{$num} is behind base; {$author} takes no rebase command");
             return ['behind-waiting', $fields];
         }
-        if ($this->rebaseRequested($repo, $num)) {
+        $comments = $this->prComments($repo, $num);
+        if ($this->rebaseRequested($repo, $num, $comments)) {
             [$outcome, $extra] = $this->unansweredRebase($repo, $num, $author, $rebaseCmd, 'is still behind base');
             return [$outcome, $fields + $extra];
         }
@@ -1140,7 +1167,7 @@ final class SecurityRun
             return ['rebase-failed', $fields];
         }
         $c->ok("  Asked {$author} to rebase PR #{$num} (branch behind base)");
-        return ['rebase-requested', $fields + $this->firstRebaseRequest()];
+        return ['rebase-requested', $fields + $this->firstRebaseRequest($num, $comments)];
     }
 
     /**
@@ -1175,7 +1202,7 @@ final class SecurityRun
             }
             if ($this->comment($repo, $num, $rebaseCmd)) {
                 $c->ok("  PR #{$num} conflicts — commented '{$rebaseCmd}'");
-                return ['rebase-requested', $fields + $this->firstRebaseRequest()];
+                return ['rebase-requested', $fields + $this->firstRebaseRequest($num, $comments)];
             }
             $c->fail("  PR #{$num} conflicts — could not post rebase comment");
             return ['rebase-failed', $fields];
@@ -1242,23 +1269,33 @@ final class SecurityRun
     }
 
     /**
-     * The fields a first rebase request leaves in the state file.
+     * The fields a fresh rebase request leaves in the state file. A request
+     * counts as answered when the head commit is newer than it — but a head
+     * dated ahead of our own clock only proves the committer's clock runs
+     * hot, not that the bot pushed: carry the earlier count forward then,
+     * so skew cannot reset the throttle into a comment flood.
      *
+     * @param array{comments: list<array<mixed>>, commits: list<array<mixed>>} $data
      * @return array<string, mixed>
      */
-    private function firstRebaseRequest(): array
+    private function firstRebaseRequest(string $num, array $data): array
     {
-        return ['rebase_requested_at' => $this->now, 'rebase_requests' => 1, 'rebase_last_at' => $this->now];
+        $commits  = $data['commits'];
+        $headTime = $commits === [] ? '' : (string)($commits[count($commits) - 1]['committedDate'] ?? '');
+        $requests = $headTime !== '' && strcmp($headTime, $this->now) > 0
+            ? max(1, (int)($this->triageState()->get($num)['rebase_requests'] ?? 1))
+            : 1;
+        return ['rebase_requested_at' => $this->now, 'rebase_requests' => $requests, 'rebase_last_at' => $this->now];
     }
 
     /**
-     * Whether this PR is redundant now: every Dependabot alert covering it
-     * has been resolved on the default branch by other work, and the PR is
-     * known to have been raised for one of those alerts. Scheduled version
+     * Whether this PR is redundant now: no open Dependabot alert covers it
+     * anymore, and the PR is latched as raised for one. Scheduled version
      * updates never were, and an alert list that cannot be read proves
-     * nothing, so both are left alone; the alert-driven link is latched into
-     * the state file on any sighting that still finds an open alert, which
-     * is what lets a later run notice it is gone.
+     * nothing, so both are left alone; the alert-driven link is latched
+     * into the state file on any sighting with a strictly covering alert —
+     * the PR's directory when its title names one — which is what lets a
+     * later run notice it is gone.
      *
      * @param array<string, mixed> $pr
      * @return array{0: string|null, 1: array<string, mixed>} outcome null when not superseded
@@ -1266,36 +1303,54 @@ final class SecurityRun
     private function supersede(string $repo, array $pr): array
     {
         $covered = $this->alertCoverage($pr);
-        $fields  = $covered === true ? ['alert_driven' => 'yes'] : [];
-        if ($covered !== false || ($this->triageState()->get((string)$pr['number'])['alert_driven'] ?? null) !== 'yes') {
+        // Only strict coverage latches: the memory that lets a later run
+        // close this PR must be about an alert in the very directory the PR
+        // names, not one that merely shares a package name
+        $fields  = $covered !== null && $covered['strict'] ? ['alert_driven' => 'yes'] : [];
+        if ($covered === null || $covered['covered']
+            || ($this->triageState()->get((string)$pr['number'])['alert_driven'] ?? null) !== 'yes') {
             return [null, $fields];
         }
-        $num     = (string)$pr['number'];
-        $default = $this->defaultBranch($repo);
+        $num = (string)$pr['number'];
         if (!$this->opt->push) {
-            // Closing is as destructive as merging; --push owns the gate
-            $this->console->info("  PR #{$num} is superseded — its advisory is already resolved on {$default}; --push would close it");
+            // Merging a bot PR is update mode's job and needs no --push;
+            // ending one holds to the stricter gate this tool sets itself,
+            // so the close waits for --push
+            $this->console->info("  PR #{$num} is superseded — " . self::supersedeClaim() . '; --push would close it');
             return ['would-supersede', $fields];
         }
-        $body = "Superseded — advisory already resolved on {$default} by another change; closing.";
-        $r    = $this->gh()->run(['pr', 'close', $num, '--repo', $repo, '--comment', $body . "\n\n<!-- security-update:superseded -->"]);
+        $body = 'Superseded — ' . self::supersedeClaim() . "; closing.\n\n<!-- security-update:superseded -->";
+        $r    = $this->gh()->run(['pr', 'close', $num, '--repo', $repo, '--comment', $body]);
         if (!$r->ok()) {
             $this->console->fail("  PR #{$num} is superseded but could not be closed (" . $r->failureReason() . ')');
             return ['close-failed', $fields];
         }
-        $this->console->ok("  PR #{$num} superseded — closed (advisory already resolved on {$default})");
+        $this->console->ok("  PR #{$num} superseded — closed (" . self::supersedeClaim() . ')');
         return ['superseded-closed', $fields];
     }
 
     /**
-     * Whether an open Dependabot alert still covers one of the packages the
-     * PR moves. null when the PR cannot be judged on alerts at all: not a
+     * What superseding asserts, and nothing beyond it: the open alert list
+     * no longer covers the PR. A human dismissing an alert empties the list
+     * exactly the same way, which is why the claim never says the advisory
+     * was "resolved by another change".
+     */
+    public static function supersedeClaim(): string
+    {
+        return 'no open Dependabot alert covers these packages anymore';
+    }
+
+    /**
+     * Whether the open Dependabot alerts still cover one of the packages the
+     * PR moves, and whether any covering alert sits in the directory the PR
+     * names. null when the PR cannot be judged on alerts at all: not a
      * Dependabot PR (the alerts speak only for what raised them), no package
      * could be read from it, or the alert list could not be read.
      *
      * @param array<string, mixed> $pr
+     * @return array{covered: bool, strict: bool}|null
      */
-    private function alertCoverage(array $pr): ?bool
+    private function alertCoverage(array $pr): ?array
     {
         if (stripos((string)($pr['author']['login'] ?? ''), 'dependabot') === false) {
             return null;
@@ -1344,36 +1399,49 @@ final class SecurityRun
     }
 
     /**
-     * Whether one open alert still covers one of the packages: the same
-     * name, in the PR's directory when both name one. The ecosystem is
-     * deliberately not compared — GitHub files Maven, Gradle and sbt apart
-     * from how a PR groups them, and a too-generous match only keeps a PR
-     * open, which is the safe direction for an auto-close.
+     * Whether one open alert still covers one of the packages, and whether
+     * any covering alert is strict: in the very directory the PR title
+     * names, when it names one. Only a strict cover may latch the
+     * "raised for this alert" memory that later justifies a close, so an
+     * unrelated alert sharing the package name cannot close the PR. A mere
+     * cover still counts when deciding: an alert that names no manifest
+     * proves nothing about where it lives, and keeping the PR open is the
+     * safe direction for an auto-close. The ecosystem is deliberately not
+     * compared — GitHub files Maven, Gradle and sbt apart from how a PR
+     * groups them, and a too-generous match only keeps a PR open.
      *
      * @param list<string> $packages
      * @param list<array<string, mixed>> $alerts normalised Dependabot alert rows
+     * @return array{covered: bool, strict: bool}
      */
-    public static function alertsCoverPr(array $packages, ?string $dir, array $alerts): bool
+    public static function alertsCoverPr(array $packages, ?string $dir, array $alerts): array
     {
         if ($packages === []) {
-            return false;
+            return ['covered' => false, 'strict' => false];
         }
-        $wanted = array_map('strtolower', $packages);
+        $covered = false;
+        $strict  = false;
+        $wanted  = array_map('strtolower', $packages);
         foreach ($alerts as $alert) {
             if (!in_array(strtolower((string)($alert['package'] ?? '')), $wanted, true)) {
                 continue;
             }
             $manifest = (string)($alert['manifest'] ?? '');
             if ($dir === null || $manifest === '') {
-                return true;
+                $covered = true; // grouped title, or an alert that cannot be placed
+                if ($dir === null) {
+                    $strict = true; // a grouped title names no directory to contradict
+                }
+                continue;
             }
             $alertDir = dirname($manifest);
             $alertDir = $alertDir === '.' ? '' : trim($alertDir, '/');
             if ($alertDir === $dir) {
-                return true;
+                $covered = true;
+                $strict  = true;
             }
         }
-        return false;
+        return ['covered' => $covered, 'strict' => $strict];
     }
 
     /**
@@ -1783,7 +1851,7 @@ final class SecurityRun
             }
         }
 
-        $this->needsMajor = $majorRows;
+        $this->needsMajor += $majorRows;  // triage may already have counted PR majors this run
         $bad              = $noValidFix > 0 ? " no-valid-fix={$noValidFix}" : '';
         if (!$write) {
             $this->readyFixes = $edits;
@@ -1794,8 +1862,19 @@ final class SecurityRun
         }
         // Every override written above now faces the lockfile: re-resolve it
         // and count the edit applied only when the vulnerable copy is gone.
-        $notEvicted = 0;
+        $notEvicted = $lockUnreadable = 0;
         foreach ($this->verifyOverrides($verifications) as $v) {
+            if ($v['unreadable']) {
+                // An absent or undecodable lock says nothing: an empty read
+                // is a "not found", and "not found" must not stand in for
+                // "evicted and applied"
+                $lockUnreadable += $v['n'];
+                $c->warn("  npm {$v['pkg']} -> {$v['ver']} in {$v['target']}: lock unreadable, not verified");
+                foreach ($v['keys'] as $key) {
+                    $updates[] = ['key' => $key, 'state' => 'pending', 'note' => 'lock unreadable, not verified'];
+                }
+                continue;
+            }
             if ($v['still'] === []) {
                 $applied += $v['n'];
                 $c->ok("  npm {$v['pkg']} -> {$v['ver']} in {$v['target']}{$v['via']} (verified in the lockfile)");
@@ -1813,13 +1892,15 @@ final class SecurityRun
             }
         }
         $bad .= $notEvicted > 0 ? " override-not-evicted={$notEvicted}" : '';
+        $bad .= $lockUnreadable > 0 ? " lock-unreadable={$lockUnreadable}" : '';
         $this->saveDb(VulnDb::applyStates($db, $updates, $this->now));
 
         $c->info("auto-fix (in records): applied={$applied} already-ok={$satisfied} not-declared={$notDeclared} missing-manifest={$missing}"
             . " cannot-edit={$unsupported} needs-major={$major}{$bad}{$rest}; {$edits} manifest edit(s)");
         if ($edits > 0) {
-            $this->record('auto-fix', $notEvicted > 0 ? 'WARN' : 'PASS', 0, 0,
-                "{$edits} edit(s)" . ($notEvicted > 0 ? ", {$notEvicted} override(s) not evicted from the lockfile" : ''));
+            $this->record('auto-fix', $notEvicted + $lockUnreadable > 0 ? 'WARN' : 'PASS', 0, 0,
+                "{$edits} edit(s)" . ($notEvicted > 0 ? ", {$notEvicted} override(s) not evicted from the lockfile" : '')
+                . ($lockUnreadable > 0 ? ", {$lockUnreadable} override(s) not verified (lock unreadable)" : ''));
             if (!$this->opt->push) {
                 $c->warn("Manifests were modified in {$this->root} — review 'git diff' before committing");
             }
@@ -1834,9 +1915,12 @@ final class SecurityRun
      * here), then report per edit the versions the lock still resolves that
      * do not clear every advisory. A failed install is answered by what the
      * lock says anyway: an override npm could not honour has evicted nothing.
+     * A lock that is absent or cannot be decoded at all says nothing, and is
+     * reported as unreadable rather than as an empty — verified — dependency
+     * tree.
      *
      * @param list<array{keys: list<string>, n: int, dir: string, pkg: string, spec: array<string, list<string>>, ver: string, target: string, via: string}> $verifications
-     * @return list<array{n: int, keys: list<string>, pkg: string, ver: string, target: string, via: string, still: list<string>}>
+     * @return list<array{n: int, keys: list<string>, pkg: string, ver: string, target: string, via: string, still: list<string>, unreadable: bool}>
      */
     private function verifyOverrides(array $verifications): array
     {
@@ -1858,14 +1942,19 @@ final class SecurityRun
         }
         $out = [];
         foreach ($verifications as $v) {
-            $still = [];
-            foreach (Lockfile::versions($v['dir'], 'npm', $v['pkg']) ?? [] as $version) {
-                if (!Version::clearsAll($version, $v['spec'])) {
-                    $still[] = $version;
+            $locked     = Lockfile::versions($v['dir'], 'npm', $v['pkg']);
+            $unreadable = $locked === null || Lockfile::unreadable($v['dir'], 'npm');
+            $still      = [];
+            if (!$unreadable) {
+                foreach ($locked as $version) {
+                    if (!Version::clearsAll($version, $v['spec'])) {
+                        $still[] = $version;
+                    }
                 }
             }
             $out[] = ['n' => $v['n'], 'keys' => $v['keys'], 'pkg' => $v['pkg'], 'ver' => $v['ver'],
-                'target' => $v['target'], 'via' => $v['via'], 'still' => array_values(array_unique($still))];
+                'target' => $v['target'], 'via' => $v['via'], 'still' => array_values(array_unique($still)),
+                'unreadable' => $unreadable];
         }
         return $out;
     }
@@ -2113,10 +2202,12 @@ final class SecurityRun
                 // uncommitted edit would outlive it (the edit reverted, the
                 // memory kept), and reuse would then rest on nothing.
                 $paths = $this->needsPaths($needs, $lister);
-                if (!self::pathsTouched($paths, $changed)) {
+                $head  = (string)$this->headSha();   // set: $changed !== null answers for it
+                if ($head !== '' && !self::pathsTouched($paths, $changed)) {
                     $m = $meta[$ref] ?? ['title' => '', 'cve' => '', 'package' => ''];
                     $state->remember($refNum, $ok ? 'fixed' : $reason, [
                         'key'        => CloseState::key($needs),
+                        'head'       => $head,
                         'why'        => $reason === 'unverifiable' ? self::unverifiableWhy($detail) : '',
                         'detail'     => mb_substr($detail, 0, 240),
                         'evidence'   => $ok ? mb_substr($evidence, 0, 4000) : '',
@@ -2235,9 +2326,12 @@ final class SecurityRun
     }
 
     /**
-     * The files a verdict leans on: every manifest a requirement names, plus
-     * the source manifest a lockfile would stand in for. A change to any of
-     * them can change the verdict.
+     * The files a verdict leans on: every manifest a requirement names, the
+     * source manifest a lockfile would stand in for, and every lockfile the
+     * verifier may have read there. A change to any of them can change the
+     * verdict — a lockfile-only regression must not close on a manifest-only
+     * watch. Names that do not exist simply never appear in the changed-set,
+     * so watching them is free.
      *
      * @param list<array{manifest: string}>  $needs
      * @param callable(string): list<string> $lister
@@ -2252,7 +2346,13 @@ final class SecurityRun
                 continue;
             }
             $paths[$manifest] = true;
-            $paths[ManifestPaths::sourceManifestFor($manifest, $lister)] = true;
+            $source           = ManifestPaths::sourceManifestFor($manifest, $lister);
+            $paths[$source]   = true;
+            $dir              = dirname($source);
+            $prefix           = $dir === '.' ? '' : $dir . '/';
+            foreach (Lockfile::lockNamesFor(ManifestPaths::ecosystemFor($source)) as $lock) {
+                $paths[$prefix . $lock] = true;
+            }
         }
         $out = array_keys($paths);
         sort($out);
@@ -2311,18 +2411,52 @@ final class SecurityRun
     }
 
     /**
-     * Every path changed since the oldest remembered verdict: commits on the
-     * checked-out branch (with a day of slack for committer clocks), plus
-     * whatever is uncommitted right now. Null when git cannot answer — a
-     * shallow clone's history proves nothing about a month of it — and null
-     * means no reuse and no new memory: today's verification stands on its
-     * own, never yesterday's verdict on unprovable ground.
+     * The commit HEAD points at, or null when git will not answer. Read once:
+     * verdicts are remembered against it, and the change scan diffs from it.
+     */
+    private function headSha(): ?string
+    {
+        if (!$this->headShaRead) {
+            $this->headShaRead = true;
+            $r = $this->ctx->runner->run(['git', '-C', $this->root, 'rev-parse', 'HEAD'], $this->root, ['timeout' => 30, 'label' => 'git']);
+            $sha = trim($r->stdout);
+            $this->headSha = $r->ok() && preg_match('/^[0-9a-f]{40,64}$/', $sha) === 1 ? $sha : null;
+        }
+        return $this->headSha;
+    }
+
+    /**
+     * Whether this clone still holds the object as a commit.
+     */
+    private function commitExists(string $sha): bool
+    {
+        return $this->ctx->runner->run(['git', '-C', $this->root, 'cat-file', '-e', $sha . '^{commit}'], $this->root, ['timeout' => 30, 'label' => 'git'])->ok();
+    }
+
+    /**
+     * Every path changed since remembered verdicts were drawn: whatever is
+     * uncommitted right now, plus — for each remembered verdict — every
+     * commit landed since the SHA it was drawn against, read with
+     * `git diff --name-only`. SHAs, not dates, because committer dates lie:
+     * a fast-forward pull or a `git am` lands old-dated commits that a
+     * `git log --since` window never sees. Entries from before SHAs were
+     * recorded have nothing to diff from; until re-verification replaces
+     * them, the date scan covers the run for those, as it always did.
+     * Null when git cannot answer — a shallow clone's history proves nothing
+     * about a month of it, and a rewritten one proves nothing about the
+     * SHAs in memory — and null means no reuse and no new memory: today's
+     * verification stands on its own, never yesterday's verdict on
+     * unprovable ground.
      *
      * @return array<string, true>|null
      */
     private function changedSinceChecks(CloseState $state): ?array
     {
         $opt     = ['timeout' => 120, 'label' => 'git'];
+        $head    = $this->headSha();
+        if ($head === null) {
+            return null;
+        }
         $shallow = $this->ctx->runner->run(['git', '-C', $this->root, 'rev-parse', '--is-shallow-repository'], $this->root, ['timeout' => 30, 'label' => 'git']);
         if (!$shallow->ok() || trim($shallow->stdout) !== 'false') {
             return null;
@@ -2345,6 +2479,29 @@ final class SecurityRun
                     $changed[$entries[$i]] = true;
                 }
             }
+        }
+        $byDate = false;
+        foreach ($state->rememberedHeads() as $sha) {
+            if ($sha === '') {
+                $byDate = true; // an entry from before SHAs were recorded
+                continue;
+            }
+            if (!$this->commitExists($sha)) {
+                return null;    // rewritten or collected history proves nothing
+            }
+            $diff = $this->ctx->runner->run(['git', '-C', $this->root, 'diff', '--name-only', $sha, $head], $this->root, $opt);
+            if (!$diff->ok()) {
+                return null;
+            }
+            foreach (preg_split('/\R/', $diff->stdout) ?: [] as $line) {
+                $line = trim($line);
+                if ($line !== '') {
+                    $changed[$line] = true;
+                }
+            }
+        }
+        if (!$byDate) {
+            return $changed;
         }
         $oldest = $state->oldestCheck();
         if ($oldest === '') {
@@ -2514,7 +2671,9 @@ final class SecurityRun
     {
         foreach ($this->openBotPrs ?? [] as $pr) {
             $packages = self::prPackages($pr['title'], $pr['body']);
-            if ($packages !== [] && self::alertsCoverPr($packages, self::prDirectory($pr['title']), [$alert])) {
+            // the loose cover: a PR anywhere on this package keeps the report
+            // from claiming nobody is moving it (the strict one only gates closes)
+            if ($packages !== [] && self::alertsCoverPr($packages, self::prDirectory($pr['title']), [$alert])['covered']) {
                 return true;
             }
         }

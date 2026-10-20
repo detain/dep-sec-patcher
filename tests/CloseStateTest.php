@@ -172,6 +172,19 @@ class CloseStateTest extends TestCase
         $this->assertSame('2026-10-16T09:00:00Z', $s->oldestCheck());
     }
 
+    public function testRememberedHeadsAreDistinctAndSayWhichEntriesPredateThem(): void
+    {
+        $s = CloseState::load($this->statePath(), 'now');
+        $this->assertSame([], $s->rememberedHeads(), 'nothing remembered, nothing to diff');
+        $this->put($s, '1', ['head' => 'aaaa']);
+        $this->put($s, '2', ['head' => 'bbbb']);
+        $this->put($s, '3', ['head' => 'aaaa']);
+        $this->assertSame(['aaaa', 'bbbb'], $s->rememberedHeads());
+        $this->put($s, '4', ['checked_at' => 'now']); // an entry from before SHAs were recorded
+        $this->assertContains('', $s->rememberedHeads(), 'the caller falls back to the date scan for these');
+        $this->assertCount(3, $s->rememberedHeads(), 'still one answer per distinct state, not per entry');
+    }
+
     public function testTheKeyFollowsTheRequirementsNotTheirArrayKeys(): void
     {
         $this->assertSame(CloseState::key(self::needs()), CloseState::key(self::needs()), 'the same requirements, the same identity');
