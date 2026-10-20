@@ -123,6 +123,9 @@ class OptionsTest extends TestCase
         $this->assertTrue(Options::parse([], [])->retriage);
         $this->assertFalse(Options::parse(['--no-retriage'], [])->retriage);
 
+        $this->assertFalse(Options::parse([], [])->enablePosture);
+        $this->assertTrue(Options::parse(['--enable-posture'], [])->enablePosture);
+
         $o = Options::parse(['--push-direct'], []);
         $this->assertTrue($o->push, '--push-direct implies --push');
         $this->assertSame('direct', $o->pushMode);
@@ -137,5 +140,6 @@ class OptionsTest extends TestCase
         }
         $this->assertMatchesRegularExpression('#--repo OWNER/NAME\s+GitHub repository#', $help);
         $this->assertStringContainsString("origin remote", $help);
+        $this->assertMatchesRegularExpression('#--enable-posture\s+In update mode#', $help);
     }
 }

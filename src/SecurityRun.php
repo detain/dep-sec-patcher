@@ -24,7 +24,7 @@ use RuntimeException;
 /**
  * One run: GitHub collection, auto-fix, ecosystem updates and audits,
  * scanners, PR triage, optional push (branch, pull request or direct),
- * close-fixed, summary and JSON report.
+ * optional security-posture remediation, close-fixed, summary and JSON report.
  *
  * @phpstan-import-type Need from IssueVerifier
  * @phpstan-import-type Verdict from IssueVerifier
@@ -93,6 +93,13 @@ final class SecurityRun
     private array $triageHandled = [];
     /** The repository's default branch, read once when a PR needs its name. */
     private string $defaultBranchRef = '';
+    /**
+     * Security posture settings this run switched on, for the JSON report.
+     * @var list<string>
+     */
+    private array $postureEnabled = [];
+    /** Whether a posture pass ran at all, so the report says "checked, nothing to change". */
+    private bool $postureAttempted = false;
 
     public function __construct(
         private Options $opt,
@@ -675,29 +682,131 @@ final class SecurityRun
             return;
         }
         $c->info('Checking repository security settings...');
-        $info = $this->gh()->json(['api', 'repos/' . $this->repo()], 60);
+        $repo = $this->repo();
+        $info = $this->gh()->json(['api', 'repos/' . $repo], 60);
         $sa   = is_array($info) ? ($info['security_and_analysis'] ?? null) : null;
         if (!is_array($sa)) {
             $c->skip('Secret scanning: cannot determine status');
             $this->record('secret-scanning', 'SKIP');
             return;
         }
-        $secret = (string)($sa['secret_scanning']['status'] ?? 'unknown');
-        if ($secret === 'enabled') {
+        /** @var array<string, mixed> $info */
+        $write = $this->opt->enablePosture && $this->opt->mode === 'update';
+        if ($write) {
+            $this->postureAttempted = true;
+        }
+        $gh  = $this->gh();
+        /** @param list<string> $args */
+        $api = fn (array $args): CommandResult => $gh->run(array_values($args), 60);
+        $this->postureEnabled = self::reportSecurityPosture($write, $repo, $info, $api, $c);
+        $this->record('secret-scanning', in_array('secret-scanning', $this->postureEnabled, true)
+            || ($sa['secret_scanning']['status'] ?? null) === 'enabled' ? 'PASS' : 'FAIL');
+    }
+
+    /**
+     * Report the repository's security posture and, where the run was asked to
+     * improve it ($write), switch on what is off and this run is able to enable.
+     * Every enable is one idempotent API call and best-effort: an error is
+     * reported with its HTTP status and never raised, so a repository the token
+     * cannot administer surfaces as a WARN rather than failing the run. When
+     * $write is false nothing is called and only the standing status is shown.
+     *
+     * @param array<string, mixed>                $info the GET repos/{owner}/{repo} body
+     * @param callable(list<string>): CommandResult $api one `gh api ...` call (args after "gh")
+     * @return list<string> what was actually switched on
+     */
+    private static function reportSecurityPosture(bool $write, string $repo, array $info, callable $api, Console $c): array
+    {
+        $sa         = is_array($info['security_and_analysis'] ?? null) ? $info['security_and_analysis'] : [];
+        $secret     = (string)($sa['secret_scanning']['status'] ?? 'unknown');
+        $dependabot = (string)($sa['dependabot_security_updates']['status'] ?? 'unknown');
+        $push       = (string)($sa['secret_scanning_push_protection']['status'] ?? 'unknown');
+        $public     = ($info['visibility'] ?? '') === 'public'
+            || (!isset($info['visibility']) && ($info['private'] ?? true) === false);
+        $enabled    = [];
+
+        if ($dependabot === 'enabled') {
+            $c->ok('Dependabot security updates: enabled');
+        } elseif ($write) {
+            if (self::tryEnable($api, $c, $repo, 'Dependabot security updates', 'cannot enable security updates',
+                ['api', '-X', 'PUT', "repos/{$repo}/vulnerability-alerts"])) {
+                $enabled[] = 'dependabot-security-updates';
+            }
+        } else {
+            $c->fail("Dependabot security updates: {$dependabot}");
+        }
+
+        $secretOn = $secret === 'enabled';
+        if ($secretOn) {
             $c->ok('Secret scanning: enabled');
-            $this->record('secret-scanning', 'PASS');
+        } elseif ($write && $public) {
+            if (self::tryEnable($api, $c, $repo, 'Secret scanning', 'cannot enable secret scanning',
+                ['api', '-X', 'PATCH', "repos/{$repo}", '-f', 'security_and_analysis[secret_scanning][status]=enabled'])) {
+                $enabled[]  = 'secret-scanning';
+                $secretOn   = true;
+            }
+        } elseif ($write) {
+            $c->info('Secret scanning: ' . $secret . ' (private repository - needs an advanced security licence, left as is)');
         } else {
             $c->fail("Secret scanning: {$secret}");
-            $this->record('secret-scanning', 'FAIL');
         }
-        $dependabot = (string)($sa['dependabot_security_updates']['status'] ?? 'unknown');
-        $dependabot === 'enabled'
-            ? $c->ok('Dependabot security updates: enabled')
-            : $c->fail("Dependabot security updates: {$dependabot}");
+
+        if ($write && $public && $secretOn && $push !== 'enabled') {
+            if (self::tryEnable($api, $c, $repo, 'Secret scanning push protection', 'cannot enable push protection',
+                ['api', '-X', 'PATCH', "repos/{$repo}", '-f', 'security_and_analysis[secret_scanning_push_protection][status]=enabled'])) {
+                $enabled[] = 'secret-scanning-push-protection';
+            }
+        }
+
+        if ($write) {
+            $r = $api(['api', '-X', 'POST', "repos/{$repo}/private-vulnerability-reporting"]);
+            if ($r->ok() || self::httpStatus($r) === 409) {
+                $c->ok('Private vulnerability reporting: ' . ($r->ok() ? 'enabled' : 'already enabled'));
+                $enabled[] = 'private-vulnerability-reporting';
+            } else {
+                self::enableFailure($c, $repo, 'cannot enable private vulnerability reporting', $r);
+            }
+        }
+
         $scanning = $sa['code_scanning']['default_setup']['summary'] ?? null;
         if (is_string($scanning)) {
             $scanning === 'configured' ? $c->ok('Code scanning: configured') : $c->info("Code scanning: {$scanning}");
         }
+
+        return $enabled;
+    }
+
+    /**
+     * One enable attempt: an idempotent write that stays quiet on success and
+     * says which HTTP status blocked it otherwise.
+     *
+     * @param callable(list<string>): CommandResult $api
+     * @param list<string> $args
+     */
+    private static function tryEnable(callable $api, Console $c, string $repo, string $label, string $why, array $args): bool
+    {
+        $r = $api($args);
+        if (!$r->ok()) {
+            self::enableFailure($c, $repo, $why, $r);
+            return false;
+        }
+        $c->ok("{$label}: enabled (was disabled)");
+        return true;
+    }
+
+    private static function enableFailure(Console $c, string $repo, string $why, CommandResult $r): void
+    {
+        $code = self::httpStatus($r);
+        $c->warn("{$repo} — {$why}: " . ($code !== null ? "HTTP {$code}" : $r->failureReason()));
+    }
+
+    /**
+     * The HTTP status gh names in its output ("... (HTTP 404)"), or null when
+     * the call failed for some other reason.
+     */
+    private static function httpStatus(CommandResult $r): ?int
+    {
+        return preg_match('/HTTP (\d{3})/', $r->output, $m) === 1 ? (int)$m[1] : null;
     }
 
     // ── dependency-bot PR triage ─────────────────────────────────────────────
@@ -2786,7 +2895,8 @@ final class SecurityRun
                 'grype'  => ['enabled' => $this->opt->trivy !== 'no' && $this->opt->grype !== 'no'],
                 'netsec' => ['enabled' => $this->opt->netsec !== 'no'],
             ],
-        ] + ($this->notFixed === null ? [] : ['not_fixed' => $this->notFixed]);
+        ] + ($this->postureAttempted ? ['posture_enabled' => $this->postureEnabled] : [])
+          + ($this->notFixed === null ? [] : ['not_fixed' => $this->notFixed]);
         $file = $this->reportDir . '/security-scan-report.json';
         if (@file_put_contents($file, JsonFile::encode($report)) !== false) {
             $this->console->info("JSON report generated: {$file}");

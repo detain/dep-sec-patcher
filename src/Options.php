@@ -47,6 +47,8 @@ final class Options
     public string $mergePrs = 'auto';
     /** Re-triage at the end of an --update --push run, for bot PRs the push itself opened. */
     public bool $retriage = true;
+    /** In update mode, switch on security posture settings this run is able to enable. */
+    public bool $enablePosture = false;
     public string $autoFix = 'auto';
     /** Let auto-fix move a declared dependency to a new major version. */
     public bool $allowMajor = false;
@@ -184,6 +186,9 @@ final class Options
                     break;
                 case '--no-retriage':
                     $o->retriage = false;
+                    break;
+                case '--enable-posture':
+                    $o->enablePosture = true;
                     break;
                 case '--no-auto-fix':
                     $o->autoFix = 'no';
@@ -447,6 +452,16 @@ GitHub integration (requires the gh CLI):
                         publishing, because the pushed changes make
                         Dependabot open new PRs while the run is going; this
                         turns that second pass off (config: retriage)
+  --enable-posture      In update mode, switch on what the settings check finds
+                        off on a repository this run administers: Dependabot
+                        security updates, secret scanning plus its push
+                        protection (public repositories only - private ones
+                        need an advanced security licence), and private
+                        vulnerability reporting. Each is one idempotent call
+                        and best-effort: a 403 (not an admin) or 404 (feature
+                        unavailable) is reported as a WARN, never a failed
+                        run. Off by default; the flag is itself the write gate
+                        (config: enable-posture)
   --no-auto-fix         Record vulnerabilities but never edit manifests
   --allow-major         Let auto-fix move a dependency to a new major version
                         when that is the only fix (default: such fixes are

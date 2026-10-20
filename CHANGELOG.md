@@ -83,6 +83,17 @@ First release: a standalone, generic port of MyAdmin's
   major, an open PR already covers it) and pending database records bucketed
   by the note that keeps them pending, each bounded to the largest ten per
   bucket with the totals alongside.
+- `--enable-posture` (config `enable-posture`): the repository settings check,
+  which until now only reported secret scanning and Dependabot security updates
+  being off, now switches them on in update mode for repositories the run
+  administers. Each is one idempotent call and best-effort: Dependabot security
+  updates (`PUT vulnerability-alerts`), secret scanning and its push protection
+  (`PATCH security_and_analysis`, public repositories only, since a private one
+  needs an advanced security licence) and private vulnerability reporting
+  (`POST private-vulnerability-reporting`). A 403 (not an admin) or 404 (feature
+  unavailable) prints a WARN with the HTTP status and never fails the run; the
+  flag itself is the write gate, so unlike closing a superseded PR it needs no
+  `--push`. What was switched on is listed in the report (`posture_enabled`).
 - A "Next steps" section at the end of a run that found fixes it did not
   apply or publish, with the exact command line that would.
 - Mend's grouped issue format (one issue per library, a summary table and

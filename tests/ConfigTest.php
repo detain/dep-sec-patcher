@@ -42,6 +42,7 @@ class ConfigTest extends TestCase
             'close-delay'    => 0,
             'close-limit'    => 10,
             'retriage'       => false,
+            'enable-posture' => true,
             'allow-http'     => ['http://intranet.example/', '*.corp.example/'],
             'exclude-dirs'   => ['docs', './test/fixtures/'],
         ];
@@ -66,6 +67,7 @@ class ConfigTest extends TestCase
         $this->assertSame(0, $o->closeDelay);
         $this->assertSame(10, $o->closeLimit);
         $this->assertFalse($o->retriage);
+        $this->assertTrue($o->enablePosture);
         $this->assertSame(['intranet.example/', '*.corp.example/'], $o->allowHttp, 'http:// prefix dropped');
         $this->assertSame(['docs', 'test/fixtures'], $o->excludeDirs, 'paths normalised');
     }
@@ -154,6 +156,7 @@ class ConfigTest extends TestCase
             'unknown ecosystem'  => [['ecosystems' => ['cobol' => false]], 'unknown name "cobol"'],
             'non-bool switch'    => [['scanners' => ['trivy' => 'no']], '"scanners"."trivy" must be true or false'],
             'unknown scanner'    => [['scanners' => ['snyk' => true]], 'unknown name "snyk"'],
+            'posture not bool'   => [['enable-posture' => 'yes'], '"enable-posture" must be true or false'],
             'only unknown'       => [['only' => ['maven', 'cobol']], "unknown check 'cobol'"],
             'only not list'      => [['only' => 'maven'], '"only" must be a list of strings'],
             'exclude escapes'    => [['exclude-dirs' => ['../up']], 'must be a relative path inside the target'],
