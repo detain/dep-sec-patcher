@@ -268,6 +268,37 @@ First release: a standalone, generic port of MyAdmin's
   pnpm/yarn workspace are removed again so `--push` cannot commit them, and
   auto-fix counts `workspace:`/`catalog:` declarations as not-declared links
   rather than cannot-edit failures.
+- Honesty over silence at every terminal path of a batch: a repository whose
+  clone failed, that holds no commits, or whose tree contains no
+  manifest-bearing project now ends with an explicit `[FAIL]`/`[SKIP]` line
+  and a `security-scan-report.json` naming the reason, instead of leaving only
+  a "cloning" line behind.
+- Composer: `composer audit` always runs with `--locked` (the lockfile, not the
+  host's `vendor/`, is the resolved state that ships). A project with a
+  `composer.json` but no `composer.lock` is SKIPped with the reason named —
+  there is no deterministic transitive state to audit — instead of auditing a
+  freshly fabricated lockfile that `composer audit` refuses anyway ("No
+  installed packages found" / "Valid composer.json and composer.lock files are
+  required").
+- Go: when gosec cannot run because the package does not build, an otherwise
+  clean govulncheck result is WARN, not OK: code-level issues were not checked.
+- npm: an override for a transitive package is only counted applied after the
+  lockfile agrees. Auto-fix re-resolves the lock (`npm install
+  --package-lock-only`, update mode) and a copy the override failed to evict
+  keeps its record pending with "override written but lock still resolves
+  <pkg>@<ver>", tallied as `override-not-evicted` and bucketed as
+  `override-did-not-evict` in the not-fixed report; the auditor prints the same
+  note under its audit. `yarn.lock` projects (`resolutions`) keep the old
+  immediate tally: verifying those would need a yarn run this tool must not
+  start.
+- Python: a directory is detected by any manifest — `requirements*.txt` in
+  every spelling, `setup.py`, `setup.cfg`, `poetry.lock` besides the old three —
+  and every requirements file in it is audited, not just `requirements.txt`.
+  A detected project with nothing pip-audit can consume prints a SKIP naming
+  the files that were found.
+- Check mode's npm results note that devDependencies were not audited
+  (`npm audit --omit=dev`), so a clean check-mode line cannot be misread as
+  full coverage.
 
 ### Kept
 

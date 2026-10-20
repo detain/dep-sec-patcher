@@ -71,7 +71,15 @@ final class GoAuditor extends Auditor
                 $issues  = count($data['Issues'] ?? []);
                 $notes[] = "gosec: {$issues} finding" . ($issues === 1 ? '' : 's') . " (report: {$report})";
             } else {
-                $notes[] = 'gosec wrote no report (' . $r->failureReason() . '; usually the package does not build)';
+                $notes[] = "gosec skipped: package doesn't build — code-level issues not checked (" . $r->failureReason() . ')';
+                // A security scanner that could not run under an otherwise
+                // clean result is a coverage hole, not an OK: govulncheck
+                // answers "no known vulnerabilities in dependencies", gosec
+                // is what checks the code itself.
+                if ($t->status === TargetResult::PASS) {
+                    $t->status = TargetResult::WARN;
+                    $t->detail .= ' — but gosec could not check the code';
+                }
             }
         }
         $t->notes = array_merge($notes, $t->notes);

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Detain\DepSecPatcher\Tests;
 
 use Detain\DepSecPatcher\Auditor\ComposerAuditor;
+use Detain\DepSecPatcher\Auditor\GoAuditor;
 use Detain\DepSecPatcher\Auditor\GradleAuditor;
 use Detain\DepSecPatcher\Auditor\MavenAuditor;
 use Detain\DepSecPatcher\Auditor\NodeAuditor;
@@ -464,23 +465,77 @@ class ScannersTest extends TestCase
     }
 
     /**
+     * With no composer.lock there is no resolved transitive state to audit:
+     * the project is skipped with its reason named, rather than a lockfile
+     * fabricated to make it pass. (Verified on composer 2.10: audit --locked
+     * refuses to run without a lockfile at all.)
+     *
      * @param list<string> $mode
      */
     #[DataProvider('modes')]
-    public function testComposerWithoutALockfileAuditsAFreshResolutionAndDeletesIt(array $mode): void
+    public function testComposerWithoutALockfileIsSkippedNotFaked(array $mode): void
     {
         $log  = $this->fakeComposer();
         $root = $this->scratchDir('lib');
         file_put_contents($root . '/composer.json', '{"require": {"psr/log": "^1.0"}}');
         $t = (new ComposerAuditor())->audit($this->context($root, $mode), '');
 
-        $this->assertSame(TargetResult::PASS, $t->status, $t->detail);
-        $calls = file($log, FILE_IGNORE_NEW_LINES) ?: [];
-        $this->assertCount(2, $calls);
-        $this->assertStringStartsWith('update -W --no-install', $calls[0]);
-        $this->assertStringStartsWith('audit --locked', $calls[1]);
-        $this->assertFileDoesNotExist($root . '/composer.lock', 'neither left behind nor committed');
-        $this->assertContains('no composer.lock: audited a fresh resolution, then deleted it', $t->notes);
+        $this->assertSame(TargetResult::SKIP, $t->status);
+        $this->assertSame(ComposerAuditor::NO_LOCK_NOTE, $t->detail);
+        $this->assertFileDoesNotExist($log, 'composer is never run');
+        $this->assertFileDoesNotExist($root . '/composer.lock', 'nothing fabricated, nothing left behind');
+    }
+
+    public function testGosecThatCannotBuildTurnsACleanResultIntoAWarn(): void
+    {
+        $bin = $this->scratchDir('bin');
+        foreach (['go', 'govulncheck'] as $tool) {
+            file_put_contents($bin . '/' . $tool, "#!/bin/sh\nexit 0\n");
+            chmod($bin . '/' . $tool, 0755);
+        }
+        // gosec exits without writing its report: the package does not build
+        file_put_contents($bin . '/gosec', "#!/bin/sh\necho 'gosec: analysis failed: packagesLoad failed' >&2\nexit 1\n");
+        chmod($bin . '/gosec', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $root = $this->scratchDir('go');
+        file_put_contents($root . '/go.mod', "module example.test/x\n\ngo 1.22\n");
+
+        $t = (new GoAuditor())->audit($this->context($root, ['--check']), '');
+        $this->assertStringContainsString('govulncheck: no reachable vulnerabilities', $t->detail);
+        $this->assertSame(TargetResult::WARN, $t->status, 'a security scanner that could not run is a coverage hole, not an OK');
+        $this->assertStringContainsString('but gosec could not check the code', $t->detail);
+        $this->assertContains("gosec skipped: package doesn't build — code-level issues not checked (exit 1)", $t->notes);
+    }
+
+    public function testAnOverrideTheInstallDidNotEvictSaysSo(): void
+    {
+        $bin = $this->scratchDir('bin');
+        $log = $bin . '/calls.log';
+        // The install accepts the override but leaves the lock as it is:
+        // npm can do exactly that when a parent's pinned spec wins
+        file_put_contents($bin . '/npm', <<<SH
+            #!/bin/sh
+            echo "\$*" >> '{$log}'
+            case " \$* " in
+              *" audit fix "*) exit 1 ;;
+              *" audit --json "*)
+                if grep -q '"overrides"' package.json; then echo '{"metadata": {"vulnerabilities": {"high": 0}}}'; exit 0; fi
+                echo '{"vulnerabilities": {"form-data": {"via": [{"range": "4.0.0 - 4.0.5"}]}}, "metadata": {"vulnerabilities": {"high": 1}}}'
+                exit 1 ;;
+              *" view form-data versions "*) echo '["4.0.5", "4.0.6"]' ;;
+            esac
+            SH);
+        chmod($bin . '/npm', 0755);
+        $this->setEnv('PATH', $bin . ':' . getenv('PATH'));
+        $root = $this->scratchDir('js');
+        file_put_contents($root . '/package.json', "{\n  \"dependencies\": {\n    \"zapier-platform-core\": \"^9.0.0\"\n  }\n}\n");
+        file_put_contents($root . '/package-lock.json', '{"packages": {"": {}, "node_modules/form-data": {"version": "4.0.6"},'
+            . ' "node_modules/zapier-platform-core/node_modules/form-data": {"version": "4.0.5"}}}');
+
+        $t = (new NodeAuditor())->audit($this->context($root, ['--update', '--allow-major']), '');
+        $this->assertContains('npm overrides for what npm audit fix left: form-data ^4.0.6', $t->notes);
+        $this->assertContains('override written but lock still resolves form-data@4.0.5', $t->notes,
+            'an override the re-resolved lock ignored is named, not counted applied');
     }
 
     public function testComposerKeepsALockfileTheProjectHas(): void

@@ -9,16 +9,22 @@ use Detain\DepSecPatcher\Context;
 use Detain\DepSecPatcher\TargetResult;
 
 /**
- * PHP / Composer. Resolves with --no-install (the lockfile is all an audit
- * needs; vendor/ was deleted afterwards anyway) and without scripts or
- * plugins from the resolved packages.
+ * PHP / Composer. Updates with --no-install (the lockfile is all an audit
+ * needs) and without scripts or plugins from the resolved packages.
  *
- * composer audit needs a lockfile. A project that does not keep one (a
- * library, usually) gets one for the audit, deleted again afterwards in both
- * modes, so it is neither left behind nor committed by --push.
+ * `composer audit --locked` reads the lockfile directly - vendor/ install
+ * state is irrelevant to it (verified against Composer 2.10). A project
+ * without a composer.lock (a library, usually) has no resolved transitive
+ * state to audit: a freshly invented resolution is not what the project
+ * installs, so the audit is skipped with a note instead. It used to be
+ * fabricated, audited and deleted again, which reported vulnerabilities that
+ * belonged to no real install of the project.
  */
 final class ComposerAuditor extends Auditor
 {
+    /** Note (and SKIP reason) for a project whose lockfile is absent. */
+    public const NO_LOCK_NOTE = 'no composer.lock: audit skipped (no resolved transitive state to audit; commit a composer.lock to have this project audited)';
+
     private const FLAGS = ['--no-install', '--no-interaction', '--no-scripts', '--no-plugins', '--no-progress'];
 
     public function name(): string
@@ -47,26 +53,21 @@ final class ComposerAuditor extends Auditor
 
     public function audit(Context $ctx, string $dir): TargetResult
     {
-        $hadLock = $this->exists($ctx, $dir, 'composer.lock');
-        try {
-            return $this->updateAndAudit($ctx, $dir, $hadLock);
-        } finally {
-            if (!$hadLock) {
-                @unlink($this->abs($ctx, $dir) . '/composer.lock');
-            }
+        // The lockfile is the only thing an audit can honestly evaluate: it
+        // records what gets installed. Without one there is nothing to check
+        // - an invented resolution says nothing about the project - so the
+        // project is reported SKIP with the reason instead of failing or
+        // auditing a state nobody installs.
+        if (!$this->exists($ctx, $dir, 'composer.lock')) {
+            return new TargetResult(TargetResult::SKIP, self::NO_LOCK_NOTE);
         }
+        return $this->updateAndAudit($ctx, $dir);
     }
 
-    private function updateAndAudit(Context $ctx, string $dir, bool $hadLock): TargetResult
+    private function updateAndAudit(Context $ctx, string $dir): TargetResult
     {
         $notes = [];
-        if (!$hadLock) {
-            $r = $this->update($ctx, $dir, ['-W'], $notes);
-            if (!$r->ok()) {
-                return TargetResult::fromFailure($r, 'composer update (to create a lockfile)');
-            }
-            $notes[] = 'no composer.lock: audited a fresh resolution, then deleted it';
-        } elseif (!$ctx->checkMode()) {
+        if (!$ctx->checkMode()) {
             $r = $this->update($ctx, $dir, ['-W'], $notes);
             if (!$r->ok()) {
                 $notes[] = 'composer update ' . $r->failureReason();

@@ -30,6 +30,7 @@ class HelpersTest extends TestCase
     {
         $this->assertSame('npm', ManifestPaths::ecosystemFor('a/b/package-lock.json'));
         $this->assertSame('pip', ManifestPaths::ecosystemFor('dev-requirements.txt'));
+        $this->assertSame('pip', ManifestPaths::ecosystemFor('pipeline/setup.cfg'));
         $this->assertSame('gradle', ManifestPaths::ecosystemFor('build.gradle.kts'));
         $this->assertSame('nuget', ManifestPaths::ecosystemFor('src/X.csproj'));
         $this->assertSame('unknown', ManifestPaths::ecosystemFor(''));

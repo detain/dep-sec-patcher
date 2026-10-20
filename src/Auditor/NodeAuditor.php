@@ -178,7 +178,8 @@ final class NodeAuditor extends Auditor
         }
         $argv = ['npm', 'audit', '--json'];
         if ($ctx->checkMode()) {
-            $argv[] = '--omit=dev';
+            $argv[]  = '--omit=dev';
+            $notes[] = 'check mode: devDependencies not audited (npm audit --omit=dev)';
         }
         $result = $this->fromCounts($this->run($ctx, $dir, $argv), 'npm audit', static fn ($d) => $d['metadata']['vulnerabilities'] ?? null);
         $result->notes = array_merge($notes, $result->notes);
@@ -344,6 +345,46 @@ final class NodeAuditor extends Auditor
             return $notes;
         }
         $notes[] = "npm overrides for what npm audit fix left: {$list}";
+        // An override is a request, not a result: when a parent's pinned spec
+        // wins, npm re-resolves the vulnerable copy right back in. Only the
+        // re-resolved lock says whether the override actually evicted it.
+        return array_merge($notes, self::overridesNotEvicted($abs, $plan['overrides'], $audit));
+    }
+
+    /**
+     * Overrides npm accepted but the lockfile ignored: each override key's
+     * base package is re-read from the lock, and any copy still inside an
+     * advisory range is named. Nothing is assumed applied.
+     *
+     * @param array<string, string> $plan  the overrides just written
+     * @param array<string, mixed>  $audit the `npm audit --json` the plan came from
+     * @return list<string>
+     */
+    private static function overridesNotEvicted(string $abs, array $plan, array $audit): array
+    {
+        $ranges = [];
+        foreach (is_array($audit['vulnerabilities'] ?? null) ? $audit['vulnerabilities'] : [] as $name => $vuln) {
+            foreach (is_array($vuln['via'] ?? null) ? $vuln['via'] : [] as $via) {
+                if (is_array($via) && is_string($via['range'] ?? null)) {
+                    $ranges[(string)$name][] = $via['range'];
+                }
+            }
+        }
+        $notes = [];
+        foreach (array_keys($plan) as $key) {
+            $at   = strrpos($key, '@');
+            $name = $at > 0 ? substr($key, 0, $at) : $key;
+            if (($ranges[$name] ?? []) === []) {
+                continue;
+            }
+            $still = array_values(array_filter(
+                Lockfile::versions($abs, 'npm', $name) ?? [],
+                static fn (string $v): bool => NpmOverrides::affected($v, $ranges[$name])
+            ));
+            if ($still !== []) {
+                $notes[] = "override written but lock still resolves {$name}@" . implode(', ', $still);
+            }
+        }
         return $notes;
     }
 

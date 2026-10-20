@@ -27,7 +27,7 @@ final class ManifestPaths
             in_array($base, ['composer.json', 'composer.lock'], true)
                 => 'composer',
             preg_match('/requirements.*\.txt$|constraints.*\.txt$/', $base) === 1,
-            in_array($base, ['Pipfile', 'Pipfile.lock', 'pyproject.toml', 'poetry.lock', 'setup.py'], true)
+            in_array($base, ['Pipfile', 'Pipfile.lock', 'pyproject.toml', 'poetry.lock', 'setup.py', 'setup.cfg'], true)
                 => 'pip',
             $base === 'pom.xml'
                 => 'maven',

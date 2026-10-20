@@ -260,6 +260,9 @@ final class SecurityRun
         $limits   = [];
         $policies = [];
         $active   = [];
+        // An available auditor that finds nothing everywhere is the empty-repo
+        // case; without this flag a `--only`-nothing run could claim it
+        $looked = false;
 
         foreach ($this->auditors() as $auditor) {
             $name = $auditor->name();
@@ -272,6 +275,7 @@ final class SecurityRun
                 $this->record($name, 'SKIP');
                 continue;
             }
+            $looked = true;
             $targets = $auditor->targets($this->ctx);
             if ($targets === []) {
                 $c->skip("{$name} (no " . implode('/', $auditor->manifests()) . ' found)');
@@ -284,6 +288,11 @@ final class SecurityRun
             }
         }
         if ($jobs === []) {
+            if ($looked) {
+                $label = $this->target->githubRepo !== '' ? $this->target->githubRepo : basename($this->root);
+                $c->skip("{$label} — no manifest-bearing projects found (empty repo?)");
+                $this->record('projects', 'SKIP', 0, 0, 'no manifest-bearing projects found (empty repo?)');
+            }
             return;
         }
 
@@ -1468,6 +1477,9 @@ final class SecurityRun
         // Fixable in principle; written (or reported) after one more pass, so
         // one family cannot be pinned to two versions in one file
         $decisions = [];
+        // npm override edits awaiting the lockfile's verdict (applied means
+        // applied and verified)
+        $verifications = [];
         foreach ($inScope as $row) {
             // Tallied in records, so the buckets add up to what is pending
             $n      = count($row['keys']);
@@ -1633,8 +1645,22 @@ final class SecurityRun
                 $note  = "would set {$d['ver']} in {$d['target']}";
                 $c->info("  would set {$d['eco']} {$d['pkg']} -> {$d['ver']} in {$d['target']}{$d['via']}");
             } elseif ($res['content'] !== $base && file_put_contents($d['abs'], $res['content']) !== false) {
-                $applied += $n;
                 $edits++;
+                // An override for a transitive package is only a request: npm
+                // can leave the vulnerable copy resolved (a parent's pinned
+                // spec wins). With a npm lockfile present the edit waits for
+                // verifyOverrides() below before it counts as applied. A
+                // declared pin shows up in every later audit of this file
+                // anyway, and yarn.lock 'resolutions' would need a yarn run
+                // this tool must not start, so both take the immediate path.
+                if ($d['eco'] === 'npm' && $d['declared'] === ''
+                    && (is_file(dirname($d['abs']) . '/package-lock.json') || is_file(dirname($d['abs']) . '/npm-shrinkwrap.json'))) {
+                    $verifications[] = ['keys' => $row['keys'], 'n' => $n, 'dir' => dirname($d['abs']),
+                        'pkg' => $d['pkg'], 'spec' => $row['spec'], 'ver' => $d['ver'],
+                        'target' => $d['target'], 'via' => $d['via']];
+                    continue;
+                }
+                $applied += $n;
                 $state = 'applied';
                 $note  = "set to {$d['ver']} in {$d['target']}";
                 $c->ok("  {$d['eco']} {$d['pkg']} -> {$d['ver']} in {$d['target']}{$d['via']}");
@@ -1657,18 +1683,82 @@ final class SecurityRun
                 . ". {$edits} manifest edit(s); use --update to apply.");
             return;
         }
+        // Every override written above now faces the lockfile: re-resolve it
+        // and count the edit applied only when the vulnerable copy is gone.
+        $notEvicted = 0;
+        foreach ($this->verifyOverrides($verifications) as $v) {
+            if ($v['still'] === []) {
+                $applied += $v['n'];
+                $c->ok("  npm {$v['pkg']} -> {$v['ver']} in {$v['target']}{$v['via']} (verified in the lockfile)");
+                $this->appliedFixes[] = "npm {$v['pkg']} -> {$v['ver']} in {$v['target']}";
+                foreach ($v['keys'] as $key) {
+                    $updates[] = ['key' => $key, 'state' => 'applied', 'note' => "set to {$v['ver']} in {$v['target']} (override verified in the lockfile)"];
+                }
+                continue;
+            }
+            $still      = implode(', ', $v['still']);
+            $notEvicted += $v['n'];
+            $c->warn("  npm {$v['pkg']} -> {$v['ver']} in {$v['target']}: override written but lock still resolves {$v['pkg']}@{$still}");
+            foreach ($v['keys'] as $key) {
+                $updates[] = ['key' => $key, 'state' => 'pending', 'note' => "override written but lock still resolves {$v['pkg']}@{$still}"];
+            }
+        }
+        $bad .= $notEvicted > 0 ? " override-not-evicted={$notEvicted}" : '';
         $this->saveDb(VulnDb::applyStates($db, $updates, $this->now));
 
         $c->info("auto-fix (in records): applied={$applied} already-ok={$satisfied} not-declared={$notDeclared} missing-manifest={$missing}"
             . " cannot-edit={$unsupported} needs-major={$major}{$bad}{$rest}; {$edits} manifest edit(s)");
         if ($edits > 0) {
-            $this->record('auto-fix', 'PASS', 0, 0, "{$edits} edit(s)");
+            $this->record('auto-fix', $notEvicted > 0 ? 'WARN' : 'PASS', 0, 0,
+                "{$edits} edit(s)" . ($notEvicted > 0 ? ", {$notEvicted} override(s) not evicted from the lockfile" : ''));
             if (!$this->opt->push) {
                 $c->warn("Manifests were modified in {$this->root} — review 'git diff' before committing");
             }
         } else {
             $this->record('auto-fix', 'SKIP');
         }
+    }
+
+    /**
+     * Re-resolve each lockfile an override edit touched (`npm install
+     * --package-lock-only`, update mode only — the write path that got us
+     * here), then report per edit the versions the lock still resolves that
+     * do not clear every advisory. A failed install is answered by what the
+     * lock says anyway: an override npm could not honour has evicted nothing.
+     *
+     * @param list<array{keys: list<string>, n: int, dir: string, pkg: string, spec: array<string, list<string>>, ver: string, target: string, via: string}> $verifications
+     * @return list<array{n: int, keys: list<string>, pkg: string, ver: string, target: string, via: string, still: list<string>}>
+     */
+    private function verifyOverrides(array $verifications): array
+    {
+        if ($verifications === []) {
+            return [];
+        }
+        $dirs  = [];
+        $quiet = ['--ignore-scripts', '--no-audit', '--no-fund'];
+        foreach ($verifications as $v) {
+            $dirs[$v['dir']] = true;
+        }
+        foreach (array_keys($dirs) as $dir) {
+            $argv = array_merge(['npm', 'install', '--package-lock-only'], $quiet);
+            $r    = $this->ctx->runner->run($argv, $dir, ['label' => "npm verify {$dir}"]);
+            if (!$r->ok() && stripos($r->output, 'ERESOLVE') !== false) {
+                // the same fallback the auditor uses for a conflicted manifest
+                $this->ctx->runner->run(array_merge($argv, ['--legacy-peer-deps']), $dir, ['label' => "npm verify {$dir}"]);
+            }
+        }
+        $out = [];
+        foreach ($verifications as $v) {
+            $still = [];
+            foreach (Lockfile::versions($v['dir'], 'npm', $v['pkg']) ?? [] as $version) {
+                if (!Version::clearsAll($version, $v['spec'])) {
+                    $still[] = $version;
+                }
+            }
+            $out[] = ['n' => $v['n'], 'keys' => $v['keys'], 'pkg' => $v['pkg'], 'ver' => $v['ver'],
+                'target' => $v['target'], 'via' => $v['via'], 'still' => array_values(array_unique($still))];
+        }
+        return $out;
     }
 
     /**

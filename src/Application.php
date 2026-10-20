@@ -23,6 +23,8 @@ final class Application
     private string $stateDir = '';
     /** The remote target's clone, deleted when the run ends; '' when there is none to delete */
     private string $clone = '';
+    /** Non-null once the state directory exists, so an abort before any project ran can still report there */
+    private ?StatePaths $preparedState = null;
 
     /**
      * @param list<string>          $argv including the program name
@@ -66,6 +68,9 @@ final class Application
         try {
             [$opt, $target, $state, $configFile] = $this->prepare($opt, $args, $env, $cwd, $console, $runner);
         } catch (InvalidArgumentException | RuntimeException $e) {
+            // A batch of 255 must never end with a repo that only printed
+            // "cloning": say what happened, on the console and in the report
+            $this->reportAbort($console, $opt, $e->getMessage(), '', true);
             $this->cleanup($console);
             fwrite(STDERR, self::PREFIX . ' ERROR: ' . $e->getMessage() . "\n");
             return 1;
@@ -75,10 +80,59 @@ final class Application
             $run  = new SecurityRun($opt, $console, $target, $state->vulnDb, $state->reportDir, $configFile, $argv,
                 $state->stateDir . '/osv-cache.json', $state->stateDir . '/triage-state.json', $state->stateDir . '/close-state.json');
             $code = $run->run();
+        } catch (\Throwable $e) {
+            // The crash still travels, but the repo gets its outcome line and
+            // — unless the run had already written a full report — a record
+            // of why it ended
+            $this->reportAbort($console, $opt, 'run failed: ' . $e->getMessage(), 'failed', false);
+            throw $e;
         } finally {
             $this->cleanup($console);
         }
         return $code;
+    }
+
+    /**
+     * The outcome of a run that ended before any project was audited: an
+     * explicit console line and, where the state directory was reached, a
+     * security-scan-report.json naming the reason. Silence is what made the
+     * empty and uncloneable repos invisible in a batch of 255.
+     */
+    private function reportAbort(Console $console, Options $opt, string $reason, string $outcome, bool $overwrite): void
+    {
+        $label = $opt->target !== '' ? GitUrl::redact($opt->target) : basename((string)getcwd());
+        if ($outcome === '') {
+            // TargetResolver's "no default branch" is an empty repository,
+            // not a failed clone: nothing was ever there to audit
+            $outcome = str_contains($reason, 'has no default branch') ? 'skipped' : 'failed';
+        }
+        if ($outcome === 'skipped') {
+            $console->skip("{$label} — no manifest-bearing projects found (empty repo?)");
+        } elseif (str_contains($reason, 'clone')) {
+            $console->fail("{$label} — clone failed: {$reason}");
+        } else {
+            $console->fail("{$label} — run ended before any project was audited: {$reason}");
+        }
+        if ($this->preparedState === null) {
+            return;
+        }
+        $file = $this->preparedState->reportDir . '/security-scan-report.json';
+        if (!$overwrite && is_file($file)) {
+            return;   // a fuller report from the run itself stands
+        }
+        if (!is_dir($this->preparedState->reportDir) && !@mkdir($this->preparedState->reportDir, 0775, true) && !is_dir($this->preparedState->reportDir)) {
+            return;
+        }
+        @file_put_contents($file, JsonFile::encode([
+            'tool'           => 'dep-sec-patcher ' . self::VERSION,
+            'scan_timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
+            'target'         => $label,
+            'mode'           => $opt->mode,
+            'outcome'        => $outcome,
+            'reason'         => $reason,
+            'summary'        => ['projects' => $outcome === 'skipped' ? 'SKIP' : 'FAIL'],
+            'ecosystems'     => ['projects' => ['status' => $outcome === 'skipped' ? 'SKIP' : 'FAIL', 'note' => $reason]],
+        ]));
     }
 
     /**
@@ -233,6 +287,7 @@ final class Application
             self::assertOutside($state, $root);
         }
         $this->acquireLock($state, $opt->stateDir === '');
+        $this->preparedState = $state;
         self::moveLegacyDb($state, $console);
 
         if ($spec['kind'] === 'remote') {

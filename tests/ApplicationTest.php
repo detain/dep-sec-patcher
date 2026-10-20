@@ -7,6 +7,7 @@ namespace Detain\DepSecPatcher\Tests;
 use Detain\DepSecPatcher\GitUrl;
 use Detain\DepSecPatcher\StatePaths;
 use Detain\DepSecPatcher\VulnDb;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -272,7 +273,64 @@ class ApplicationTest extends TestCase
         $this->assertSame(1, $rc, $out);
         $this->assertStringContainsString('--subdir not found', $out);
         $this->assertStringContainsString('deleted the clone', $out);
-        $this->assertDirectoryDoesNotExist($this->remoteState($remote), 'the lock went too, leaving the directory empty');
+        $this->assertStringContainsString("[FAIL] {$remote['url']} — run ended before any project was audited", $out,
+            'an aborted repo never leaves only a "cloning" line behind');
+
+        // The state directory now keeps the report of the abort instead of
+        // vanishing: in a batch, the report is what says what happened here
+        $state  = $this->remoteState($remote);
+        $report = json_decode((string)file_get_contents($state . '/reports/security-scan-report.json'), true);
+        $this->assertIsArray($report);
+        $this->assertSame('failed', $report['outcome']);
+        $this->assertStringContainsString('--subdir not found', $report['reason']);
+        $this->assertSame(['reports'], array_values(array_diff(scandir($state) ?: [], ['.', '..'])),
+            'the clone and the lock went; the reports stay');
+    }
+
+    public function testAnEmptyRemoteRepositoryReportsItselfSkipped(): void
+    {
+        $bare = $this->scratchDir('empty-bare') . '/empty.git';
+        mkdir($bare);
+        $this->git($bare, ['init', '--bare', '--initial-branch=main']);
+        $url = 'file://' . $bare;
+        [$rc, $out] = $this->cli(['--check', $url], '/');
+        $this->assertSame(1, $rc, $out);
+        $this->assertStringContainsString("cloning {$url}", $out);
+        $this->assertStringContainsString("[SKIP] {$url} — no manifest-bearing projects found (empty repo?)", $out);
+
+        $state  = $this->xdg . '/dep-sec-patcher/' . StatePaths::slug('', GitUrl::normalize($url), GitUrl::basename($url));
+        $report = json_decode((string)file_get_contents($state . '/reports/security-scan-report.json'), true);
+        $this->assertIsArray($report);
+        $this->assertSame('skipped', $report['outcome']);
+        $this->assertStringContainsString('has no default branch', $report['reason']);
+    }
+
+    public function testACloneThatCannotEvenFetchReportsItselfFailed(): void
+    {
+        $url = 'file://' . $this->scratchDir('nowhere') . '/missing.git';
+        [$rc, $out] = $this->cli(['--check', $url], '/');
+        $this->assertSame(1, $rc, $out);
+        $this->assertStringContainsString("[FAIL] {$url} — clone failed:", $out);
+
+        $state  = $this->xdg . '/dep-sec-patcher/' . StatePaths::slug('', GitUrl::normalize($url), GitUrl::basename($url));
+        $report = json_decode((string)file_get_contents($state . '/reports/security-scan-report.json'), true);
+        $this->assertIsArray($report);
+        $this->assertSame('failed', $report['outcome']);
+        $this->assertStringContainsString('git clone', $report['reason']);
+    }
+
+    public function testAnEmptyLocalTargetSaysNoManifestBearingProjectsWereFound(): void
+    {
+        $root = $this->scratchDir('vacant');
+        [$rc, $out] = $this->cli(['--check', $root], '/');
+        $this->assertSame(0, $rc, $out);
+        $name = basename($root);
+        $this->assertStringContainsString("[SKIP] {$name} — no manifest-bearing projects found (empty repo?)", $out);
+
+        $state  = $this->xdg . '/dep-sec-patcher/' . StatePaths::slug('', $root);
+        $report = json_decode((string)file_get_contents($state . '/reports/security-scan-report.json'), true);
+        $this->assertSame('SKIP', $report['ecosystems']['projects']['status']);
+        $this->assertStringContainsString('empty repo?', $report['ecosystems']['projects']['note']);
     }
 
     public function testAWorkdirTheToolDidNotCreateIsNeverDeleted(): void
@@ -451,6 +509,62 @@ class ApplicationTest extends TestCase
         $this->assertStringContainsString('several major versions', $vulns['yarn.lock|nanoid|GHSA-nanoid']['note']);
         $this->assertSame('skipped', $vulns['yarn.lock|babel|GHSA-babel']['state'], 'nothing installs it, so no pin');
         $this->assertStringContainsString('neither declared in package.json nor in its lockfile', $vulns['yarn.lock|babel|GHSA-babel']['note']);
+    }
+
+    /**
+     * A transitive override is only a request: npm may re-resolve the
+     * vulnerable copy right back into the lock. Until the lock says the copy
+     * is gone the record stays pending and the run says so — applied means
+     * applied and verified.
+     *
+     * @return array<string, array{string}>
+     */
+    public static function overrideInstallBehaviours(): array
+    {
+        return [
+            'the install evicts the vulnerable copy' => ["sed -i 's/\"2.3.2\"/\"2.3.3\"/' package-lock.json\n  exit 0"],
+            'the install leaves it in place'         => ['exit 0'],
+        ];
+    }
+
+    /**
+     * @param string $installBody
+     */
+    #[DataProvider('overrideInstallBehaviours')]
+    public function testATransitiveOverrideCountsAppliedOnlyWhenTheLockEvictsIt(string $installBody): void
+    {
+        $bin = $this->scratchDir('npm-stub');
+        file_put_contents($bin . '/npm', "#!/bin/sh\ncase \" \$* \" in\n  *\" view \"*) echo '[\"2.3.1\", \"2.3.2\", \"2.3.3\"]'; exit 0 ;;\n"
+            . "  *\" install \"*)  {$installBody} ;;\nesac\nexit 0\n");
+        chmod($bin . '/npm', 0755);
+
+        $dir = $this->scratchDir('evict');
+        file_put_contents($dir . '/package.json', "{\n  \"dependencies\": {\n    \"micromatch\": \"^4.0.0\"\n  }\n}\n");
+        file_put_contents($dir . '/package-lock.json', '{"packages": {"": {}, "node_modules/micromatch": {"version": "4.0.4"},'
+            . ' "node_modules/braces": {"version": "2.3.2"}}}');
+        $db = $this->storedDb([[
+            'key' => 'package-lock.json|braces|GHSA-braces', 'source' => 'dependabot', 'id' => 'GHSA-braces', 'ecosystem' => 'npm',
+            'package' => 'braces', 'manifest' => 'package-lock.json', 'fixed_version' => '2.3.3', 'fix_versions' => ['2.3.3'],
+        ]]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/',
+            ['PATH' => $bin . ':' . getenv('PATH')]);
+        $this->assertSame(0, $rc, $out);
+
+        $doc = json_decode((string)file_get_contents($dir . '/package.json'), true);
+        $this->assertSame(['braces' => '^2.3.3'], $doc['overrides'], 'the override itself was written either way');
+
+        $record = VulnDb::load($db)['vulns']['package-lock.json|braces|GHSA-braces'];
+        if (str_contains($installBody, 'sed')) {
+            $this->assertSame('applied', $record['state'], $record['note']);
+            $this->assertStringContainsString('override verified in the lockfile', $record['note']);
+            $this->assertStringNotContainsString('override-not-evicted', $out);
+        } else {
+            $this->assertSame('pending', $record['state'], 'the lock still holds braces 2.3.2: nothing was evicted');
+            $this->assertStringContainsString('override written but lock still resolves braces@2.3.2', $record['note']);
+            $this->assertStringContainsString('override written but lock still resolves braces@2.3.2', $out);
+            $this->assertStringContainsString('override-not-evicted=1', $out);
+            $this->assertStringContainsString('applied=0', $out);
+        }
     }
 
     public function testWithoutALockfileATransitivePinFollowsTheVersionTheIssueFoundInUse(): void

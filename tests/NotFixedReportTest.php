@@ -39,6 +39,7 @@ class NotFixedReportTest extends TestCase
             ['workspace specifier ^2.0', 'not-declared'],
             ['no fixed version known', 'no-fix-yet'],
             ['would set qs to 6.15.2', 'would-set'],
+            ['override written but lock still resolves braces@2.3.2', 'override-did-not-evict'],
             ['already satisfied: 6.15.2', 'other'],
             ['refused: pinned elsewhere', 'other'],
         ];
