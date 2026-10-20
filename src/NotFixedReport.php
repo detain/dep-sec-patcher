@@ -32,7 +32,7 @@ final class NotFixedReport
     ];
     /** Report order for the database section. @var list<string> */
     public const DATABASE_BUCKETS = [
-        'needs-major', 'no-valid-fix', 'override-did-not-evict', 'not-declared', 'manifest-missing', 'cannot-edit', 'no-fix-yet', 'would-set', 'other',
+        'needs-major', 'no-valid-fix', 'override-did-not-evict', 'lock-unreadable', 'not-declared', 'manifest-missing', 'cannot-edit', 'no-fix-yet', 'would-set', 'other',
     ];
 
     /**
@@ -47,6 +47,7 @@ final class NotFixedReport
         return match (true) {
             str_starts_with($note, 'no valid fix')            => 'no-valid-fix',
             str_contains($note, 'lock still resolves')        => 'override-did-not-evict',
+            str_contains($note, 'lock unreadable')            => 'lock-unreadable',
             str_contains($note, 'needs a major upgrade')      => 'needs-major',
             str_starts_with($note, 'manifest not found')      => 'manifest-missing',
             str_starts_with($note, 'cannot edit')             => 'cannot-edit',

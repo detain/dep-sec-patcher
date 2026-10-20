@@ -127,6 +127,31 @@ class CloseEvidenceTest extends TestCase
         $this->assertTrue($this->call($run, 'entryPathsTouched', [$state->get('5'), $changed]));
     }
 
+    public function testAWatchedPathRenamedAwayStillInvalidatesTheVerdict(): void
+    {
+        $root = $this->gitRoot();
+        file_put_contents($root . '/a/package.json', "{\"dependencies\":{\"qs\":\"6.15.2\"}}\n");
+        $this->git($root, ['add', '--all']);
+        $this->git($root, ['commit', '--quiet', '-m', 'qs fixed']);
+        $headA = trim($this->git($root, ['rev-parse', 'HEAD']));
+
+        $run   = $this->secRun($root);
+        $needs = $this->qsNeeds();
+        $paths = $this->call($run, 'needsPaths', [$needs, $this->call($run, 'dirLister')]);
+        $state = $this->state($root, $headA, $needs, $paths);
+
+        // the manifest itself moves: rename detection would list only the
+        // destination, hiding that the watched path went away
+        $this->git($root, ['mv', 'a/package.json', 'a/package-moved.json']);
+        $this->git($root, ['commit', '--quiet', '-m', 'moved the manifest']);
+
+        $changed = $this->call($run, 'changedSinceChecks', [$state]);
+        $this->assertIsArray($changed);
+        $this->assertArrayHasKey('a/package.json', $changed, '--no-renames makes each side of the move list itself');
+        $this->assertTrue($this->call($run, 'entryPathsTouched', [$state->get('5'), $changed]),
+            'a watched path renamed away re-earns the verdict, it does not close on memory');
+    }
+
     public function testAnUnreachableRememberedShaFailsClosedForTheRun(): void
     {
         $root  = $this->gitRoot();
@@ -240,6 +265,22 @@ class CloseEvidenceTest extends TestCase
             'a commit from before now is a real push: the answer starts a fresh cycle');
         $this->assertSame(1, $this->call($run, 'firstRebaseRequest', ['404', $future])['rebase_requests'],
             'a PR never asked before counts its first request as one');
+    }
+
+    public function testASkewedHeadCommitDoesNotAnswerTheRebaseRequest(): void
+    {
+        $root = $this->plainRoot();
+        $run  = $this->secRun($root);
+        $data = [
+            'comments' => [['body' => 'rebase please <!-- security-update:rebase -->', 'createdAt' => gmdate('Y-m-d\TH:i:s\Z', time() - 86400)]],
+            'commits'  => [['committedDate' => gmdate('Y-m-d\TH:i:s\Z', time() + 7200)]],
+        ];
+        $this->assertTrue($this->call($run, 'rebaseRequested', ['o/r', '9', $data]),
+            'a head dated ahead of our clock proves the committer runs hot, not that the bot pushed');
+
+        $data['commits'] = [['committedDate' => gmdate('Y-m-d\TH:i:s\Z', time() - 3600)]];
+        $this->assertFalse($this->call($run, 'rebaseRequested', ['o/r', '9', $data]),
+            'a push that really lands after the request still answers it');
     }
 
     public function testTheSupersedeClaimStatesTheAlertListNotItsCause(): void

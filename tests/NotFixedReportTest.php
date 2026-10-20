@@ -40,6 +40,7 @@ class NotFixedReportTest extends TestCase
             ['no fixed version known', 'no-fix-yet'],
             ['would set qs to 6.15.2', 'would-set'],
             ['override written but lock still resolves braces@2.3.2', 'override-did-not-evict'],
+            ['lock unreadable, not verified', 'lock-unreadable'],
             ['already satisfied: 6.15.2', 'other'],
             ['refused: pinned elsewhere', 'other'],
         ];
@@ -49,6 +50,11 @@ class NotFixedReportTest extends TestCase
     public function testEveryAutoFixNoteFindsItsBucket(string $note, string $want): void
     {
         $this->assertSame($want, NotFixedReport::noteReason($note));
+    }
+
+    public function testTheUnreadableLockHasItsPlaceInTheDatabaseOrder(): void
+    {
+        $this->assertContains('lock-unreadable', NotFixedReport::DATABASE_BUCKETS, 'a named bucket, not a castaway in "other"');
     }
 
     public function testAggregateCollapsesIdenticalItemsHighestFirst(): void

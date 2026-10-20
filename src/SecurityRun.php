@@ -1322,7 +1322,7 @@ final class SecurityRun
         $body = 'Superseded — ' . self::supersedeClaim() . "; closing.\n\n<!-- security-update:superseded -->";
         $r    = $this->gh()->run(['pr', 'close', $num, '--repo', $repo, '--comment', $body]);
         if (!$r->ok()) {
-            $this->console->fail("  PR #{$num} is superseded but could not be closed (" . $r->failureReason() . ')');
+            $this->console->warn("  PR #{$num} is superseded but could not be closed (" . $r->failureReason() . ')');
             return ['close-failed', $fields];
         }
         $this->console->ok("  PR #{$num} superseded — closed (" . self::supersedeClaim() . ')');
@@ -1542,8 +1542,10 @@ final class SecurityRun
         }
         $commits  = $data['commits'];
         $headTime = $commits === [] ? '' : (string)($commits[count($commits) - 1]['committedDate'] ?? '');
-        // Cannot compare: assume the request stands rather than risk comment spam
-        return $headTime === '' || strcmp($lastReq, $headTime) > 0;   // ISO-8601 UTC sorts lexically
+        // Cannot compare, or a head dated ahead of our clock — which only
+        // proves the committer's clock runs hot, not that the bot pushed:
+        // assume the request stands rather than risk comment spam
+        return $headTime === '' || strcmp($headTime, $this->now) > 0 || strcmp($lastReq, $headTime) > 0;   // ISO-8601 UTC sorts lexically
     }
 
     private function comment(string $repo, string $num, string $body): bool
@@ -2489,7 +2491,9 @@ final class SecurityRun
             if (!$this->commitExists($sha)) {
                 return null;    // rewritten or collected history proves nothing
             }
-            $diff = $this->ctx->runner->run(['git', '-C', $this->root, 'diff', '--name-only', $sha, $head], $this->root, $opt);
+            // --no-renames: a watched path renamed away must still list its
+            // source side, or the move would hide from the verdict it guards
+            $diff = $this->ctx->runner->run(['git', '-C', $this->root, 'diff', '--no-renames', '--name-only', $sha, $head], $this->root, $opt);
             if (!$diff->ok()) {
                 return null;
             }
