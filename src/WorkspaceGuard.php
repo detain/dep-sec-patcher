@@ -13,7 +13,8 @@ namespace Detain\DepSecPatcher;
  * do not always ship. The guard snapshots the directory's top level (and
  * sbt's project/) before an audit, then:
  *   - always removes entries that did not exist before but are build or
- *     dependency directories;
+ *     dependency directories, or names the caller passed as $purgeNew (a
+ *     stray lockfile of the wrong manager);
  *   - in check mode ("audit only, no writes") also removes every other new
  *     file and restores every file whose content changed.
  *
@@ -33,12 +34,25 @@ final class WorkspaceGuard
     private array $before = [];
     /** @var array<string, string> file => content, for restoring in check mode */
     private array $contents = [];
+    /** @var array<string, true> files to remove when the run created them, whatever the mode */
+    private array $purgeNew = [];
     /** @var array<int, self> guards of audits in progress in this process */
     private static array $active = [];
 
-    public function __construct(private string $dir, private bool $checkMode)
+    /**
+     * @param bool         $checkMode
+     * @param list<string> $purgeNew top-level file names (a lockfile whose
+     *                               manager is not this directory's) that
+     *                               must go again when the run created them,
+     *                               update mode included: keeping them is
+     *                               --push committing litter
+     */
+    public function __construct(private string $dir, private bool $checkMode, array $purgeNew = [])
     {
         self::$active[spl_object_id($this)] = $this;
+        foreach ($purgeNew as $name) {
+            $this->purgeNew[$name] = true;
+        }
         foreach (['', 'project/'] as $prefix) {
             $entries = @scandir($this->dir . '/' . $prefix);
             if ($entries === false) {
@@ -101,7 +115,8 @@ final class WorkspaceGuard
                     continue;
                 }
                 $isBuildDir = in_array($rel, self::BUILD_DIRS, true);
-                if ($isBuildDir || $this->checkMode) {
+                $isPurge    = $prefix === '' && isset($this->purgeNew[$entry]);
+                if ($isBuildDir || $this->checkMode || $isPurge) {
                     Filesystem::remove($this->dir . '/' . $rel);
                     if (!$isBuildDir) {
                         $undone[] = "removed {$rel}";

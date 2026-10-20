@@ -23,6 +23,7 @@ final class ManifestEditor
     public const OK        = 'ok';
     public const REFUSED   = 'refused';      // would move a declared version backwards
     public const UNSUPPORTED = 'unsupported'; // file type or package shape not handled
+    public const INTERNAL  = 'internal';     // workspace:/catalog: link: no upstream version to bump
 
     /** What a version written into a manifest may look like: no quotes, spaces or code. */
     private const VERSION_RX = '/^[0-9A-Za-z][0-9A-Za-z.+_~-]*$/';
@@ -248,6 +249,12 @@ final class ManifestEditor
                 // "*" already admits the fix; give it a floor and keep it open-ended
                 $doc->{$section}->{$pkg} = '>=' . $version;
                 return self::ok(JsonFile::encode($doc, JsonFile::detectIndent($content)), $content, $doc);
+            }
+            // A workspace-protocol specifier links the package to a sibling
+            // or the root's catalog: the version lives in that package, not
+            // here, and rewriting the link would break it
+            if (preg_match(NodeWorkspace::PROTOCOL_RX, $declared) === 1) {
+                return ['status' => self::INTERNAL, 'content' => $content];
             }
             // A git/file/alias spec or a tag names no registry version to
             // bump, and one version cannot replace every alternative of a union

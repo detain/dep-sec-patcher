@@ -261,7 +261,11 @@ final class SecurityRun
                 [$auditor, $dir] = $job;
                 $guards = [];
                 foreach ($auditor->guardDirs($ctx, $dir) as $g) {
-                    $guards[] = new WorkspaceGuard($g === '' ? $ctx->root : $ctx->root . '/' . $g, $ctx->checkMode());
+                    $guards[] = new WorkspaceGuard(
+                        $g === '' ? $ctx->root : $ctx->root . '/' . $g,
+                        $ctx->checkMode(),
+                        $g === $dir ? $auditor->guardPurge($ctx, $dir) : []
+                    );
                 }
                 $start = microtime(true);
                 try {
@@ -970,7 +974,14 @@ final class SecurityRun
                     $c->info("  {$eco} {$pkg} is on prerelease {$current} in {$target}, above every fix; moving it to release {$release}");
                 }
 
-                if ($locked === []) {
+                if ($eco === 'npm' && preg_match(NodeWorkspace::PROTOCOL_RX, $declared) === 1) {
+                    // A workspace link to a sibling package or the root's
+                    // catalog, not an upstream dependency: there is no
+                    // registry version here to bump, and "cannot edit" is
+                    // for edits that genuinely failed
+                    $notDeclared += $n;
+                    [$state, $note] = ['skipped', "{$pkg} in {$target} is linked as {$declared} (a workspace specifier, not an upstream dependency)"];
+                } elseif ($locked === []) {
                     // The lockfile is what gets installed, and it holds no
                     // copy: an override would add a pin that fixes nothing
                     $notDeclared += $n;
@@ -1024,6 +1035,10 @@ final class SecurityRun
                     } elseif ($res['status'] === ManifestEditor::UNSUPPORTED) {
                         $unsupported += $n;
                         $note = "cannot edit {$pkg}" . ($declared !== '' ? " (declared as {$declared})" : '') . " in {$target}";
+                    } elseif ($res['status'] === ManifestEditor::INTERNAL) {
+                        // belt and braces: a workspace link reached the editor
+                        $notDeclared += $n;
+                        [$state, $note] = ['skipped', "{$pkg} in {$target} is linked as {$declared} (a workspace specifier, not an upstream dependency)"];
                     } elseif ($res['content'] !== $content && !$write) {
                         $applied += $n;
                         $edits++;

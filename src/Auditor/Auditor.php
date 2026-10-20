@@ -69,6 +69,19 @@ abstract class Auditor
     }
 
     /**
+     * File names within a guarded directory that the guard must remove again
+     * when the audit created them, update mode included — the lockfile of a
+     * package manager this directory does not use. Empty by default: what an
+     * update run resolved, it normally keeps.
+     *
+     * @return list<string>
+     */
+    public function guardPurge(Context $ctx, string $dir): array
+    {
+        return [];
+    }
+
+    /**
      * Concurrency group for a target. Targets in one group share a limit.
      */
     public function group(Context $ctx, string $dir): string

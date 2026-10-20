@@ -207,6 +207,17 @@ First release: a standalone, generic port of MyAdmin's
   release by hand.
 - close-fixed's log and closing comment give every release line's fix
   (`needs >= 4.1.137.Final or 4.2.17.Final`), not one of them.
+- Node: pnpm/yarn/npm workspaces are understood. A workspace member is no
+  longer audited as its own npm project — `npm install` there failed with
+  EUNSUPPORTEDPROTOCOL on every `workspace:*`/`catalog:` specifier linking a
+  sibling — it is SKIPped as covered by the root's audit, which reports the
+  whole graph; the root dispatches to the workspace tool even before its
+  lockfile exists (a root `packageManager` field is the tiebreaker), npm
+  refuses any manifest with workspace-protocol specifiers even in a
+  workspace outside the scanned tree, lockfiles a stray run creates inside a
+  pnpm/yarn workspace are removed again so `--push` cannot commit them, and
+  auto-fix counts `workspace:`/`catalog:` declarations as not-declared links
+  rather than cannot-edit failures.
 
 ### Kept
 

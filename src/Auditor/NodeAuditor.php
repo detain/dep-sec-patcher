@@ -8,11 +8,13 @@ use Detain\DepSecPatcher\CommandResult;
 use Detain\DepSecPatcher\Context;
 use Detain\DepSecPatcher\JsonFile;
 use Detain\DepSecPatcher\Lockfile;
+use Detain\DepSecPatcher\NodeWorkspace;
 use Detain\DepSecPatcher\ProcessRunner;
 use Detain\DepSecPatcher\TargetResult;
 
 /**
- * Node: npm, yarn or pnpm depending on the lockfile present.
+ * Node: npm, yarn or pnpm depending on the lockfile present, and on the
+ * pnpm/yarn/npm workspace a directory belongs to where there is none.
  *
  * Lockfile-only operations throughout (--package-lock-only), with install
  * scripts disabled: the audited tree never needs node_modules, so downloading every
@@ -61,11 +63,41 @@ final class NodeAuditor extends Auditor
 
     public function audit(Context $ctx, string $dir): TargetResult
     {
+        // A workspace installs and audits from its root: the root's lockfile
+        // pins every member and `pnpm audit` there reports the whole graph,
+        // so a member audited on its own is at best redundant — and npm, the
+        // fallback for a member without a local lockfile, fails every
+        // install of the `workspace:`/`catalog:` specifiers linking siblings
+        $workspace = NodeWorkspace::containing($ctx->root, $this->abs($ctx, $dir));
+        if ($workspace !== null && $workspace['member'] && ProcessRunner::has($workspace['manager'])) {
+            return new TargetResult(TargetResult::SKIP, $workspace['manager'] . ' workspace member — covered by root workspace audit at '
+                . ($workspace['rel'] === '' ? '.' : $workspace['rel']));
+        }
         return match ($this->manager($ctx, $dir)) {
             'yarn'  => $this->yarn($ctx, $dir),
             'pnpm'  => $this->pnpm($ctx, $dir),
             default => $this->npm($ctx, $dir),
         };
+    }
+
+    /**
+     * Lockfiles a run here may create that belong to another manager, so the
+     * guard removes them again even in update mode: a member has no lockfile
+     * of its own (the root's pins it), and inside a pnpm/yarn workspace the
+     * workspace tool owns the one file — an npm package-lock left behind by
+     * the fallback dispatch is only something --push could commit by mistake.
+     *
+     * @return list<string>
+     */
+    public function guardPurge(Context $ctx, string $dir): array
+    {
+        $workspace = NodeWorkspace::containing($ctx->root, $this->abs($ctx, $dir));
+        if ($workspace === null || $workspace['manager'] === 'npm') {
+            return [];
+        }
+        return $workspace['member']
+            ? NodeWorkspace::lockfiles()
+            : array_values(array_diff(NodeWorkspace::lockfiles(), NodeWorkspace::MANAGER_LOCKS[$workspace['manager']]));
     }
 
     private function manager(Context $ctx, string $dir): string
@@ -76,11 +108,32 @@ final class NodeAuditor extends Auditor
         if ($this->exists($ctx, $dir, 'pnpm-lock.yaml') && ProcessRunner::has('pnpm')) {
             return 'pnpm';
         }
+        // A workspace root dispatches by the tool its layout dictates even
+        // before its lockfile exists: pnpm-workspace.yaml means pnpm. Members
+        // are audited by audit() itself, and a directory the globs do not
+        // claim is nobody's member: its own lockfiles, or npm, decide.
+        $workspace = NodeWorkspace::containing($ctx->root, $this->abs($ctx, $dir));
+        if ($workspace !== null && $workspace['root'] === $this->abs($ctx, $dir)
+            && $workspace['manager'] !== 'npm' && ProcessRunner::has($workspace['manager'])) {
+            return $workspace['manager'];
+        }
+        // corepack's "packageManager" field, as a tiebreaker only
+        $declared = NodeWorkspace::packageManager($this->abs($ctx, $dir));
+        if (in_array($declared, ['pnpm', 'yarn'], true) && ProcessRunner::has($declared)) {
+            return $declared;
+        }
         return 'npm';
     }
 
     private function npm(Context $ctx, string $dir): TargetResult
     {
+        // Belt and braces for the workspace-protocol specifiers: an
+        // undetected member, or one of a workspace rooted above the scanned
+        // tree, fails `npm install` with EUNSUPPORTEDPROTOCOL on every run
+        $link = NodeWorkspace::protocolSpecifier($this->abs($ctx, $dir));
+        if ($link !== '') {
+            return new TargetResult(TargetResult::SKIP, 'npm cannot resolve ' . $link . ' (a workspace-protocol specifier); only its workspace root can audit this package');
+        }
         $quiet = ['--ignore-scripts', '--no-audit', '--no-fund'];
         $peers = [];
         $notes = [];
