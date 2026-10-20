@@ -40,6 +40,8 @@ final class SecurityRun
     private array $appliedFixes = [];
     /** @var array<string, list<string>|null> npm registry versions per package, asked once per run */
     private array $npmVersions = [];
+    /** Which versions the registries publish, asked once per package per run */
+    private RegistryProbe $registry;
     /** Whether this run's changes reached the base branch on origin; null when not pushing. */
     private ?bool $landed = null;
     /** Whether the git tree was clean before the run; null outside a work tree. */
@@ -64,9 +66,11 @@ final class SecurityRun
         private array $argv = [],
         /** Where OSV answers are cached between runs; '' keeps them for this run only */
         private string $advisoryCache = '',
+        ?RegistryProbe $registry = null,
     ) {
-        $this->now  = gmdate('Y-m-d\TH:i:s\Z');
-        $this->root = $target->root;
+        $this->now      = gmdate('Y-m-d\TH:i:s\Z');
+        $this->root     = $target->root;
+        $this->registry = $registry ?? new RegistryProbe();
     }
 
     public function run(): int
@@ -900,7 +904,8 @@ final class SecurityRun
             $c->ok('auto-fix: nothing pending');
             return;
         }
-        $plan    = FixPlanner::plan($db);
+        $plan       = FixPlanner::plan($db);
+        $advisories = FixPlanner::advisories($db);
         $inScope = array_values(array_filter($plan, fn (array $row): bool => $this->target->inScope($row['manifest'])));
         // With --subdir, fixes for manifests elsewhere in the repository stay pending
         $scopeNote = $this->target->subdir === '' ? ''
@@ -914,7 +919,7 @@ final class SecurityRun
 
         $lister  = $this->dirLister();
         $updates = [];
-        $applied = $missing = $notDeclared = $satisfied = $unsupported = $major = $edits = $majorRows = 0;
+        $applied = $missing = $notDeclared = $satisfied = $unsupported = $major = $noValidFix = $edits = $majorRows = 0;
         $unplanned = FixPlanner::unplanned($db);
         $outside   = array_sum(array_map(static fn (array $row): int => count($row['keys']), $plan)) - array_sum(array_map(static fn (array $row): int => count($row['keys']), $inScope));
         // Pending but not fixable here: no fix released yet, nothing to edit,
@@ -922,6 +927,9 @@ final class SecurityRun
         $rest = ' no-fix-yet=' . $unplanned['no-fix']
             . ($unplanned['unplaceable'] > 0 ? " unplaceable={$unplanned['unplaceable']}" : '')
             . ($this->target->subdir !== '' ? " outside-subdir={$outside}" : '');
+        // Fixable in principle; written (or reported) after one more pass, so
+        // one family cannot be pinned to two versions in one file
+        $decisions = [];
         foreach ($inScope as $row) {
             // Tallied in records, so the buckets add up to what is pending
             $n      = count($row['keys']);
@@ -1012,66 +1020,109 @@ final class SecurityRun
                     $majorRows++;
                     $note = "needs a major upgrade: {$pkg} {$current} -> {$ver} in {$target} (rerun with --allow-major)";
                     $c->warn("  {$eco} {$pkg} needs a major upgrade ({$current} -> {$ver}) in {$target}; not applied without --allow-major");
-                } elseif ($eco === 'npm' && ($missingVer = $this->npmUnpublished($pkg, [$ver, $pin], dirname($abs))) !== null) {
-                    // A record naming the wrong package (an unscoped name for
-                    // a scoped one) would break every later npm install
-                    $unsupported += $n;
-                    [$state, $note] = ['skipped', "{$pkg}@{$missingVer} is not published on the npm registry; nothing written to {$target}"];
-                    $c->warn("  {$eco} {$pkg}@{$missingVer} is not published on the npm registry; not written to {$target}");
                 } else {
-                    $res = ManifestEditor::apply(
-                        $eco,
-                        $target,
-                        $content,
-                        $pkg,
-                        $ver,
-                        $pin !== '' ? $pin : $ver,
-                        is_file(dirname($abs) . '/yarn.lock'),
-                        is_file(dirname($abs) . '/package-lock.json') || is_file(dirname($abs) . '/npm-shrinkwrap.json')
-                    );
-                    if ($res['status'] === ManifestEditor::REFUSED) {
-                        $notDeclared += $n;
-                        [$state, $note] = ['skipped', "refused: {$ver} would downgrade the version declared in {$target}"];
-                    } elseif ($res['status'] === ManifestEditor::UNSUPPORTED) {
-                        $unsupported += $n;
-                        $note = "cannot edit {$pkg}" . ($declared !== '' ? " (declared as {$declared})" : '') . " in {$target}";
-                    } elseif ($res['status'] === ManifestEditor::INTERNAL) {
-                        // belt and braces: a workspace link reached the editor
-                        $notDeclared += $n;
-                        [$state, $note] = ['skipped', "{$pkg} in {$target} is linked as {$declared} (a workspace specifier, not an upstream dependency)"];
-                    } elseif ($res['content'] !== $content && !$write) {
-                        $applied += $n;
-                        $edits++;
-                        $note = "would set {$ver} in {$target}";
-                        $c->info("  would set {$eco} {$pkg} -> {$ver} in {$target}{$via}");
-                    } elseif ($res['content'] !== $content && file_put_contents($abs, $res['content']) !== false) {
-                        $applied += $n;
-                        $edits++;
-                        [$state, $note] = ['applied', "set to {$ver} in {$target}"];
-                        $c->ok("  {$eco} {$pkg} -> {$ver} in {$target}{$via}");
-                        $this->appliedFixes[] = "{$eco} {$pkg} -> {$ver} in {$target}";
-                    } else {
-                        $notDeclared += $n;
-                        [$state, $note] = ['skipped', "package not declared in {$target}"];
+                    // The last gate before any manifest write: the target must
+                    // exist in its registry, must not be a version this
+                    // database itself knows is vulnerable for this exact
+                    // coordinate, and must not move the package backwards.
+                    $choice = $this->guardTarget($eco, $pkg, (string)$current, (string)$ver, dirname($abs), $row['spec'], $advisories, $release !== '');
+                    if ($choice['version'] === '') {
+                        // The no-fix-yet shape of a bad candidate: the record
+                        // stays pending, so a registry that gains a real fix
+                        // is picked up by a later run
+                        $noValidFix += $n;
+                        $c->warn("  {$eco} {$pkg}@{$ver} {$choice['why']}; nothing written to {$target}");
+                        foreach ($row['keys'] as $key) {
+                            $updates[] = ['key' => $key, 'state' => 'pending', 'note' => "no valid fix: {$choice['why']}"];
+                        }
+                        continue;
                     }
+                    if ($choice['version'] !== $ver) {
+                        $c->warn("  {$eco} {$pkg}@{$ver} {$choice['why']}; {$choice['version']} in its place");
+                        $ver = $pin = $choice['version'];
+                    }
+                    $decisions[] = ['row' => $row, 'target' => $target, 'abs' => $abs, 'eco' => $eco, 'pkg' => $pkg,
+                        'content' => $content, 'ver' => $ver, 'pin' => $pin, 'via' => $via, 'current' => (string)$current,
+                        'declared' => (string)$declared, 'allowLower' => $release !== ''];
+                    continue;
                 }
             }
             foreach ($row['keys'] as $key) {
                 $updates[] = ['key' => $key, 'state' => $state, 'note' => $note];
             }
         }
+
+        // A second pass so one family (io.netty, org.springframework) cannot
+        // be pinned to two versions in the same file by two records
+        $this->alignFamilies($decisions, $advisories);
+        foreach ($decisions as $d) {
+            /** @var array{row: array<string, mixed>, target: string, abs: string, eco: string, pkg: string, content: string, ver: string, pin: string, via: string, current: string, declared: string, allowLower: bool} $d */
+            $row  = $d['row'];
+            $n    = count($row['keys']);
+            $note = '';
+            $state = 'skipped';
+            // Two fixes can share one manifest: apply to what the file says
+            // now, not to the snapshot taken before the first of them was
+            // written, or the earlier edit is silently undone
+            $live  = (string)@file_get_contents($d['abs']);
+            $base  = $live === '' ? (string)$d['content'] : $live;
+            $res   = ManifestEditor::apply(
+                $d['eco'],
+                $d['target'],
+                $base,
+                $d['pkg'],
+                $d['ver'],
+                $d['pin'] !== '' ? $d['pin'] : $d['ver'],
+                is_file(dirname($d['abs']) . '/yarn.lock'),
+                is_file(dirname($d['abs']) . '/package-lock.json') || is_file(dirname($d['abs']) . '/npm-shrinkwrap.json'),
+                $d['allowLower']
+            );
+            if ($res['status'] === ManifestEditor::REFUSED) {
+                $notDeclared += $n;
+                $note = "refused: {$d['ver']} would downgrade the version declared in {$d['target']}";
+            } elseif ($res['status'] === ManifestEditor::UNSUPPORTED) {
+                $unsupported += $n;
+                $state = 'pending';
+                $note  = 'cannot edit ' . $d['pkg'] . ($d['declared'] !== '' ? " (declared as {$d['declared']})" : '') . " in {$d['target']}";
+            } elseif ($res['status'] === ManifestEditor::INTERNAL) {
+                // belt and braces: a workspace link reached the editor
+                $notDeclared += $n;
+                $note = "{$d['pkg']} in {$d['target']} is linked as {$d['declared']} (a workspace specifier, not an upstream dependency)";
+            } elseif ($res['content'] !== $base && !$write) {
+                $applied += $n;
+                $edits++;
+                $state = 'pending';
+                $note  = "would set {$d['ver']} in {$d['target']}";
+                $c->info("  would set {$d['eco']} {$d['pkg']} -> {$d['ver']} in {$d['target']}{$d['via']}");
+            } elseif ($res['content'] !== $base && file_put_contents($d['abs'], $res['content']) !== false) {
+                $applied += $n;
+                $edits++;
+                $state = 'applied';
+                $note  = "set to {$d['ver']} in {$d['target']}";
+                $c->ok("  {$d['eco']} {$d['pkg']} -> {$d['ver']} in {$d['target']}{$d['via']}");
+                $this->appliedFixes[] = "{$d['eco']} {$d['pkg']} -> {$d['ver']} in {$d['target']}";
+            } else {
+                $notDeclared += $n;
+                $note = 'package not declared in ' . $d['target'];
+            }
+            foreach ($row['keys'] as $key) {
+                $updates[] = ['key' => $key, 'state' => $state, 'note' => $note];
+            }
+        }
+
         $this->needsMajor = $majorRows;
+        $bad              = $noValidFix > 0 ? " no-valid-fix={$noValidFix}" : '';
         if (!$write) {
             $this->readyFixes = $edits;
             $c->info("auto-fix (check mode, in records): would-apply={$applied} already-ok={$satisfied} not-declared={$notDeclared}"
-                . " missing-manifest={$missing} cannot-edit={$unsupported} needs-major={$major}{$rest}"
+                . " missing-manifest={$missing} cannot-edit={$unsupported} needs-major={$major}{$bad}{$rest}"
                 . ". {$edits} manifest edit(s); use --update to apply.");
             return;
         }
         $this->saveDb(VulnDb::applyStates($db, $updates, $this->now));
 
         $c->info("auto-fix (in records): applied={$applied} already-ok={$satisfied} not-declared={$notDeclared} missing-manifest={$missing}"
-            . " cannot-edit={$unsupported} needs-major={$major}{$rest}; {$edits} manifest edit(s)");
+            . " cannot-edit={$unsupported} needs-major={$major}{$bad}{$rest}; {$edits} manifest edit(s)");
         if ($edits > 0) {
             $this->record('auto-fix', 'PASS', 0, 0, "{$edits} edit(s)");
             if (!$this->opt->push) {
@@ -1083,27 +1134,114 @@ final class SecurityRun
     }
 
     /**
-     * The first of $versions npm does not publish for $pkg, or null when all
-     * are published or the registry cannot be asked (no npm, offline): an
-     * unanswered check never blocks a fix.
+     * The last gate before any manifest write. The target version must exist
+     * in its registry, must not sit inside an affected range the database
+     * knows for this exact coordinate, and must not compare below what the
+     * manifest declares - unless it is the deliberate prerelease-to-release
+     * channel, which may. FixPlanner::safeTarget() walks down to the next
+     * valid candidate; '' version means write nothing.
      *
-     * @param list<string> $versions
+     * @param array<string, list<string>> $spec
+     * @param array<string, array<string, array{fixes: list<string>, ranges: list<string>}>> $advisories
+     * @return array{version: string, why: string}
      */
-    private function npmUnpublished(string $pkg, array $versions, string $cwd): ?string
+    private function guardTarget(
+        string $eco,
+        string $pkg,
+        string $current,
+        string $ver,
+        string $dir,
+        array $spec,
+        array $advisories,
+        bool $allowLower
+    ): array {
+        // Gradle and sbt coordinates are Maven coordinates: same Central
+        // layout, same records (GitHub files them as "Maven")
+        if ($eco === 'gradle' || $eco === 'sbt') {
+            $eco = 'maven';
+        }
+        $known    = $advisories[$eco . '|' . $pkg] ?? [];
+        $registry = $this->publishedVersionsFor($eco, $pkg, $dir);
+        $exists   = $registry === null ? null : static fn (string $v): bool => in_array($v, $registry, true);
+        return FixPlanner::safeTarget($eco, $current, $ver, $spec, $known, $registry, $exists, $allowLower, $this->opt->allowMajor);
+    }
+
+    /**
+     * The versions the registry publishes for a package, or null when nobody
+     * can say: an unanswered check never blocks a fix, and only the three
+     * registries with published version lists are asked. npm is asked through
+     * the project's own npm first (a private registry is authoritative where
+     * registry.npmjs.org is not); the plain HTTP answer covers the hosts
+     * without a working npm, where the old check failed open and lodash
+     * 4.18.0 - a version that exists nowhere - reached a manifest.
+     *
+     * @return list<string>|null
+     */
+    private function publishedVersionsFor(string $eco, string $pkg, string $dir): ?array
     {
-        if (!ProcessRunner::has('npm')) {
-            return null;
+        if ($eco === 'npm') {
+            if (ProcessRunner::has('npm')) {
+                if (!array_key_exists($pkg, $this->npmVersions)) {
+                    $this->npmVersions[$pkg] = NodeAuditor::registryVersions($this->ctx->runner, $dir, $pkg);
+                }
+                if ($this->npmVersions[$pkg] !== null) {
+                    return $this->npmVersions[$pkg];
+                }
+            }
+            return $this->registry->versions('npm', $pkg);
         }
-        if (!array_key_exists($pkg, $this->npmVersions)) {
-            $this->npmVersions[$pkg] = NodeAuditor::registryVersions($this->ctx->runner, $cwd, $pkg);
+        return $this->registry->versions($eco, $pkg);
+    }
+
+    /**
+     * Where two records each pinned a netty or spring artifact in one pom,
+     * the file ends up holding the family at two versions (4.1.133 beside
+     * 4.1.94). These artifacts ship together; raise the lower pins to the
+     * highest candidate that every one of them can bear - same guards, and
+     * any artifact that refuses the join keeps its own version with a note.
+     *
+     * @param list<array<string, mixed>> $decisions
+     * @param array<string, array<string, array{fixes: list<string>, ranges: list<string>}>> $advisories
+     */
+    private function alignFamilies(array &$decisions, array $advisories): void
+    {
+        $c    = $this->console;
+        $sets = [];
+        foreach ($decisions as $i => $d) {
+            if ($d['eco'] !== 'maven' || !str_contains($d['pkg'], ':')) {
+                continue;
+            }
+            $group = explode(':', $d['pkg'], 2)[0];
+            if (!str_starts_with($group, 'io.netty') && !str_starts_with($group, 'org.springframework')) {
+                continue;
+            }
+            $sets[$d['target'] . "\0" . $group . "\0" . Version::majorLine($d['ver'])][] = $i;
         }
-        $published = $this->npmVersions[$pkg];
-        foreach (array_unique(array_filter($versions, static fn (string $v): bool => $v !== '')) as $v) {
-            if ($published !== null && !in_array($v, $published, true)) {
-                return $v;
+        foreach ($sets as $members) {
+            if (count($members) < 2) {
+                continue;
+            }
+            $best = Version::maxMaven(array_map(static fn (int $i): string => (string)$decisions[$i]['ver'], $members));
+            foreach ($members as $i) {
+                $d = $decisions[$i];
+                if ($d['ver'] === $best) {
+                    continue;
+                }
+                $choice = $this->guardTarget((string)$d['eco'], (string)$d['pkg'], (string)$d['current'],
+                    $best, dirname((string)$d['abs']), $d['row']['spec'], $advisories, false);
+                if ($choice['version'] === $best) {
+                    $c->info("  maven {$d['pkg']}: joining the {$this->groupId($d['pkg'])} family at {$best}");
+                    $decisions[$i]['ver'] = $decisions[$i]['pin'] = $best;
+                } else {
+                    $c->warn("  maven {$d['pkg']} stays at {$d['ver']}; {$best} {$choice['why']} for it");
+                }
             }
         }
-        return null;
+    }
+
+    private function groupId(string $pkg): string
+    {
+        return str_contains($pkg, ':') ? explode(':', $pkg, 2)[0] : $pkg;
     }
 
     // ── close-fixed ──────────────────────────────────────────────────────────

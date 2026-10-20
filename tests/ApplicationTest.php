@@ -52,7 +52,7 @@ class ApplicationTest extends TestCase
     private function cli(array $args, string $cwd, array $env = []): array
     {
         $env  = array_merge(getenv(), ['XDG_STATE_HOME' => $this->xdg, 'NVD_API_KEY' => '', 'GH_TOKEN' => '',
-            'DSP_TEST_REGISTRY' => $this->registry, 'PATH' => $this->bin . ':' . getenv('PATH')], $env);
+            'DEP_SEC_PATCHER_OFFLINE' => '1', 'DSP_TEST_REGISTRY' => $this->registry, 'PATH' => $this->bin . ':' . getenv('PATH')], $env);
         // sh merges stderr into stdout, so errors and output arrive in order
         $cmd  = array_merge(['sh', '-c', 'exec "$0" "$@" 2>&1', PHP_BINARY, dirname(__DIR__) . '/bin/dep-sec-patcher'], $args);
         $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w']], $pipes, $cwd, $env);
@@ -299,7 +299,7 @@ class ApplicationTest extends TestCase
         file_put_contents($bin . '/npm', "#!/bin/sh\ntouch " . escapeshellarg($marker) . "\nexec sleep 60\n");
         chmod($bin . '/npm', 0755);
         $env  = array_merge(getenv(), ['XDG_STATE_HOME' => $this->xdg, 'NVD_API_KEY' => '', 'GH_TOKEN' => '',
-            'PATH' => $bin . ':' . getenv('PATH')]);
+            'DEP_SEC_PATCHER_OFFLINE' => '1', 'PATH' => $bin . ':' . getenv('PATH')]);
         // exec: the pid signalled below is the tool's, not the shell's
         $cmd  = ['sh', '-c', 'exec "$0" "$@" 2>&1', PHP_BINARY, dirname(__DIR__) . '/bin/dep-sec-patcher', '--check', '--only', 'node', $remote['url']];
         $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w']], $pipes, '/', $env);
@@ -530,8 +530,79 @@ class ApplicationTest extends TestCase
         $doc = json_decode((string)file_get_contents($dir . '/package.json'), true);
         $this->assertSame(['@apidevtools/json-schema-ref-parser' => '^15.3.6'], $doc['overrides'], 'names compared exactly, scope included');
         $vulns = VulnDb::load($db)['vulns'];
-        $this->assertSame('skipped', $vulns['package.json|json-schema-ref-parser|CVE-2026-15195']['state']);
+        // Not skipped for good: a registry that later publishes the fix, or a
+        // lower candidate that clears it, gets picked up by a later run
+        $this->assertSame('pending', $vulns['package.json|json-schema-ref-parser|CVE-2026-15195']['state']);
+        $this->assertStringContainsString('no valid fix: is not published on the npm registry', $vulns['package.json|json-schema-ref-parser|CVE-2026-15195']['note']);
         $this->assertSame('applied', $vulns['package.json|@apidevtools/json-schema-ref-parser|CVE-2026-15195']['state']);
+    }
+
+    public function testAWalkedDownFixIsWrittenInPlaceOfTheUnpublishedOne(): void
+    {
+        // The package-wide pin takes the highest candidate; when the registry
+        // has never heard of it, the next candidate that does and still clears
+        // the advisory goes in its place
+        $dir = $this->scratchDir('walkdown');
+        file_put_contents($dir . '/package.json', "{\n  \"dependencies\": {\n    \"left-pad\": \"^1.0.0\"\n  }\n}\n");
+        file_put_contents($this->registry . '/walk-down-lib.json', '["3.0.4", "3.1.2", "5.1.2"]');
+        $db = $this->storedDb([[
+            'key' => 'package.json|walk-down-lib|CVE-w', 'source' => 'issue', 'id' => 'CVE-w', 'ecosystem' => 'npm',
+            'package' => 'walk-down-lib', 'manifest' => 'package.json', 'fixed_version' => '3.1.4', 'fix_versions' => ['3.1.2', '3.1.4'],
+        ]]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('walk-down-lib@3.1.4 is not published on the npm registry; 3.1.2 in its place', $out);
+        $doc = json_decode((string)file_get_contents($dir . '/package.json'), true);
+        $this->assertSame(['walk-down-lib' => '^3.1.2'], $doc['overrides'], 'the override pins the version that exists');
+        $this->assertSame('applied', VulnDb::load($db)['vulns']['package.json|walk-down-lib|CVE-w']['state']);
+    }
+
+    public function testTwoRecordsOfOneFamilyPinOneVersion(): void
+    {
+        // netty releases all its artifacts together; two records pinning two
+        // versions of it into one pom left the family split (4.1.133 beside
+        // 4.1.94). The lower pin joins the higher one when it can.
+        $dir = $this->scratchDir('family');
+        $pom = "<project>\n  <dependencies>\n    <dependency>\n      <groupId>io.netty</groupId>\n      <artifactId>netty-codec-http</artifactId>\n"
+            . "      <version>4.1.42.Final</version>\n    </dependency>\n    <dependency>\n      <groupId>io.netty</groupId>\n"
+            . "      <artifactId>netty-handler</artifactId>\n      <version>4.1.42.Final</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        file_put_contents($dir . '/pom.xml', $pom);
+        $record = static fn (string $a, string $fix): array => [
+            'key' => "pom.xml|io.netty:netty-{$a}|CVE-{$a}", 'source' => 'dependabot', 'id' => "CVE-{$a}", 'ecosystem' => 'maven',
+            'package' => "io.netty:netty-{$a}", 'manifest' => 'pom.xml', 'fixed_version' => $fix, 'fix_versions' => [$fix],
+        ];
+        $db = $this->storedDb([
+            $record('codec-http', '4.1.133.Final'),
+            $record('handler', '4.1.94.Final'),
+        ]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $this->assertStringContainsString('maven io.netty:netty-handler: joining the io.netty family at 4.1.133.Final', $out);
+        $written = (string)file_get_contents($dir . '/pom.xml');
+        $this->assertSame(2, substr_count($written, '<version>4.1.133.Final</version>'), 'one version for the whole family');
+        $this->assertStringNotContainsString('4.1.94.Final', $written);
+        $this->assertStringNotContainsString('4.1.42.Final', $written);
+    }
+
+    public function testASecondFixToTheSamePomStacksOnTheFirst(): void
+    {
+        // Two records, one pom: the second write must see the first one's
+        // edit, not the content read before any of them was applied
+        $dir = $this->scratchDir('stack');
+        $pom = "<project>\n  <dependencies>\n    <dependency>\n      <groupId>io.netty</groupId>\n      <artifactId>netty-codec-http</artifactId>\n"
+            . "      <version>4.1.42.Final</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        file_put_contents($dir . '/pom.xml', $pom);
+        $db = $this->storedDb([
+            ['key' => 'pom.xml|io.netty:netty-codec-http|C1', 'source' => 'issue', 'id' => 'C1', 'ecosystem' => 'maven',
+                'package' => 'io.netty:netty-codec-http', 'manifest' => 'pom.xml', 'fixed_version' => '4.1.133.Final', 'fix_versions' => ['4.1.133.Final']],
+            ['key' => 'pom.xml|org.springframework:spring-webmvc|C2', 'source' => 'issue', 'id' => 'C2', 'ecosystem' => 'maven',
+                'package' => 'org.springframework:spring-webmvc', 'manifest' => 'pom.xml', 'fixed_version' => '5.3.39.RELEASE', 'fix_versions' => ['5.3.39.RELEASE'], 'installed' => ['5.1.17.RELEASE']],
+        ]);
+        [$rc, $out] = $this->cli(['--update', '--apply-stored', '--vuln-db', $db, $dir], '/');
+        $this->assertSame(0, $rc, $out);
+        $written = (string)file_get_contents($dir . '/pom.xml');
+        $this->assertStringContainsString('<version>4.1.133.Final</version>', $written, 'the inline fix survived the later write');
+        $this->assertStringContainsString('<artifactId>spring-webmvc</artifactId>', $written, 'and the dependencyManagement insert landed');
     }
 
     public function testCheckModeSuggestsTheCommandThatAppliesTheFixes(): void

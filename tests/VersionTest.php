@@ -270,4 +270,59 @@ class VersionTest extends TestCase
         $this->assertFalse(Version::clearsAll('1.1.14', $spec));
         $this->assertFalse(Version::clearsAll('2.0.1', $spec), 'below the 2.x fix of A');
     }
+
+    public function testCompareMavenOrdersReleaseNumericsAboveLetteredVersions(): void
+    {
+        // The guava r09 bug: sort -V reads the leading "r" as newer than "28",
+        // and Maven's own ComparableVersion does too; the release history says
+        // r09 (2010) is older than 28.1-jre (2019), which is what fixing needs
+        $this->assertSame(-1, Version::compareMaven('r09', '28.1-jre'));
+        $this->assertSame(1, Version::compareMaven('28.2-android', 'r10'));
+        $this->assertSame(-1, Version::compareMaven('r09', 'r10'), 'the lettered line still orders within itself');
+        $this->assertSame(1, Version::compareMaven('10.0.1', 'r10'), '10.0.1 came after r10');
+        $this->assertTrue(Version::gteMaven('28.1-jre', 'r09'));
+        $this->assertFalse(Version::gteMaven('r09', '28.1-jre'));
+        $this->assertSame('33.4.8-jre', Version::maxMaven(['28.1-jre', 'r09', '33.4.8-jre', '11.0.17']));
+    }
+
+    public function testCompareMavenOnNettyAndSpringQualifierFamilies(): void
+    {
+        $this->assertSame(1, Version::compareMaven('4.1.133.Final', '4.1.94.Final'));
+        $this->assertSame(-1, Version::compareMaven('4.1.94.Final', '4.1.133.Final'));
+        $this->assertSame(0, Version::compareMaven('4.1.42.Final', '4.1.42'), 'Final is the plain release');
+        $this->assertSame(0, Version::compareMaven('5.3.10.RELEASE', '5.3.10'), 'RELEASE likewise');
+        $this->assertSame(0, Version::compareMaven('5.3.10-GA', '5.3.10'));
+        $this->assertSame(-1, Version::compareMaven('5.3.10.RELEASE', '5.3.11'), 'one release ahead of a qualifier');
+        $this->assertSame(1, Version::compareMaven('5.3.10.RELEASE', '5.3.10-RC1'), 'a release outranks its rc');
+        $this->assertSame(-1, Version::compareMaven('5.3.10-RC1', '5.3.10-SNAPSHOT'));
+        $this->assertSame(1, Version::compareMaven('5.3.10-sp1', '5.3.10'), 'a service pack is after the release');
+    }
+
+    public function testFamilySuffix(): void
+    {
+        $this->assertSame('jre', Version::familySuffix('28.1-jre'));
+        $this->assertSame('android', Version::familySuffix('28.2-android'));
+        $this->assertSame('final', Version::familySuffix('4.1.42.Final'));
+        $this->assertSame('release', Version::familySuffix('5.3.10.RELEASE'));
+        $this->assertSame('javad8', Version::familySuffix('1.16.0-javad8'));
+        $this->assertSame('', Version::familySuffix('28.1'), 'a plain release carries no family');
+        $this->assertSame('', Version::familySuffix('r09'), 'nor does a version that opens with one');
+        $this->assertSame('', Version::familySuffix('6.15.2'));
+    }
+
+    public function testRangeContains(): void
+    {
+        $this->assertTrue(Version::rangeContains('[9.0.0, 9.0.119)', '9.0.118'));
+        $this->assertFalse(Version::rangeContains('[9.0.0, 9.0.119)', '9.0.119'), 'the fix ends the range');
+        $this->assertTrue(Version::rangeContains('< 11.0.25', '11.0.17'));
+        $this->assertTrue(Version::rangeContains('>= 11.0.0-M1, < 11.0.25', '11.0.17'));
+        $this->assertFalse(Version::rangeContains('>= 11.0.0-M1, < 11.0.25', '11.0.25'));
+        $this->assertTrue(Version::rangeContains('< 3.1.4 || >= 5.0.0, < 5.1.2', '3.0.4'));
+        $this->assertTrue(Version::rangeContains('< 3.1.4 || >= 5.0.0, < 5.1.2', '5.1.0'));
+        $this->assertFalse(Version::rangeContains('< 3.1.4 || >= 5.0.0, < 5.1.2', '4.2.1'));
+        $this->assertTrue(Version::rangeContains('= 2.9.2', '2.9.2'));
+        $this->assertNull(Version::rangeContains('everything before 1999', '1.0'), 'an unknown shape is never a guess');
+        $this->assertNull(Version::rangeContains('', '1.0'));
+        $this->assertNull(Version::rangeContains('[9.0.0, 9.0.119)', ''));
+    }
 }

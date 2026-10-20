@@ -451,12 +451,12 @@ final class MavenAuditor extends Auditor
                 $skipped[] = "{$ga} (in use at " . implode(', ', $f['versions']) . ')';
                 continue;
             }
-            $current = Version::max($f['versions']);
+            $current = Version::maxMaven($f['versions']);
             $later   = [];
             $floors  = $f['floors'];
             if (!$any) {
                 // A fix only a new major has waits for --allow-major
-                $later  = array_values(array_filter($floors, static fn (string $v): bool => Version::majorLine($v) !== $lines[0] && Version::gte($v, $current)));
+                $later  = array_values(array_filter($floors, static fn (string $v): bool => Version::majorLine($v) !== $lines[0] && Version::gteMaven($v, $current)));
                 $floors = array_values(array_diff($floors, $later));
             }
             [$g, $a]   = explode(':', $ga, 2);
@@ -465,6 +465,13 @@ final class MavenAuditor extends Auditor
             if ($to === '') {
                 // Nothing on the line clears it all: still the newest there
                 $to = MavenPom::newestOnLine($published, $current, $any);
+            }
+            if ($to !== '' && Version::compareMaven($to, $current) < 0) {
+                // Hard guard: a pin never moves an artifact backwards. The
+                // r09 of the world sort above release numbers byte-for-byte,
+                // and pinning one broke a guava 28.1-jre build.
+                $notes[] = "WARN: not pinning {$ga}: {$to} compares below the {$current} in use";
+                $to      = '';
             }
             if ($to === '') {
                 $skipped[] = "{$ga} {$current} (no newer release" . ($any ? '' : ' on its major line') . ')';

@@ -112,6 +112,25 @@ class MavenAuditorTest extends TestCase
         $this->assertSame('', MavenPom::newestOnLine($v, '2.2', false));
     }
 
+    public function testTheNewestReleaseStaysOnTheQualifiersFamily(): void
+    {
+        // guava ships its releases in parallel -jre and -android families,
+        // and predates numbering with lettered r09/r10; a fix for 28.1-jre
+        // must come from the -jre line, and never from r09 - which both
+        // `sort -V` and Maven's own ComparableVersion rank above 28.x
+        $guava = ['r09', 'r10', '10.0.1', '28.2-android', '28.2-jre', '33.4.8-jre', '33.5.0-android'];
+        $this->assertSame('28.2-jre', MavenPom::newestOnLine($guava, '28.1-jre', false));
+        $this->assertSame('33.4.8-jre', MavenPom::newestOnLine($guava, '28.1-jre', true), 'with --allow-major still the -jre release');
+        $this->assertSame('28.2-android', MavenPom::newestOnLine($guava, '28.1-android', false), 'the android line gets the android release');
+
+        $netty = ['4.1.94.Final', '4.1.133.Final', '4.2.17.Final', '5.0.0.Alpha2'];
+        $this->assertSame('4.2.17.Final', MavenPom::newestOnLine($netty, '4.1.76.Final', false), '4.2 is the same major line as 4.1, 5 is not');
+        $this->assertSame('4.2.17.Final', MavenPom::newestOnLine($netty, '4.1.76.Final', true), 'never the prerelease');
+
+        $spring = ['5.3.39.RELEASE', '6.2.19', '7.0.8'];
+        $this->assertSame('5.3.39.RELEASE', MavenPom::newestOnLine($spring, '5.3.10.RELEASE', false), 'the .RELEASE family holds the line');
+    }
+
     public function testAPropertyWithNoSuchVersionForSomeUserGoesToTheNewestTheyAllHave(): void
     {
         $log  = $this->fakeMaven(['update' => 's#<jackson-version>2.9.5<#<jackson-version>2.22<#; s#<logback-version>1.0<#<logback-version>1.1<#']);

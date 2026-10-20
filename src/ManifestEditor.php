@@ -42,7 +42,8 @@ final class ManifestEditor
         string $version,
         string $globalMax = '',
         bool $hasYarnLock = false,
-        bool $hasNpmLock = false
+        bool $hasNpmLock = false,
+        bool $allowDowngrade = false
     ): array {
         // Both come from advisory feeds and bot-written issue bodies: anything
         // that is not plainly a name or a version never reaches a manifest
@@ -51,7 +52,7 @@ final class ManifestEditor
             return ['status' => self::UNSUPPORTED, 'content' => $content];
         }
         try {
-            return self::dispatch(self::ecosystem($ecosystem, $path), $path, $content, $pkg, $version, $globalMax, $hasYarnLock, $hasNpmLock);
+            return self::dispatch(self::ecosystem($ecosystem, $path), $path, $content, $pkg, $version, $globalMax, $hasYarnLock, $hasNpmLock, $allowDowngrade);
         } catch (\RuntimeException $e) {
             // A regex that blew its backtrack limit returns null; writing that
             // back would empty the manifest, so leave the file untouched
@@ -70,7 +71,8 @@ final class ManifestEditor
         string $version,
         string $globalMax,
         bool $hasYarnLock,
-        bool $hasNpmLock
+        bool $hasNpmLock,
+        bool $allowDowngrade
     ): array {
         switch ($ecosystem) {
             case 'npm':
@@ -80,6 +82,17 @@ final class ManifestEditor
             case 'pip':
                 return self::applyPip(basename($path), $content, $pkg, $version);
             case 'maven':
+                // The hard downgrade guard: a fix that compares below the
+                // version the pom declares (guava 28.1-jre -> r09) is a bad
+                // candidate, not an upgrade, whatever the ordering above
+                // believed. Only the deliberate prerelease-to-release channel
+                // (allowDowngrade, maven-only) may move a version back.
+                $declared = self::declaredMaven($content, $pkg);
+                if (!$allowDowngrade && $declared !== '' && !str_contains($declared, '$')
+                    && preg_match(self::VERSION_RX, $declared) === 1 && preg_match('/[0-9]/', $declared) === 1
+                    && Version::compareMaven($version, $declared) < 0) {
+                    return ['status' => self::REFUSED, 'content' => $content];
+                }
                 return self::ok(self::applyMaven($content, $pkg, $version));
             case 'gradle':
                 if (!str_contains($pkg, ':')) {

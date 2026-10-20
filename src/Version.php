@@ -39,6 +39,235 @@ final class Version
     }
 
     /**
+     * Three-way comparison with Maven's ComparableVersion ordering, for the
+     * versions a pom can hold: items split at '.', '-', '_' and '+', letters
+     * and digits separated ("alpha1" is "alpha" then 1). At the same position
+     * a numeric item outranks a string one, "final", "ga" and "release" mean
+     * the plain release, and the known prerelease qualifiers order
+     * alpha < beta < milestone < rc < snapshot < release < sp < unknown.
+     *
+     * Diverging from sort -V on purpose: filevercmp reads the leading letter
+     * of guava "r09" (2010) as an "r" release byte-wise above "28.1-jre"
+     * (2019), which sent fix selection to r09; and Maven's own ComparableVersion
+     * counts such a lettered qualifier as newer than a number, which is how
+     * the versions plugin has downgraded guava too. Ordering a leading-letter
+     * version below the numeric ones is what the release history says and
+     * what picking a fix version needs.
+     */
+    public static function compareMaven(string $a, string $b): int
+    {
+        $ta = self::mavenItems($a);
+        $tb = self::mavenItems($b);
+        for ($i = 0, $n = max(count($ta), count($tb)); $i < $n; $i++) {
+            $r = self::compareMavenItem($ta[$i] ?? [1, ''], $tb[$i] ?? [1, '']);
+            if ($r !== 0) {
+                return $r;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * True when $a >= $b under compareMaven().
+     */
+    public static function gteMaven(string $a, string $b): bool
+    {
+        return self::compareMaven($a, $b) >= 0;
+    }
+
+    /**
+     * Highest of a list under compareMaven(), or '' for an empty list.
+     *
+     * @param list<string> $versions
+     */
+    public static function maxMaven(array $versions): string
+    {
+        $versions = array_values(array_filter($versions, static fn ($v) => $v !== ''));
+        usort($versions, [self::class, 'compareMaven']);
+        return $versions === [] ? '' : $versions[count($versions) - 1];
+    }
+
+    /**
+     * The qualifier family a version carries after its release numbers,
+     * lowercased: "28.1-jre" -> "jre", "4.1.42.Final" -> "final",
+     * "5.3.10.RELEASE" -> "release", "28.1" and "r09" -> ''. Families are
+     * release flavours published in parallel (guava's -jre and -android,
+     * spring's .RELEASE), and a fix must stay on the one in use.
+     */
+    public static function familySuffix(string $version): string
+    {
+        return preg_match('/^v?\d[\d.+-]*?[.\-_+]([A-Za-z][A-Za-z0-9]*)(?:[.\-_+]?\d*)?$/', trim($version), $m) === 1
+            ? strtolower($m[1]) : '';
+    }
+
+    /**
+     * Split a Maven version into comparable items: [0, number] or
+     * [1, qualifier]. "final", "ga" and "release" collapse to the plain
+     * release item ''.
+     *
+     * @return list<array{0: int, 1: int|string}>
+     */
+    private static function mavenItems(string $version): array
+    {
+        $version = strtolower(trim($version));
+        $version = (string)preg_replace('/^v(?=\d)/', '', $version);
+        $items   = [];
+        foreach (preg_split('/[.\-_+]/', $version, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+            if (preg_match('/^\d+$/', $token) === 1) {
+                $items[] = [0, (int)$token];
+                continue;
+            }
+            if (preg_match('/^[a-z]+$/', $token) === 1) {
+                $items[] = [1, in_array($token, ['final', 'ga', 'release'], true) ? '' : $token];
+                continue;
+            }
+            // "alpha1", "rc1": a letters run then a digits run
+            preg_match_all('/\d+|[a-z]+|[^a-z\d]+/u', $token, $runs);
+            foreach ($runs[0] as $run) {
+                $items[] = preg_match('/^\d+$/', $run) === 1 ? [0, (int)$run] : [1, $run];
+            }
+        }
+        return $items;
+    }
+
+    /**
+     * @param array{0: int, 1: int|string} $x
+     * @param array{0: int, 1: int|string} $y
+     */
+    private static function compareMavenItem(array $x, array $y): int
+    {
+        if ($x[0] === 0 && $y[0] === 0) {
+            return $x[1] <=> $y[1];
+        }
+        if ($x[0] === 1 && $y[0] === 1) {
+            $rank = self::mavenQualifierRank((string)$x[1]) <=> self::mavenQualifierRank((string)$y[1]);
+            return $rank !== 0 ? $rank : strcmp((string)$x[1], (string)$y[1]);
+        }
+        // A release number outranks a qualifier: "28.1-jre" > "r09", "1.0.1" > "1.0-sp"
+        return $x[0] === 0 ? 1 : -1;
+    }
+
+    private static function mavenQualifierRank(string $qualifier): int
+    {
+        return match ($qualifier) {
+            'a', 'alpha'                              => 1,
+            'b', 'beta'                               => 2,
+            'm', 'milestone'                          => 3,
+            'cr', 'rc'                                => 4,
+            'snapshot'                                => 5,
+            ''                                        => 6,  // the plain release
+            'sp'                                      => 7,
+            default                                   => 8,  // "jre", "android", "javad8": unknown
+        };
+    }
+
+    /**
+     * Whether a vulnerable range names $version: Maven/NuGet brackets
+     * ("[9.0.0, 9.0.106)"), plain comparators ("&lt; 4.17.21",
+     * ">= 11.0.0-M1, < 11.0.25") and "||" alternatives. True when inside one,
+     * false when outside every parsed alternative, and null when the range is
+     * not in any of those shapes - "we cannot tell", never a guess.
+     */
+    public static function rangeContains(string $range, string $version): ?bool
+    {
+        $range = trim($range);
+        if ($range === '' || $version === '') {
+            return null;
+        }
+        $answered = false;
+        foreach (preg_split('/\|\|/', $range) ?: [] as $alternative) {
+            $clauses = self::rangeClauses(trim($alternative));
+            if ($clauses === null) {
+                continue;
+            }
+            $answered = true;
+            $inside   = true;
+            foreach ($clauses as [$operator, $bound]) {
+                if (!self::comparatorHolds($version, $operator, $bound)) {
+                    $inside = false;
+                    break;
+                }
+            }
+            if ($inside) {
+                return true;
+            }
+        }
+        return $answered ? false : null;
+    }
+
+    /**
+     * The AND clauses of one range alternative as [operator, bound] pairs, or
+     * null when it holds a shape that is not understood. Bracket ranges are
+     * conjunctions of one bound pair; commas and spaces split plain comparators.
+     *
+     * @return list<array{0: string, 1: string}>|null
+     */
+    private static function rangeClauses(string $alternative): ?array
+    {
+        if ($alternative === '') {
+            return null;
+        }
+        $clauses = [];
+        foreach (self::splitTopLevel($alternative) as $part) {
+            $part = trim($part);
+            $bracket = self::bracketRange($part);
+            if ($bracket !== null) {
+                if ($bracket['lower'] !== '') {
+                    $clauses[] = [$bracket['lowerInclusive'] ? '>=' : '>', $bracket['lower']];
+                }
+                if ($bracket['upper'] !== '') {
+                    $clauses[] = [$bracket['upperInclusive'] ? '<=' : '<', $bracket['upper']];
+                }
+                continue;
+            }
+            if (preg_match('/^(<=|>=|<|>|=)?\s*(\S+)$/', $part, $m) === 1 && preg_match('/^\d/', $m[2]) === 1) {
+                $clauses[] = [$m[1] === '' ? '=' : $m[1], $m[2]];
+                continue;
+            }
+            return null;
+        }
+        return $clauses === [] ? null : $clauses;
+    }
+
+    /**
+     * Split on commas that sit outside any bracket, so "[9.0.0, 9.0.119)"
+     * stays one clause while ">= 1.0, < 2.0" splits in two.
+     *
+     * @return list<string>
+     */
+    private static function splitTopLevel(string $alternative): array
+    {
+        $parts = [];
+        $buf   = '';
+        $depth = 0;
+        foreach (str_split($alternative) as $char) {
+            if ($char === '[' || $char === '(') {
+                $depth++;
+            } elseif ($char === ']' || $char === ')') {
+                $depth = max(0, $depth - 1);
+            } elseif ($char === ',' && $depth === 0) {
+                $parts[] = $buf;
+                $buf     = '';
+                continue;
+            }
+            $buf .= $char;
+        }
+        $parts[] = $buf;
+        return $parts;
+    }
+
+    private static function comparatorHolds(string $version, string $operator, string $bound): bool
+    {
+        return match ($operator) {
+            '<'     => !self::gte($version, $bound),
+            '<='    => self::gte($bound, $version),
+            '>'     => !self::gte($bound, $version),
+            '>='    => self::gte($version, $bound),
+            default => self::floor($version) === self::floor($bound) || self::compare($version, $bound) === 0,
+        };
+    }
+
+    /**
      * True when $a >= $b.
      *
      * sort -V alone ranks "1.0.0-beta" above "1.0.0"; semver says a release

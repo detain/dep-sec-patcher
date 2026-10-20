@@ -105,7 +105,10 @@ final class MavenPom
     /**
      * The newest release in $versions above $current, on $current's major
      * line unless $anyMajor, and at least every $floors bound ('>=' version)
-     * and above every $above bound; '' when none qualifies.
+     * and above every $above bound; '' when none qualifies. Ordered with
+     * Maven's rules (Version::compareMaven), and preferring versions that
+     * share $current's qualifier family: from guava 28.1-jre the -jre line,
+     * never the lettered r09, which byte ordering ranked above everything.
      *
      * @param list<string> $versions
      * @param list<string> $floors
@@ -113,27 +116,32 @@ final class MavenPom
      */
     public static function newestOnLine(array $versions, string $current, bool $anyMajor, array $floors = [], array $above = []): string
     {
-        $line = Version::majorLine($current);
-        $ok   = array_filter($versions, static function (string $v) use ($current, $line, $anyMajor, $floors, $above): bool {
-            if (Version::isPrerelease($v) || !Version::gte($v, $current) || $v === $current) {
+        $line   = Version::majorLine($current);
+        $family = Version::familySuffix($current);
+        $ok     = array_values(array_filter($versions, static function (string $v) use ($current, $line, $anyMajor, $floors, $above): bool {
+            if (Version::isPrerelease($v) || !Version::gteMaven($v, $current) || $v === $current) {
                 return false;
             }
             if (!$anyMajor && Version::majorLine($v) !== $line) {
                 return false;
             }
             foreach ($floors as $f) {
-                if (!Version::gte($v, $f)) {
+                if (!Version::gteMaven($v, $f)) {
                     return false;
                 }
             }
             foreach ($above as $f) {
-                if (Version::gte($f, $v)) {
+                if (Version::gteMaven($f, $v)) {
                     return false;
                 }
             }
             return true;
-        });
-        return Version::max(array_values($ok));
+        }));
+        if ($family !== '') {
+            $same   = array_values(array_filter($ok, static fn (string $v): bool => Version::familySuffix($v) === $family));
+            $ok     = $same !== [] ? $same : $ok;
+        }
+        return Version::maxMaven($ok);
     }
 
     /**

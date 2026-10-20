@@ -66,6 +66,22 @@ First release: a standalone, generic port of MyAdmin's
 
 ### Changed (compared with update-samples-security)
 
+- Auto-fix no longer writes a fix version it cannot vouch for. Before any
+  maven, npm or pip manifest write, the candidate is checked against the
+  registry (Maven Central's `maven-metadata.xml`, the npm registry, PyPI -
+  each asked once per package per run, and never in the way that lets an
+  unanswered check block a fix where one is already known to be bad): the
+  version must exist there, must not sit inside an affected range this
+  database already knows for that exact coordinate, and must not move the
+  package backwards (the deliberate maven prerelease-to-release channel
+  excepted). When the highest candidate fails, it walks down to the next one
+  that passes; when none does, the record stays pending with a `no valid fix`
+  note and nothing is written. Maven ordering follows Maven's own rules for
+  these decisions, so a lettered version like guava `r09` no longer outranks
+  `28.1-jre`, and where one family (io.netty, org.springframework) is pinned
+  by two records into one file, the lower pin joins the higher. npm override
+  and resolution writes are validated the same way a declared bump always
+  was; the old "is this unpublished" check only covered one write path.
 - The MyAdmin project profiles (`--profile`, `--project`, `--list-profiles`,
   `API_SAMPLES_PROFILE`, `API_SAMPLES_PROJECT`) are removed.
 - Default state location (see above) and output prefix `[dep-sec-patcher]`.

@@ -172,4 +172,88 @@ class VulnDbAndPlannerTest extends TestCase
         $this->assertSame('skipped', $db['vulns']['k']['state']);
         $this->assertSame('no fixed version known', $db['vulns']['k']['note']);
     }
+
+    public function testAdvisoriesAreKeyedByTheExactCoordinate(): void
+    {
+        $mk = static fn (array $over): array => $over + [
+            'key' => 'k1', 'id' => 'CVE-1', 'ecosystem' => 'maven', 'package' => 'io.netty:netty-codec-http2',
+            'manifest' => 'pom.xml', 'fixed_version' => '4.1.135.Final', 'fix_versions' => ['4.1.135.Final'],
+            'vulnerable_range' => '< 4.1.135.Final',
+        ];
+        $db = VulnDb::upsert(VulnDb::empty(), [
+            $mk([]),
+            // The same artifactId under another groupId: a plexus-utils-style
+            // version must never be able to answer for netty
+            $mk(['key' => 'k2', 'id' => 'CVE-2', 'package' => 'com.acme:netty-codec-http2',
+                'fixed_version' => '7.0.12', 'fix_versions' => ['7.0.12'], 'vulnerable_range' => '']),
+            // An already-applied record still says which versions were affected
+            $mk(['key' => 'k3', 'id' => 'CVE-3', 'ecosystem' => 'npm', 'package' => 'qs', 'state' => 'applied',
+                'fixed_version' => '6.15.2', 'fix_versions' => ['6.15.2'], 'vulnerable_range' => '>= 6.0.0, < 6.15.2']),
+            $mk(['key' => 'k4', 'id' => 'CVE-4', 'ecosystem' => '', 'package' => 'x']),
+        ], 't', '');
+        $known = FixPlanner::advisories($db);
+
+        $this->assertSame(['maven|com.acme:netty-codec-http2', 'maven|io.netty:netty-codec-http2', 'npm|qs'], array_keys($known));
+        $this->assertSame(['4.1.135.Final'], $known['maven|io.netty:netty-codec-http2']['CVE-1']['fixes']);
+        $this->assertSame(['7.0.12'], $known['maven|com.acme:netty-codec-http2']['CVE-2']['fixes'], 'one groupId does not speak for the other');
+        $this->assertSame(['>= 6.0.0, < 6.15.2'], $known['npm|qs']['CVE-3']['ranges'], 'applied records still count');
+        $this->assertSame([], FixPlanner::vulnerableTarget('7.0.12', $known['maven|io.netty:netty-codec-http2']),
+            'the other group\'s version is not in netty\'s range');
+    }
+
+    public function testATargetInsideAKnownAffectedRangeIsNotAFix(): void
+    {
+        $known = ['GHSA-t' => ['fixes' => ['9.0.119', '10.1.55', '11.0.25'], 'ranges' => ['>= 11.0.0, < 11.0.25']]];
+        $this->assertSame(['GHSA-t'], FixPlanner::vulnerableTarget('11.0.17', $known), 'the version that opened ten fresh alerts');
+        $this->assertSame(['GHSA-t'], FixPlanner::vulnerableTarget('9.0.118', $known), 'below the fix on its own line');
+        $this->assertSame([], FixPlanner::vulnerableTarget('11.0.25', $known));
+        $this->assertSame([], FixPlanner::vulnerableTarget('9.0.119', $known));
+
+        // With no range recorded, "below a fix on the same branch" is the shape of still-affected
+        $fixesOnly = ['GHSA-j' => ['fixes' => ['11.0.25'], 'ranges' => []]];
+        $this->assertSame(['GHSA-j'], FixPlanner::vulnerableTarget('11.0.17', $fixesOnly));
+        $this->assertSame([], FixPlanner::vulnerableTarget('10.0.5', $fixesOnly), 'a line the advisory does not speak of');
+    }
+
+    public function testSafeTargetWalksAwayFromVersionsThatFailTheirGuards(): void
+    {
+        $from = static fn (array $published): callable => static fn (string $v): bool => in_array($v, $published, true);
+
+        // minimatch: the record named 3.1.4, npm's newest on the line is 3.1.2
+        $got = FixPlanner::safeTarget('npm', '3.0.4', '3.1.4', ['CVE-m' => ['3.1.2', '3.1.4']], [],
+            ['3.0.4', '3.1.2', '5.1.2'], $from(['3.0.4', '3.1.2', '5.1.2']));
+        $this->assertSame('3.1.2', $got['version']);
+        $this->assertStringContainsString('is not published on the npm registry', $got['why']);
+
+        // lodash 4.18.0: nothing publishes it and nothing lower clears it - no pin beats a broken one
+        $got = FixPlanner::safeTarget('npm', '^4.17.20', '4.18.0', ['CVE-l' => ['4.18.0']], [],
+            ['4.0.0', '4.17.20', '4.17.21'], $from(['4.0.0', '4.17.20', '4.17.21']));
+        $this->assertSame('', $got['version'], 'the no-fix-yet answer');
+        $this->assertStringContainsString('is not published on the npm registry', $got['why']);
+
+        // tomcat-embed-core 11.0.17 exists and is itself affected; 11.0.25 is the fix
+        $got = FixPlanner::safeTarget('maven', '11.0.12', '11.0.17', ['CVE-t' => ['11.0.17']],
+            ['GHSA-t' => ['fixes' => ['11.0.25'], 'ranges' => ['>= 11.0.0, < 11.0.25']]],
+            ['11.0.12', '11.0.17', '11.0.25'], $from(['11.0.12', '11.0.17', '11.0.25']));
+        $this->assertSame('11.0.25', $got['version']);
+        $this->assertStringContainsString('is itself affected by GHSA-t', $got['why']);
+
+        // guava: r09 does not outrank 28.1-jre, and the -jre family is kept
+        $published = ['r09', 'r10', '28.1-jre', '28.2-jre', '28.2-android', '33.4.8-jre'];
+        $got       = FixPlanner::safeTarget('maven', '28.1-jre', 'r09', ['CVE-g' => ['r09', '28.2-jre']], [],
+            $published, $from($published));
+        $this->assertSame('28.2-jre', $got['version'], 'stays on the line in use and on the family in use');
+        $this->assertStringContainsString('would downgrade from 28.1-jre', $got['why']);
+
+        // The deliberate prerelease-to-release channel may move down
+        $got = FixPlanner::safeTarget('maven', '5.0.0.Alpha2', '4.2.17.Final',
+            ['CVE-n' => ['4.1.137.Final', '4.2.17.Final']], [], null, null, true);
+        $this->assertSame('4.2.17.Final', $got['version']);
+        $this->assertSame('', $got['why'], 'the channel passes unmoved');
+
+        // A registry that cannot answer must not block the fix
+        $got = FixPlanner::safeTarget('npm', '^6.15.1', '6.15.2', ['CVE-q' => ['6.15.2']], [], null, null);
+        $this->assertSame('6.15.2', $got['version']);
+        $this->assertSame('', $got['why']);
+    }
 }
