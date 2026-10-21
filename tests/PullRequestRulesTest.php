@@ -181,4 +181,15 @@ class PullRequestRulesTest extends TestCase
             $this->assertContains($tally($outcome), ['merged', 'rebased', 'closed', 'pending', 'blocked', 'none'], $outcome);
         }
     }
+
+    public function testTheMergeCommitShaIsReadFromTheObjectGhSends(): void
+    {
+        $object = ['mergeCommit' => ['oid' => 'abc1234def', 'url' => 'https://github.com/o/r/commit/abc1234def']];
+        $this->assertSame('abc1234def', self::call('mergeCommitOid', $object), 'live gh answers --json mergeCommit with an object, not a string');
+        $this->assertSame('abc1234def', self::call('mergeCommitOid', ['mergeCommit' => 'abc1234def']), 'a plain string still parses');
+        $this->assertSame('', self::call('mergeCommitOid', null), 'a failed view records nothing');
+        $this->assertSame('', self::call('mergeCommitOid', []));
+        $this->assertSame('', self::call('mergeCommitOid', ['mergeCommit' => null]));
+        $this->assertSame('', self::call('mergeCommitOid', ['mergeCommit' => ['url' => 'https://x']]), 'an object without an oid is nothing, never the word Array');
+    }
 }

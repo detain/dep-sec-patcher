@@ -1125,7 +1125,7 @@ final class SecurityRun
         if ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--delete-branch'])->ok()) {
             $c->ok("  Merged PR #{$num}");
             $view   = $this->gh()->json(['pr', 'view', $num, '--repo', $repo, '--json', 'mergeCommit'], 60);
-            $commit = is_array($view) ? (string)($view['mergeCommit'] ?? '') : '';
+            $commit = self::mergeCommitOid($view);
             return ['merged', $commit === '' ? [] : ['merge_commit' => $commit]];
         }
         if ($this->gh()->run(['pr', 'merge', $num, '--repo', $repo, '--squash', '--auto', '--delete-branch'])->ok()) {
@@ -1134,6 +1134,20 @@ final class SecurityRun
         }
         $c->fail("  Could not merge PR #{$num}");
         return ['merge-failed', []];
+    }
+
+    /**
+     * The sha of a merged PR's commit. gh answers `--json mergeCommit` with an
+     * object ({oid, url}), so a naive cast stores the word "Array"; a plain
+     * string is tolerated in case that shape ever reverts.
+     */
+    private static function mergeCommitOid(mixed $view): string
+    {
+        $mergeCommit = is_array($view) ? ($view['mergeCommit'] ?? null) : null;
+        if (is_array($mergeCommit)) {
+            return (string)($mergeCommit['oid'] ?? '');
+        }
+        return is_string($mergeCommit) ? $mergeCommit : '';
     }
 
     /**
